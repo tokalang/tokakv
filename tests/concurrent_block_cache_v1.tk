@@ -32,7 +32,7 @@ fn test_concurrent_double_check_miss() {
     auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k = string::from("alpha")
     auto v = string::from("val_alpha")
-    db#.put(cede k, cede v).unwrap()
+    db#.put(k, v).unwrap()
     db#.flush_active_memtable().unwrap()
     auto cur_v = db#.current_version()
     auto fnum = cur_v.get_table(0:usize).meta.file_number
@@ -123,7 +123,7 @@ fn test_concurrent_hits_misses_evictions() {
     loop i <= 10:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db#.flush_active_memtable().unwrap() // Table 1
@@ -131,7 +131,7 @@ fn test_concurrent_hits_misses_evictions() {
     loop i <= 20:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db#.flush_active_memtable().unwrap() // Table 2
@@ -139,7 +139,7 @@ fn test_concurrent_hits_misses_evictions() {
     loop i <= 30:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db#.flush_active_memtable().unwrap() // Table 3
@@ -147,7 +147,7 @@ fn test_concurrent_hits_misses_evictions() {
     loop i <= 40:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db#.flush_active_memtable().unwrap() // Table 4

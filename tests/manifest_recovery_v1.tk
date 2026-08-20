@@ -43,7 +43,7 @@ fn test_manifest_flush_and_recovery_watermark() {
     loop i <= 20:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db1#.put(cede k, cede v).unwrap()
+        db1#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db1#.flush_active_memtable().unwrap()
@@ -54,7 +54,7 @@ fn test_manifest_flush_and_recovery_watermark() {
     loop i <= 40:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db1#.put(cede k, cede v).unwrap()
+        db1#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db1#.flush_active_memtable().unwrap()
@@ -65,7 +65,7 @@ fn test_manifest_flush_and_recovery_watermark() {
     loop i <= 50:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db1#.put(cede k, cede v).unwrap()
+        db1#.put(k, v).unwrap()
         i = i + 1:usize
     }
     assert(db1#.current_seq() == 50:u64, "current_seq must be 50")
@@ -99,7 +99,7 @@ fn test_manifest_flush_and_recovery_watermark() {
     loop i <= 60:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db2#.put(cede k, cede v).unwrap()
+        db2#.put(k, v).unwrap()
         i = i + 1:usize
     }
     assert(db2#.current_seq() == 60:u64, "current_seq must advance to 60")
@@ -122,7 +122,7 @@ fn test_orphan_sstable_exclusion() {
     loop i <= 10:usize {
         auto k = make_key(i)
         auto v = make_val(i)
-        db1#.put(cede k, cede v).unwrap()
+        db1#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db1#.flush_active_memtable().unwrap()

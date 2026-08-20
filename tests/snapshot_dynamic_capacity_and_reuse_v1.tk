@@ -24,7 +24,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(i as i32).as_str())
         auto v# = string::from("dyn_val_")
         v#.push_str(string::from_int(i as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
 
         auto lease_res = db#.acquire_snapshot()
         assert(lease_res.is_ok(), "acquire_snapshot must succeed beyond 512 capacity")
@@ -54,7 +54,7 @@ fn main() -> i32 {
         assert(r1.unwrap().as_str().equals(exp_v.as_str()), "r1 val mismatch")
 
         // Query 2 on same lease (proving non-destructive borrowing)
-        auto r2 = db#.get_at_snapshot(cede k, lease).unwrap()
+        auto r2 = db#.get_at_snapshot(k, lease).unwrap()
         assert(r2.is_some(), "r2 must find key")
         assert(r2.unwrap().as_str().equals(exp_v.as_str()), "r2 val mismatch")
 

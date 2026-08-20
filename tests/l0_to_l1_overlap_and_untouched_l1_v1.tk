@@ -20,7 +20,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(i as i32).as_str())
         auto v# = string::from("val_a_")
         v#.push_str(string::from_int(i as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db#.flush_active_memtable().unwrap()
@@ -33,7 +33,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(j as i32).as_str())
         auto v# = string::from("val_z_")
         v#.push_str(string::from_int(j as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         j = j + 1:usize
     }
     db#.flush_active_memtable().unwrap()
@@ -46,7 +46,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(k_idx as i32).as_str())
         auto v# = string::from("val_m_")
         v#.push_str(string::from_int(k_idx as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         k_idx = k_idx + 1:usize
     }
     db#.flush_active_memtable().unwrap()
@@ -63,7 +63,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(o as i32).as_str())
         auto v# = string::from("val_m_updated_")
         v#.push_str(string::from_int(o as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         o = o + 1:usize
     }
     auto n# = 0:usize
@@ -72,7 +72,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(n as i32).as_str())
         auto v# = string::from("val_n_")
         v#.push_str(string::from_int(n as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         n = n + 1:usize
     }
     db#.flush_active_memtable().unwrap()

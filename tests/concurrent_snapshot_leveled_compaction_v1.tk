@@ -40,7 +40,7 @@ fn test_concurrent_snapshot_leveled_compaction() {
         loop i < 15 {
             auto k = make_key(string::from("seed"), i)
             auto v = make_val(string::from("seed"), i + t * 100)
-            db.put(cede k, cede v).unwrap()
+            db.put(k, v).unwrap()
             i = i + 1
         }
         db.flush_active_memtable().unwrap()
@@ -62,7 +62,7 @@ fn test_concurrent_snapshot_leveled_compaction() {
             auto idx# = 0
             loop idx < 15 {
                 auto k = make_key(string::from("seed"), idx)
-                auto r_res = snap_db.get_at_snapshot(cede k, lease)
+                auto r_res = snap_db.get_at_snapshot(k, lease)
                 assert(r_res.is_ok(), "get_at_snapshot must succeed")
                 assert(r_res.unwrap().is_some(), "seed key must be visible in snapshot")
                 yield_now()
@@ -80,7 +80,7 @@ fn test_concurrent_snapshot_leveled_compaction() {
             auto idx# = 0
             loop idx < 15 {
                 auto k = make_key(string::from("seed"), idx)
-                auto r_res = reader_db.get(cede k)
+                auto r_res = reader_db.get(k)
                 assert(r_res.is_ok(), "get must succeed")
                 yield_now()
                 idx = idx + 1
@@ -98,7 +98,7 @@ fn test_concurrent_snapshot_leveled_compaction() {
             loop idx < 10 {
                 auto k = make_key(string::from("dyn"), idx + round * 10)
                 auto v = make_val(string::from("dyn"), idx + round * 10)
-                writer_db.put(cede k, cede v).unwrap()
+                writer_db.put(k, v).unwrap()
                 idx = idx + 1
             }
             writer_db.flush_active_memtable().unwrap()

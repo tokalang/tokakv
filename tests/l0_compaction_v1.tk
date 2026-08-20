@@ -20,36 +20,36 @@ fn test_l0_compaction_deduplication_and_tombstones() {
     // Flush 1: k1="v1", k2="v2_old", k3="v3_old"
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db.put(cede k1, cede v1).unwrap()
+    db.put(k1, v1).unwrap()
 
     auto k2_1 = string::from("k2")
     auto v2_1 = string::from("v2_old")
-    db.put(cede k2_1, cede v2_1).unwrap()
+    db.put(k2_1, v2_1).unwrap()
 
     auto k3_1 = string::from("k3")
     auto v3_1 = string::from("v3_old")
-    db.put(cede k3_1, cede v3_1).unwrap()
+    db.put(k3_1, v3_1).unwrap()
 
     db.flush_active_memtable().unwrap()
 
     // Flush 2: k2="v2_updated", k4="v4"
     auto k2_2 = string::from("k2")
     auto v2_2 = string::from("v2_updated")
-    db.put(cede k2_2, cede v2_2).unwrap()
+    db.put(k2_2, v2_2).unwrap()
 
     auto k4 = string::from("k4")
     auto v4 = string::from("v4")
-    db.put(cede k4, cede v4).unwrap()
+    db.put(k4, v4).unwrap()
 
     db.flush_active_memtable().unwrap()
 
     // Flush 3: delete k3 (tombstone), k5="v5"
     auto k3_del = string::from("k3")
-    db.delete(cede k3_del).unwrap()
+    db.delete(k3_del).unwrap()
 
     auto k5 = string::from("k5")
     auto v5 = string::from("v5")
-    db.put(cede k5, cede v5).unwrap()
+    db.put(k5, v5).unwrap()
 
     db.flush_active_memtable().unwrap()
 

@@ -20,7 +20,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(i as i32).as_str())
         auto v# = string::from("val_")
         v#.push_str(string::from_int(i as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         i = i + 1:usize
     }
     db#.flush_active_memtable().unwrap()
@@ -32,7 +32,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(j as i32).as_str())
         auto v# = string::from("val_updated_")
         v#.push_str(string::from_int(j as i32).as_str())
-        db#.put(cede k, cede v).unwrap()
+        db#.put(k, v).unwrap()
         j = j + 1:usize
     }
     db#.flush_active_memtable().unwrap()
@@ -69,7 +69,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(c1 as i32).as_str())
         auto exp_v# = string::from("val_")
         exp_v#.push_str(string::from_int(c1 as i32).as_str())
-        auto r = db#.get(cede k).unwrap()
+        auto r = db#.get(k).unwrap()
         assert(r.is_some(), "key must exist")
         assert(r.unwrap().as_str().equals(exp_v.as_str()), "val mismatch for non-updated key")
         c1 = c1 + 1:usize
@@ -81,7 +81,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(c2 as i32).as_str())
         auto exp_v# = string::from("val_updated_")
         exp_v#.push_str(string::from_int(c2 as i32).as_str())
-        auto r = db#.get(cede k).unwrap()
+        auto r = db#.get(k).unwrap()
         assert(r.is_some(), "key must exist")
         assert(r.unwrap().as_str().equals(exp_v.as_str()), "val mismatch for updated key")
         c2 = c2 + 1:usize

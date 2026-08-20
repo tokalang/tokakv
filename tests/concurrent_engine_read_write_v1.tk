@@ -39,7 +39,7 @@ fn test_concurrent_readers_and_writers() {
     loop i < 30 {
         auto k = make_key(string::from("seed"), i)
         auto v = make_val(string::from("seed"), i)
-        db.put(cede k, cede v).unwrap()
+        db.put(k, v).unwrap()
         i = i + 1
     }
     // Flush initial seed into SSTable
@@ -61,7 +61,7 @@ fn test_concurrent_readers_and_writers() {
             auto idx# = 0
             loop idx < 30 {
                 auto k = make_key(string::from("seed"), idx)
-                auto g_res = r1_db.get(cede k)
+                auto g_res = r1_db.get(k)
                 if g_res.is_err() {
                     assert(false, "Reader 1 get returned error")
                 }
@@ -84,7 +84,7 @@ fn test_concurrent_readers_and_writers() {
             auto idx# = 0
             loop idx < 40 {
                 auto k = make_key(string::from("w1"), idx)
-                auto g_res = r2_db.get(cede k)
+                auto g_res = r2_db.get(k)
                 if g_res.is_err() {
                     assert(false, "Reader 2 get returned error")
                 }
@@ -103,7 +103,7 @@ fn test_concurrent_readers_and_writers() {
             auto idx# = 0
             loop idx < 40 {
                 auto k = make_key(string::from("w2"), idx)
-                auto g_res = r3_db.get(cede k)
+                auto g_res = r3_db.get(k)
                 if g_res.is_err() {
                     assert(false, "Reader 3 get returned error")
                 }
@@ -120,7 +120,7 @@ fn test_concurrent_readers_and_writers() {
         auto round# = 0
         loop round < 50 {
             auto k = make_key(string::from("seed"), 0)
-            auto g_res = r4_db.get(cede k)
+            auto g_res = r4_db.get(k)
             if g_res.is_err() {
                 assert(false, "Reader 4 query error")
             }
@@ -138,7 +138,7 @@ fn test_concurrent_readers_and_writers() {
         loop idx < 40 {
             auto k = make_key(string::from("w1"), idx)
             auto v = make_val(string::from("w1"), idx)
-            auto p_res = w1_db.put(cede k, cede v)
+            auto p_res = w1_db.put(k, v)
             assert(p_res.is_ok(), "Writer 1 put failed")
             yield_now()
             idx = idx + 1
@@ -152,7 +152,7 @@ fn test_concurrent_readers_and_writers() {
         loop idx < 40 {
             auto k = make_key(string::from("w2"), idx)
             auto v = make_val(string::from("w2"), idx)
-            auto p_res = w2_db.put(cede k, cede v)
+            auto p_res = w2_db.put(k, v)
             assert(p_res.is_ok(), "Writer 2 put failed")
             if idx == 20 {
                 auto f_res = w2_db.flush_active_memtable()
@@ -190,11 +190,11 @@ fn test_concurrent_readers_and_writers() {
     auto k_check# = 0
     loop k_check < 40 {
         auto k1 = make_key(string::from("w1"), k_check)
-        auto g1 = db.get(cede k1).unwrap()
+        auto g1 = db.get(k1).unwrap()
         assert(g1.is_some(), "w1 key must be present in final state")
 
         auto k2 = make_key(string::from("w2"), k_check)
-        auto g2 = db.get(cede k2).unwrap()
+        auto g2 = db.get(k2).unwrap()
         assert(g2.is_some(), "w2 key must be present in final state")
         k_check = k_check + 1
     }

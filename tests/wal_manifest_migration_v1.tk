@@ -63,7 +63,7 @@ fn create_legacy_v1_database(db_path: string) {
         k#.push_str(string::from_int(i as i32).as_str())
         auto v# = string::from("mig_val_")
         v#.push_str(string::from_int(i as i32).as_str())
-        wal_w#.append(OP_PUT, i as u64, cede k, cede v).unwrap()
+        wal_w#.append(OP_PUT, i as u64, k, v).unwrap()
         i = i + 1:usize
     }
     wal_w#.close()
@@ -94,7 +94,7 @@ fn test_legacy_v1_migration() {
         k#.push_str(string::from_int(i as i32).as_str())
         auto exp_v# = string::from("mig_val_")
         exp_v#.push_str(string::from_int(i as i32).as_str())
-        auto res = db#.get(cede k).unwrap()
+        auto res = db#.get(k).unwrap()
         assert(res.is_some(), "Migrated key must be found")
         assert(res.unwrap().as_str().equals(exp_v.as_str()), "Migrated value mismatch")
         i = i + 1:usize
@@ -103,7 +103,7 @@ fn test_legacy_v1_migration() {
     // 2. Put new record 11 into migrated engine
     auto k11 = string::from("mig_key_11")
     auto v11 = string::from("mig_val_11")
-    db#.put(cede k11, cede v11).unwrap()
+    db#.put(k11, v11).unwrap()
     assert(db#.current_seq() == 11:u64, "Current seq must be 11")
 
     db#.close().unwrap()
@@ -127,7 +127,7 @@ fn test_legacy_v1_migration() {
         k#.push_str(string::from_int(i as i32).as_str())
         auto exp_v# = string::from("mig_val_")
         exp_v#.push_str(string::from_int(i as i32).as_str())
-        auto res = db2#.get(cede k).unwrap()
+        auto res = db2#.get(k).unwrap()
         assert(res.is_some(), "Key must exist in reopened migrated DB")
         assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch in reopened migrated DB")
         i = i + 1:usize
@@ -242,7 +242,7 @@ fn test_migration_crash_recovery(exe_path: string, fp_name: string, sub_name: st
         k#.push_str(string::from_int(i as i32).as_str())
         auto exp_v# = string::from("mig_val_")
         exp_v#.push_str(string::from_int(i as i32).as_str())
-        auto res = db#.get(cede k).unwrap()
+        auto res = db#.get(k).unwrap()
         assert(res.is_some(), "Key must exist after migration crash reopen")
         assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch after migration crash reopen")
         i = i + 1:usize
@@ -312,7 +312,7 @@ fn test_target_wal_corrupt_overwritten_by_legacy_wal() {
         k#.push_str(string::from_int(i as i32).as_str())
         auto exp_v# = string::from("mig_val_")
         exp_v#.push_str(string::from_int(i as i32).as_str())
-        auto res = db#.get(cede k).unwrap()
+        auto res = db#.get(k).unwrap()
         assert(res.is_some(), "Key must exist from authoritative wal.log")
         assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch from authoritative wal.log")
         i = i + 1:usize
@@ -413,7 +413,7 @@ fn test_legacy_wal_non_enoent_error_fail_closed() {
         k#.push_str(string::from_int(i as i32).as_str())
         auto exp_v# = string::from("mig_val_")
         exp_v#.push_str(string::from_int(i as i32).as_str())
-        auto res = db#.get(cede k).unwrap()
+        auto res = db#.get(k).unwrap()
         assert(res.is_some(), "Key must exist after permissions restored")
         assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch after permissions restored")
         i = i + 1:usize

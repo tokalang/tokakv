@@ -16,27 +16,27 @@ fn main() -> i32 {
     // 1. Initial write
     auto k1 = string::from("user_1001")
     auto v1 = string::from("alice_initial")
-    db#.put(cede k1, cede v1).unwrap()
+    db#.put(k1, v1).unwrap()
     auto s1 = db#.acquire_snapshot().unwrap()
     assert(s1.sequence() == 1:u64, "s1 seq must be 1")
 
     // 2. Overwrite in active MemTable
     auto k1_2 = string::from("user_1001")
     auto v2 = string::from("alice_updated_v2")
-    db#.put(cede k1_2, cede v2).unwrap()
+    db#.put(k1_2, v2).unwrap()
     auto s2 = db#.acquire_snapshot().unwrap()
     assert(s2.sequence() == 2:u64, "s2 seq must be 2")
 
     // 3. Delete in active MemTable (tombstone)
     auto k1_3 = string::from("user_1001")
-    db#.delete(cede k1_3).unwrap()
+    db#.delete(k1_3).unwrap()
     auto s3 = db#.acquire_snapshot().unwrap()
     assert(s3.sequence() == 3:u64, "s3 seq must be 3")
 
     // 4. Re-insert in active MemTable
     auto k1_4 = string::from("user_1001")
     auto v4 = string::from("alice_reborn_v4")
-    db#.put(cede k1_4, cede v4).unwrap()
+    db#.put(k1_4, v4).unwrap()
     auto s4 = db#.acquire_snapshot().unwrap()
     assert(s4.sequence() == 4:u64, "s4 seq must be 4")
 

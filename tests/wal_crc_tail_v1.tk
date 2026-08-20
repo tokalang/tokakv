@@ -29,7 +29,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(i as i32).as_str())
         auto v# = string::from("v_")
         v#.push_str(string::from_int(i as i32).as_str())
-        assert(db1#.put(cede k, cede v).is_ok(), "db1 put failed")
+        assert(db1#.put(k, v).is_ok(), "db1 put failed")
         i = i + 1:usize
     }
     assert(db1#.close().is_ok(), "db1 close failed")

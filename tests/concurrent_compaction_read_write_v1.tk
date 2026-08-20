@@ -41,7 +41,7 @@ fn test_concurrent_compaction_read_write() {
         loop i < 20 {
             auto k = make_key(string::from("seed"), i)
             auto v = make_val(string::from("seed"), i + t * 100)
-            db.put(cede k, cede v).unwrap()
+            db.put(k, v).unwrap()
             i = i + 1
         }
         db.flush_active_memtable().unwrap()
@@ -63,7 +63,7 @@ fn test_concurrent_compaction_read_write() {
             auto idx# = 0
             loop idx < 20 {
                 auto k = make_key(string::from("seed"), idx)
-                auto g_res = r1_db.get(cede k)
+                auto g_res = r1_db.get(k)
                 assert(g_res.is_ok(), "Reader 1 get failed")
                 auto opt = g_res.unwrap()
                 assert(opt.is_some(), "Seed key must exist")
@@ -84,7 +84,7 @@ fn test_concurrent_compaction_read_write() {
             auto idx# = 0
             loop idx < 30 {
                 auto k = make_key(string::from("dyn"), idx)
-                auto g_res = r2_db.get(cede k)
+                auto g_res = r2_db.get(k)
                 assert(g_res.is_ok(), "Reader 2 get failed")
                 yield_now()
                 idx = idx + 1
@@ -99,7 +99,7 @@ fn test_concurrent_compaction_read_write() {
         auto round# = 0
         loop round < 60 {
             auto k = make_key(string::from("seed"), 5)
-            auto g_res = r3_db.get(cede k)
+            auto g_res = r3_db.get(k)
             assert(g_res.is_ok(), "Reader 3 get failed")
             auto opt = g_res.unwrap()
             assert(opt.is_some(), "Seed key 5 must exist")
@@ -115,7 +115,7 @@ fn test_concurrent_compaction_read_write() {
         loop idx < 30 {
             auto k = make_key(string::from("dyn"), idx)
             auto v = make_val(string::from("dyn"), idx)
-            auto p_res = w1_db.put(cede k, cede v)
+            auto p_res = w1_db.put(k, v)
             assert(p_res.is_ok(), "Writer put failed")
             yield_now()
             idx = idx + 1
@@ -146,7 +146,7 @@ fn test_concurrent_compaction_read_write() {
     auto s_idx# = 0
     loop s_idx < 20 {
         auto k = make_key(string::from("seed"), s_idx)
-        auto g_res = db.get(cede k).unwrap()
+        auto g_res = db.get(k).unwrap()
         assert(g_res.is_some(), "Seed key must exist post-compaction")
         s_idx = s_idx + 1
     }
@@ -160,7 +160,7 @@ fn test_concurrent_compaction_read_write() {
     auto r_idx# = 0
     loop r_idx < 20 {
         auto k = make_key(string::from("seed"), r_idx)
-        auto g_res = db2.get(cede k).unwrap()
+        auto g_res = db2.get(k).unwrap()
         assert(g_res.is_some(), "Seed key must exist in reopened DB")
         r_idx = r_idx + 1
     }

@@ -21,12 +21,12 @@ fn main() -> i32 {
     // Flush 2 SSTables
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db.put(cede k1, cede v1).unwrap()
+    db.put(k1, v1).unwrap()
     db.flush_active_memtable().unwrap()
 
     auto k2 = string::from("k2")
     auto v2 = string::from("v2")
-    db.put(cede k2, cede v2).unwrap()
+    db.put(k2, v2).unwrap()
     db.flush_active_memtable().unwrap()
 
     assert(db.current_version().tables_count() == 2:usize, "2 SSTables before compaction")

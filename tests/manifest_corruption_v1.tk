@@ -18,7 +18,7 @@ fn test_corrupted_manifest_magic() {
     auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db1#.put(cede k1, cede v1).unwrap()
+    db1#.put(k1, v1).unwrap()
     db1#.flush_active_memtable().unwrap()
     db1#.close().unwrap()
 
@@ -59,12 +59,12 @@ fn test_corrupted_manifest_record_crc() {
     auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db1#.put(cede k1, cede v1).unwrap()
+    db1#.put(k1, v1).unwrap()
     db1#.flush_active_memtable().unwrap()
 
     auto k2 = string::from("k2")
     auto v2 = string::from("v2")
-    db1#.put(cede k2, cede v2).unwrap()
+    db1#.put(k2, v2).unwrap()
     db1#.flush_active_memtable().unwrap()
     db1#.close().unwrap()
 
@@ -107,7 +107,7 @@ fn test_manifest_last_complete_frame_crc_corruption() {
     auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db1#.put(cede k1, cede v1).unwrap()
+    db1#.put(k1, v1).unwrap()
     db1#.flush_active_memtable().unwrap()
     db1#.close().unwrap()
 
@@ -153,7 +153,7 @@ fn test_missing_referenced_sstable() {
     auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db1#.put(cede k1, cede v1).unwrap()
+    db1#.put(k1, v1).unwrap()
     db1#.flush_active_memtable().unwrap()
     auto cur_v = db1#.current_version()
     auto sst_fnum = cur_v.get_table(0:usize).meta.file_number
@@ -178,7 +178,7 @@ fn test_manifest_torn_tail_recovery() {
     auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db1#.put(cede k1, cede v1).unwrap()
+    db1#.put(k1, v1).unwrap()
     db1#.flush_active_memtable().unwrap()
     db1#.close().unwrap()
 
@@ -220,7 +220,7 @@ fn test_engine_get_fail_closed_on_corrupted_data_block() {
     auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
     auto k1 = string::from("key_corrupt_test")
     auto v1 = string::from("val_corrupt_test")
-    db#.put(cede k1, cede v1).unwrap()
+    db#.put(k1, v1).unwrap()
     db#.flush_active_memtable().unwrap()
     auto cur_v = db#.current_version()
     auto sst_fnum = cur_v.get_table(0:usize).meta.file_number
@@ -297,7 +297,7 @@ fn test_reject_level_above_l1_in_manifest() {
     put_u32_le(payload#, 0:u32) // del_count = 0
 
     // Frame with valid CRC
-    auto frame# = frame_manifest_payload(cede payload).unwrap()
+    auto frame# = frame_manifest_payload(payload).unwrap()
 
     // Append frame to MANIFEST
     auto manifest_path = build_manifest_path(db_path.clone())

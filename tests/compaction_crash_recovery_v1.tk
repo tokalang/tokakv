@@ -17,22 +17,22 @@ fn seed_two_tables(db: TokaKvEngine) {
     // Flush 1: k1="v1", k2="v2_old"
     auto k1 = string::from("k1")
     auto v1 = string::from("v1")
-    db.put(cede k1, cede v1).unwrap()
+    db.put(k1, v1).unwrap()
 
     auto k2_1 = string::from("k2")
     auto v2_1 = string::from("v2_old")
-    db.put(cede k2_1, cede v2_1).unwrap()
+    db.put(k2_1, v2_1).unwrap()
 
     db.flush_active_memtable().unwrap()
 
     // Flush 2: k2="v2_new", k3="v3"
     auto k2_2 = string::from("k2")
     auto v2_2 = string::from("v2_new")
-    db.put(cede k2_2, cede v2_2).unwrap()
+    db.put(k2_2, v2_2).unwrap()
 
     auto k3 = string::from("k3")
     auto v3 = string::from("v3")
-    db.put(cede k3, cede v3).unwrap()
+    db.put(k3, v3).unwrap()
 
     db.flush_active_memtable().unwrap()
 }

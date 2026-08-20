@@ -16,7 +16,7 @@ fn main() -> i32 {
         k#.push_str(string::from_int(i as i32).as_str())
         auto v# = string::from("value_")
         v#.push_str(string::from_int(i as i32).as_str())
-        auto p_res = db1#.put(cede k, cede v)
+        auto p_res = db1#.put(k, v)
         assert(p_res.is_ok(), "put failed")
         i = i + 1:usize
     }
@@ -29,7 +29,7 @@ fn main() -> i32 {
         auto v# = string::from("value_")
         v#.push_str(string::from_int(up_i as i32).as_str())
         v#.push_str("_v2")
-        auto p_res = db1#.put(cede k, cede v)
+        auto p_res = db1#.put(k, v)
         assert(p_res.is_ok(), "overwrite failed")
         up_i = up_i + 1:usize
     }
@@ -39,7 +39,7 @@ fn main() -> i32 {
     loop del_i <= 49:usize {
         auto k# = string::from("user:")
         k#.push_str(string::from_int(del_i as i32).as_str())
-        auto d_res = db1#.delete(cede k)
+        auto d_res = db1#.delete(k)
         assert(d_res.is_ok(), "delete failed")
         del_i = del_i + 1:usize
     }
@@ -128,7 +128,7 @@ fn main() -> i32 {
     // 3. Continue writing in session 2: sequence must continue from 66
     auto k51 = string::from("user:51")
     auto v51 = string::from("value_51")
-    auto p51_res = db2#.put(cede k51, cede v51)
+    auto p51_res = db2#.put(k51, v51)
     assert(p51_res.is_ok(), "session 2 put failed")
     assert(p51_res.unwrap() == 66:u64, "Sequence must be 66")
     assert(db2#.current_seq() == 66:u64, "Current seq must be 66")

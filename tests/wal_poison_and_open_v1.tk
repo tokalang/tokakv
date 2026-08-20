@@ -83,7 +83,7 @@ fn main() -> i32 {
     assert(!eng#.is_poisoned(), "engine must not be poisoned initially")
     auto ek1 = string::from("user:1")
     auto ev1 = string::from("val:1")
-    assert(eng#.put(cede ek1, cede ev1).is_ok(), "put 1 failed")
+    assert(eng#.put(ek1, ev1).is_ok(), "put 1 failed")
     assert(eng#.current_seq() == 1:u64, "seq must be 1")
 
     // --- A. Inject forced_pwrite_error failpoint ---
@@ -91,7 +91,7 @@ fn main() -> i32 {
 
     auto ek2 = string::from("user:2")
     auto ev2 = string::from("val:2")
-    auto put_fail_res = eng#.put(cede ek2, cede ev2)
+    auto put_fail_res = eng#.put(ek2, ev2)
     assert(put_fail_res.is_err(), "put with forced_pwrite_error must fail")
     assert(eng#.is_poisoned(), "Engine MUST BE POISONED after pwrite error!")
     assert(eng#.current_seq() == 1:u64, "Sequence MUST NOT increment on failed write!")
@@ -99,14 +99,14 @@ fn main() -> i32 {
     // Subsequent calls must return KvError::poisoned (code -6)
     auto ek3 = string::from("user:3")
     auto ev3 = string::from("val:3")
-    auto post_put = eng#.put(cede ek3, cede ev3)
+    auto post_put = eng#.put(ek3, ev3)
     assert(post_put.is_err(), "post_put must fail")
     auto err_p = post_put.unwrap_err()
     assert(err_p.kind.as_str().equals("poisoned"), "Must report poisoned")
     assert(err_p.code == -6:i32, "Poisoned code must be -6")
 
     auto del_k = string::from("user:1")
-    auto post_del = eng#.delete(cede del_k)
+    auto post_del = eng#.delete(del_k)
     assert(post_del.is_err(), "post_del must fail")
     auto err_d = post_del.unwrap_err()
     assert(err_d.kind.as_str().equals("poisoned"), "Must report poisoned")
@@ -136,7 +136,7 @@ fn main() -> i32 {
 
     auto ek4 = string::from("user:4")
     auto ev4 = string::from("val:4")
-    auto sync_fail_res = eng_reopened#.put(cede ek4, cede ev4)
+    auto sync_fail_res = eng_reopened#.put(ek4, ev4)
     assert(sync_fail_res.is_err(), "put with forced_sync_error must fail")
     assert(eng_reopened#.is_poisoned(), "Engine MUST BE POISONED after sync error!")
     assert(eng_reopened#.current_seq() == 1:u64, "Sequence MUST NOT increment on sync failure!")

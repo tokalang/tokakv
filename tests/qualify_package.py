@@ -74,6 +74,7 @@ def main():
         ("tombstone_gc_whole_group_and_empty_output_v1", os.path.join(TOKAKV_DIR, "tests", "tombstone_gc_whole_group_and_empty_output_v1.tk")),
         ("l1_compaction_failpoint_crash_recovery_v1", os.path.join(TOKAKV_DIR, "tests", "l1_compaction_failpoint_crash_recovery_v1.tk")),
         ("concurrent_snapshot_leveled_compaction_v1", os.path.join(TOKAKV_DIR, "tests", "concurrent_snapshot_leveled_compaction_v1.tk")),
+        ("value_lease_v1", os.path.join(TOKAKV_DIR, "tests", "value_lease_v1.tk")),
     ]
 
     tsan_tests = [
@@ -98,6 +99,8 @@ def main():
         ("diag_snapshot_registry_cannot_acquire_lease", os.path.join(TOKAKV_DIR, "tests", "diag_snapshot_registry_cannot_acquire_lease.tk"), "E0417"),
         ("diag_snapshot_capability_cannot_grant", os.path.join(TOKAKV_DIR, "tests", "diag_snapshot_capability_cannot_grant.tk"), "E04551"),
         ("diag_snapshot_capability_cannot_forge", os.path.join(TOKAKV_DIR, "tests", "diag_snapshot_capability_cannot_forge.tk"), "E0418"),
+        ("diag_value_view_outlives_lease", os.path.join(TOKAKV_DIR, "tests", "diag_value_view_outlives_lease.tk"), "E0455"),
+        ("diag_value_lease_private_fields", os.path.join(TOKAKV_DIR, "tests", "diag_value_lease_private_fields.tk"), "E0418"),
     ]
 
     passed = 0

@@ -14,23 +14,26 @@ pub const PACKAGE = (
 
 pub const AI_CONTRACT = (
     schema = "toka-official-package-v1",
-    summary = "Fast, durable, single-writer key-value engine with append-only WAL, CRC32 verification, crash recovery, and immutable MemTable rotation.",
+    summary = "Durable MVCC LSM key-value engine with WAL recovery, immutable SSTables, snapshot-aware compaction, block caching, and owner-pinned value leases.",
     capabilities = (
         "binary WAL record framing with CRC32-IEEE checksum",
         "synchronous durable commit via WalFile sync_data",
         "fail-closed recovery: clean EOF and valid records restored, torn tails safely truncated, corrupted frames rejected",
         "single-writer MemTable with consumed immutable freeze",
-        "Put, Delete (tombstone), and Get key-value operations"
+        "Put, Delete (tombstone), and Get key-value operations",
+        "immutable SSTables with Manifest/VersionSet recovery",
+        "MVCC snapshots and snapshot-aware L0-to-L1 compaction",
+        "thread-safe LRU block cache with full-IR ASan and TSan qualification",
+        "PAL-bound ValueLease reads with cache-pinned decoded SSTable values"
     ),
     non_goals = (
         "Redis protocol server",
-        "SSTable on-disk format",
-        "background LSM compaction",
-        "multi-version snapshots",
+        "distributed replication or consensus",
+        "levels deeper than L1",
         "async disk offload"
     ),
     safety = (
-        "zero unverified byte ingestion; corrupted full-frame CRC32 halts startup with KvError::CorruptedRecord; torn writes at EOF are safely physical-truncated via ftruncate; explicit bounds on key (64KB), value (32MB), and record (33.6MB) prevent unbounded allocations; freeze consumes active MemTable ownership"
+        "fail-closed CRC and bounds validation; owner-carrying positional I/O buffers; RAII snapshots and cache pins; PAL-bound borrowed value views; atomic Manifest replacement; test-only failpoints excluded from release builds"
     ),
     qualification = ("python3 tests/qualify_package.py")
 )

@@ -1,0 +1,7 @@
+import official/tokakv/cache/block_cache::{ValueLease}
+
+fn main() -> i32 {
+    auto owned = string::from("owned")
+    auto lease = ValueLease::from_owned(cede owned)
+    return lease.index as i32
+}

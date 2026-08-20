@@ -13,6 +13,30 @@ import official/tokakv/types::{Entry, KvError, LookupResult}
 import official/tokakv/memtable::{compare_internal_key}
 import official/tokakv/sstable/block::{decode_and_validate_data_block}
 
+/// Internal non-owning lookup result. A Hit index is only valid while its
+/// corresponding CachedBlock remains pinned by a BlockLease.
+shape BlockLookupIndex (
+    Hit(usize) = 1 |
+    Deleted = 2 |
+    NotFound = 0
+)
+
+impl BlockLookupIndex {
+    fn hit_index(self) -> Option<usize> {
+        match self {
+            auto BlockLookupIndex::Hit(index) => return Option<usize>::Some(index)
+            _ => return Option<usize>::None
+        }
+    }
+
+    fn is_deleted(self) -> bool {
+        match self {
+            auto BlockLookupIndex::Deleted => return true
+            _ => return false
+        }
+    }
+}
+
 /// CachedBlock: An immutable decoded data block residing in memory.
 pub shape CachedBlock (
     file_number: u64,
@@ -34,6 +58,43 @@ impl CachedBlock {
             estimated_size_bytes = estimated_size_bytes
         )
         return cede ~blk
+    }
+
+    /// Finds the matching entry without cloning its value.
+    fn lookup_index_at_seq(self, key_slice: str, target_seq: u64) -> BlockLookupIndex {
+        auto count = self.entries.len()
+        if count == 0:usize {
+            return BlockLookupIndex::NotFound
+        }
+        auto low# = 0:usize
+        auto high# = count
+
+        loop low < high {
+            auto mid = low + ((high - low) / 2:usize)
+            auto &mid_entry = self.entries.borrow(mid)
+            auto cmp = compare_internal_key(key_slice, target_seq, mid_entry.key.as_str(), mid_entry.seq)
+            if cmp <= 0:i32 {
+                high = mid
+            } else {
+                low = mid + 1:usize
+            }
+        }
+        if low < count {
+            auto &entry = self.entries.borrow(low)
+            if entry.key.as_str().equals(key_slice) && entry.seq <= target_seq {
+                if entry.is_del {
+                    return BlockLookupIndex::Deleted
+                } else {
+                    return BlockLookupIndex::Hit(low)
+                }
+            }
+        }
+        return BlockLookupIndex::NotFound
+    }
+
+    fn value_at(self, index: usize) -> str <- self {
+        auto &entry = self.entries.borrow(index)
+        return entry.value.as_str()
     }
 
     /// Performs safe binary search lookup for a specific sequence watermark within the block's entries.
@@ -111,9 +172,130 @@ impl BlockLease {
         return self.lookup_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64)
     }
 
+    fn lookup_index_at_seq(self, key: str, target_seq: u64) -> BlockLookupIndex {
+        return self.block.lookup_index_at_seq(key, target_seq)
+    }
+
+    fn value_at(self, index: usize) -> str <- self {
+        return self.block.value_at(index)
+    }
+
     pub fn estimated_size_bytes(self) -> usize {
         return self.block.estimated_size_bytes
     }
+}
+
+/// A value view whose storage remains alive for the lifetime of this object.
+/// Cached hits pin their resident block. Owned values are placed in a
+/// one-entry transient block so both cases share the same provable borrow path.
+pub shape ValueLease (
+    lease: BlockLease,
+    index: usize
+)
+
+impl ValueLease@Encap {}
+impl ValueLease@Send {}
+impl ValueLease@Sync {}
+
+impl ValueLease {
+    fn from_cached(cede lease: BlockLease, index: usize) -> ValueLease {
+        return ValueLease(lease = cede lease, index = index)
+    }
+
+    pub fn from_owned(cede value: string) -> ValueLease {
+        auto estimated_size = value.len() + 32:usize
+        auto entries# = Vec<Entry>::with_capacity(1:usize)
+        entries#.push(Entry::new_put(
+            cede string::new(),
+            cede value,
+            0:u64
+        ))
+        auto ~block = CachedBlock::new(
+            0:u64,
+            0:u64,
+            cede entries,
+            estimated_size
+        )
+        return ValueLease(
+            lease = BlockLease::new(~block),
+            index = 0:usize
+        )
+    }
+
+    pub fn as_str(self) -> str <- self {
+        return self.lease.value_at(self.index)
+    }
+
+    pub fn as_bytes(self) -> bytes <- self {
+        return self.as_str().as_bytes()
+    }
+
+    pub fn len(self) -> usize {
+        return self.as_str().len()
+    }
+
+    pub fn to_string(self) -> string {
+        return string::from(self.as_str())
+    }
+}
+
+/// Three-tier point lookup result retaining ownership of a hit's storage.
+pub shape LeasedLookupResult (
+    Hit(ValueLease) = 1 |
+    Deleted = 2 |
+    NotFound = 0
+)
+
+impl LeasedLookupResult {
+    pub fn is_hit(self) -> bool {
+        match self {
+            auto LeasedLookupResult::Hit(_) => return true
+            _ => return false
+        }
+    }
+
+    pub fn is_deleted(self) -> bool {
+        match self {
+            auto LeasedLookupResult::Deleted => return true
+            _ => return false
+        }
+    }
+
+    pub fn is_not_found(self) -> bool {
+        match self {
+            auto LeasedLookupResult::NotFound => return true
+            _ => return false
+        }
+    }
+
+    pub fn into_value(cede self) -> Option<ValueLease> {
+        match cede self {
+            auto LeasedLookupResult::Hit('lease) => {
+                return Option<ValueLease>::Some(cede 'lease)
+            }
+            _ => return Option<ValueLease>::None
+        }
+    }
+}
+
+/// Converts a block pin into a leased lookup result without cloning a hit.
+pub fn lookup_lease_at_seq(
+    cede lease: BlockLease,
+    key: str,
+    target_seq: u64
+) -> LeasedLookupResult {
+    auto index_result = lease.lookup_index_at_seq(key, target_seq)
+    auto lease_owner = Option<BlockLease>::Some(cede lease)
+    auto hit_index = index_result.hit_index()
+    if hit_index.is_some() {
+        auto index = hit_index.unwrap()
+        auto pinned = lease_owner.unwrap()
+        return LeasedLookupResult::Hit(ValueLease::from_cached(cede pinned, index))
+    }
+    if index_result.is_deleted() {
+        return LeasedLookupResult::Deleted
+    }
+    return LeasedLookupResult::NotFound
 }
 
 /// BlockEntry: An entry wrapper inside the LRU list holding a ~CachedBlock.

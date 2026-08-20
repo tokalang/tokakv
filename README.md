@@ -82,7 +82,14 @@
    - When all leases and cache entries for a block drop, the block's heap memory is safely reclaimed without raw pointers, `Addr`, or manual refcounts.
    - 100% Safe Toka: Zero `unsafe` blocks, zero raw pointer dereferences in `block_cache.tk`.
 
-2. **Strict Encapsulation & Field-Level Protection**:
+2. **Owner-Pinned Value Views (`ValueLease`)**:
+   - `TokaKvEngine::get_lease` and `get_lease_at_snapshot` preserve `Hit`, `Deleted`, and `NotFound` as `LeasedLookupResult`.
+   - SSTable hits keep `BlockLease + entry_index`, so `ValueLease::as_str() -> str <- self` and `as_bytes() -> bytes <- self` expose decoded cached values without another payload copy.
+   - Cache eviction and engine close do not invalidate an outstanding lease; the shared `CachedBlock` is reclaimed only after its final cache/lease owner drops.
+   - Active/Frozen MemTable hits use a one-value owned fallback because their read lock cannot safely escape; the existing `get()` copy API remains unchanged.
+   - PAL rejects a value view escaping its lease lifetime (`E0455`).
+
+3. **Strict Encapsulation & Field-Level Protection**:
    - `CachedBlock`, `BlockLease`, `BlockCacheInner`, and `BlockCache` are declared `@Encap`.
    - `BlockLease::lookup` performs binary search directly over `CachedBlock` internal entries using safe borrowed access without copying or moving `Vec<Entry>`.
    - Diagnostic compile-fail tests verify private member isolation:
@@ -90,19 +97,19 @@
      - `diag_block_cache_cannot_mutate_entries.tk`: Accessing `CachedBlock.entries` fails with `E0418`.
      - `diag_block_cache_cannot_mutate_inner.tk`: Accessing `BlockCache.~inner` fails with `E0418`.
 
-3. **Immutable Outer Receiver & Double-Check Loading**:
+4. **Immutable Outer Receiver & Double-Check Loading**:
    - `BlockCache::get_or_load(self, ...)` and `BlockCache::stats(self)` provide immutable `self` receivers backed by internal `Mutex<BlockCacheInner>`.
    - Lock payload access uses safe borrowed references (`auto &inner# = lock.get_ref()`).
    - Miss loader performs un-locked disk I/O via path parameter (`sst_path: string`) rather than consuming `@Encap` resource handles.
    - Re-acquires cache mutex upon decoded block construction to perform double-check insertion against concurrent peer workers.
 
-4. **Estimated Resident Memory Accounting & LRU Eviction**:
+5. **Estimated Resident Memory Accounting & LRU Eviction**:
    - Explicit `estimated_resident_bytes` accounting tracks block length, entry count (32 bytes overhead each), and key/value byte lengths.
    - Least Recently Used (LRU) eviction chain evicts oldest blocks when `resident_bytes + block_size > capacity_bytes`.
    - Blocks exceeding cache capacity bypass insertion and are returned directly as transient leases.
    - Decoded block CRC mismatches and I/O errors are never cached (fail-closed bypass).
 
-5. **Full LLVM IR ThreadSanitizer (TSan) Qualification**:
+6. **Full LLVM IR ThreadSanitizer (TSan) Qualification**:
    - `tokac --emit-llvm` generates complete LLVM IR for the concurrent test suite and library code.
    - `clang -fsanitize=thread` compiles the LLVM IR, instrumenting all Toka generated functions, memory operations, and synchronization points.
    - Jointly linked with `toka_rt_tsan.o` and executed under ThreadSanitizer with 0 data races and 0 concurrency defects.
@@ -137,4 +144,5 @@
 ## Known Boundaries, Technical Debt & Future Roadmap
 
 - **Tail Corruption Tolerance Strategy**: Incomplete frame headers or incomplete payloads at EOF are treated as torn tails and physically truncated; complete frames with invalid CRC unconditionally fail closed.
-- **Compaction & WAL Recycling**: SSTable multi-level compaction and obsolete WAL log recycling are scheduled for Phase 4.
+- **Pinned-After-Eviction Accounting**: `CacheStats.estimated_resident_bytes` counts blocks still resident in the LRU map; an evicted block retained solely by an outstanding `ValueLease` remains memory-safe but is not included in that counter.
+- **Current Leveled Scope**: Compaction currently targets L0-to-L1; deeper levels, distributed replication, and the Redis protocol server remain future work.

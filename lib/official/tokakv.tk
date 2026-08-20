@@ -25,7 +25,9 @@ import official/tokakv/manifest/version::{
     ActiveLogMetadata, SealedLogMetadata, TableMetadata, TableHandle, Version, VersionEdit, validate_l1_disjoint
 }
 import official/tokakv/manifest/version_set::{VersionSet, build_table_path, build_wal_path}
-import official/tokakv/cache/block_cache::{BlockCache, CacheStats}
+import official/tokakv/cache/block_cache::{
+    BlockCache, CacheStats, ValueLease, LeasedLookupResult
+}
 import sys/sync::{sys_atomic_init_i32, sys_atomic_load_i32, sys_atomic_store_i32, sys_atomic_destroy_i32}
 import sys/libc::{toka_test_check_failpoint}
 
@@ -191,6 +193,65 @@ impl ReadState {
 
     pub fn get(self, key: string, cache_opt: Option<&BlockCache>) -> Result<Option<string>, KvError> {
         return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
+    }
+
+    /// Lookup retaining a hit's backing storage beyond the read lock scope.
+    pub fn get_lease_at_seq(
+        self,
+        key: string,
+        target_seq: u64,
+        cache_opt: Option<&BlockCache>
+    ) -> Result<LeasedLookupResult, KvError> {
+        if self.health == HEALTH_POISONED {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
+        }
+        if self.health == HEALTH_CLOSED {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+
+        auto active = self.active_mem.get_at_seq(key.clone(), target_seq)
+        match cede active {
+            auto LookupResult::Hit('value) => {
+                return Result<LeasedLookupResult, KvError>::Ok(
+                    LeasedLookupResult::Hit(ValueLease::from_owned(cede 'value))
+                )
+            }
+            auto LookupResult::Deleted => {
+                return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::Deleted)
+            }
+            _ => {}
+        }
+
+        auto frozen_count = self.frozen_mems.len()
+        if frozen_count > 0:usize {
+            auto idx# = frozen_count
+            loop idx > 0:usize {
+                idx = idx - 1:usize
+                auto &frozen = self.frozen_mems.borrow(idx)
+                auto frozen_result = frozen.get_at_seq(key.clone(), target_seq)
+                match cede frozen_result {
+                    auto LookupResult::Hit('value) => {
+                        return Result<LeasedLookupResult, KvError>::Ok(
+                            LeasedLookupResult::Hit(ValueLease::from_owned(cede 'value))
+                        )
+                    }
+                    auto LookupResult::Deleted => {
+                        return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::Deleted)
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        return self.current_version.get_lease_at_seq(key, target_seq, cache_opt)
+    }
+
+    pub fn get_lease(
+        self,
+        key: string,
+        cache_opt: Option<&BlockCache>
+    ) -> Result<LeasedLookupResult, KvError> {
+        return self.get_lease_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
     }
 }
 
@@ -1182,6 +1243,27 @@ impl TokaKvEngine {
         return reg#.acquire_lease_with_cap(seq, self.engine_id, self.~snapshots, cap)
     }
 
+    fn resolve_snapshot_sequence(self, lease: SnapshotLease) -> Result<u64, KvError> {
+        if lease.engine_id() != self.engine_id {
+            return Result<u64, KvError>::Err(
+                KvError::corrupted("snapshot_lease_engine_mismatch")
+            )
+        }
+        auto snap_lock_res = self.snapshots.lock()
+        if snap_lock_res.is_err() {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        auto snap_g = snap_lock_res.unwrap()
+        auto &reg = snap_g.get_ref()
+        auto seq_opt = reg.get_sequence_for_id(lease.id())
+        if seq_opt.is_none() {
+            return Result<u64, KvError>::Err(
+                KvError::corrupted("snapshot_lease_expired_or_released")
+            )
+        }
+        return Result<u64, KvError>::Ok(seq_opt.unwrap())
+    }
+
     /// Point lookup at a specific snapshot point-in-time using authoritative registered sequence.
     pub fn get_at_snapshot(self, key: string, lease: SnapshotLease) -> Result<Option<string>, KvError> {
         if self.health.get() == (HEALTH_POISONED as i32) {
@@ -1190,20 +1272,11 @@ impl TokaKvEngine {
         if self.health.get() == (HEALTH_CLOSED as i32) {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
-        if lease.engine_id() != self.engine_id {
-            return Result<Option<string>, KvError>::Err(KvError::corrupted("snapshot_lease_engine_mismatch"))
+        auto seq_res = self.resolve_snapshot_sequence(lease)
+        if seq_res.is_err() {
+            return Result<Option<string>, KvError>::Err(seq_res.unwrap_err())
         }
-        auto snap_lock_res = self.snapshots.lock()
-        if snap_lock_res.is_err() {
-            return Result<Option<string>, KvError>::Err(KvError::closed())
-        }
-        auto snap_g = snap_lock_res.unwrap()
-        auto &reg = snap_g.get_ref()
-        auto seq_opt = reg.get_sequence_for_id(lease.id())
-        if seq_opt.is_none() {
-            return Result<Option<string>, KvError>::Err(KvError::corrupted("snapshot_lease_expired_or_released"))
-        }
-        auto authoritative_seq = seq_opt.unwrap()
+        auto authoritative_seq = seq_res.unwrap()
 
         auto r_lock_res = self.reader.read_lock()
         if r_lock_res.is_err() {
@@ -1220,6 +1293,45 @@ impl TokaKvEngine {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
         return rs.get_at_seq(key, authoritative_seq, Option<&BlockCache>::Some(&(self.block_cache)))
+    }
+
+    /// Snapshot lookup retaining the hit's backing storage behind a ValueLease.
+    pub fn get_lease_at_snapshot(
+        self,
+        key: string,
+        lease: SnapshotLease
+    ) -> Result<LeasedLookupResult, KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+        auto seq_res = self.resolve_snapshot_sequence(lease)
+        if seq_res.is_err() {
+            return Result<LeasedLookupResult, KvError>::Err(seq_res.unwrap_err())
+        }
+        auto authoritative_seq = seq_res.unwrap()
+
+        auto read_lock_res = self.reader.read_lock()
+        if read_lock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+        auto read_lock = read_lock_res.unwrap()
+        auto &state = read_lock.get_ref()
+        if state.health == HEALTH_POISONED {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
+        }
+        if state.health == HEALTH_CLOSED {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+        return state.get_lease_at_seq(
+            key,
+            authoritative_seq,
+            Option<&BlockCache>::Some(&(self.block_cache))
+        )
     }
 
     /// Returns the oldest live snapshot sequence (Result<Option<u64>, KvError>). Fail-closed on lock error.
@@ -1257,6 +1369,34 @@ impl TokaKvEngine {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
         return rs.get(key, Option<&BlockCache>::Some(&(self.block_cache)))
+    }
+
+    /// Point lookup retaining either a cache pin or an owned MemTable value.
+    pub fn get_lease(self, key: string) -> Result<LeasedLookupResult, KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+        auto read_lock_res = self.reader.read_lock()
+        if read_lock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+        auto read_lock = read_lock_res.unwrap()
+        auto &state = read_lock.get_ref()
+        if state.health == HEALTH_POISONED {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
+        }
+        if state.health == HEALTH_CLOSED {
+            return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
+        }
+        return state.get_lease(
+            key,
+            Option<&BlockCache>::Some(&(self.block_cache))
+        )
     }
 
     pub fn signal_maintenance(self, flush: bool, compaction: bool) {

@@ -1,0 +1,107 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// ValueLease qualification: MemTable fallback, cache pinning, snapshots,
+// tombstones, misses, and owner-bound byte/string views.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import core/option::{Option}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/cache/block_cache::{BlockCache, LeasedLookupResult}
+import official/tokakv/manifest/version_set::{build_table_path}
+import official/tokakv/sstable/reader::{SSTableReader}
+
+fn expect_value(cede result: LeasedLookupResult, expected: str) {
+    assert(result.is_hit(), "lookup must be a hit")
+    auto lease = result.into_value().unwrap()
+    assert(lease.as_str().equals(expected), "leased string value mismatch")
+    assert(lease.as_bytes().len() == expected.len(), "leased byte view length mismatch")
+    assert(lease.to_string().as_str().equals(expected), "owned conversion mismatch")
+}
+
+fn test_direct_reader_identity_isolation() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_direct_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    db#.put(string::from("same"), string::from("first")).unwrap()
+    db#.flush_active_memtable().unwrap()
+    db#.put(string::from("same"), string::from("second")).unwrap()
+    db#.flush_active_memtable().unwrap()
+
+    auto version = db#.current_version()
+    auto first_number = version.get_table(0:usize).meta.file_number
+    auto second_number = version.get_table(1:usize).meta.file_number
+    db#.close().unwrap()
+
+    auto first_path = build_table_path(db_path.clone(), first_number)
+    auto second_path = build_table_path(db_path.clone(), second_number)
+    auto first_reader = SSTableReader::open(first_path).unwrap()
+    auto second_reader = SSTableReader::open(second_path).unwrap()
+    auto cache = BlockCache::new(65536:usize)
+
+    auto first = first_reader.get_lease_with_cache(
+        string::from("same"), Option<&BlockCache>::Some(&cache)
+    ).unwrap()
+    expect_value(cede first, "first")
+    auto second = second_reader.get_lease_with_cache(
+        string::from("same"), Option<&BlockCache>::Some(&cache)
+    ).unwrap()
+    expect_value(cede second, "second")
+
+    auto stats = cache.stats()
+    assert(stats.hit_count == 0:u64 && stats.miss_count == 0:u64,
+           "readers without a manifest file number must bypass the shared cache")
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // A 150-byte cache holds one of these one-entry table blocks.
+    auto db# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 150:usize).unwrap()
+
+    db#.put(string::from("alpha"), string::from("val_alpha")).unwrap()
+    auto mem_result = db#.get_lease(string::from("alpha")).unwrap()
+    expect_value(cede mem_result, "val_alpha")
+    db#.flush_active_memtable().unwrap()
+
+    db#.put(string::from("beta"), string::from("val_beta")).unwrap()
+    db#.flush_active_memtable().unwrap()
+
+    // Pin Table 1, then load Table 2 and evict Table 1 from the cache map.
+    auto pinned_result = db#.get_lease(string::from("alpha")).unwrap()
+    auto pinned = pinned_result.into_value().unwrap()
+    assert(pinned.as_str().equals("val_alpha"), "initial pinned value mismatch")
+
+    auto second_result = db#.get_lease(string::from("beta")).unwrap()
+    expect_value(cede second_result, "val_beta")
+    assert(db.block_cache_stats().eviction_count == 1:u64,
+           "loading the second block must evict the first cache entry")
+    assert(pinned.as_str().equals("val_alpha"),
+           "eviction must not invalidate an outstanding ValueLease")
+
+    // Public leased lookup preserves tombstone and miss as distinct states.
+    db#.delete(string::from("deleted")).unwrap()
+    auto deleted = db#.get_lease(string::from("deleted")).unwrap()
+    assert(deleted.is_deleted(), "tombstone must remain distinguishable")
+    auto missing = db#.get_lease(string::from("missing")).unwrap()
+    assert(missing.is_not_found(), "missing key must remain distinguishable")
+
+    // Snapshot leased lookup uses the registry's authoritative sequence.
+    db#.put(string::from("snap"), string::from("v1")).unwrap()
+    auto snapshot# = db#.acquire_snapshot().unwrap()
+    db#.put(string::from("snap"), string::from("v2")).unwrap()
+    auto snap_result = db#.get_lease_at_snapshot(string::from("snap"), snapshot).unwrap()
+    expect_value(cede snap_result, "v1")
+
+    db#.close().unwrap()
+    assert(pinned.as_str().equals("val_alpha"),
+           "closing the engine must not invalidate an outstanding pin")
+    tmp#.remove()
+    test_direct_reader_identity_isolation()
+    println("[PASS] ValueLease owner-pinned read path qualified successfully!")
+    return 0
+}

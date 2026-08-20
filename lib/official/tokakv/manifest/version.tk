@@ -10,7 +10,7 @@ import std/vec::{Vec}
 import std/io::{println}
 import official/tokakv/types::{KvError, LookupResult}
 import official/tokakv/sstable/reader::{SSTableReader}
-import official/tokakv/cache/block_cache::{BlockCache}
+import official/tokakv/cache/block_cache::{BlockCache, LeasedLookupResult}
 
 pub shape TableMetadata (
     file_number: u64,
@@ -312,6 +312,89 @@ impl Version {
         }
 
         return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
+    }
+
+    /// Point lookup retaining a hit's backing storage behind a ValueLease.
+    pub fn get_lease_at_seq(
+        self,
+        key: string,
+        target_seq: u64,
+        cache_opt: Option<&BlockCache>
+    ) -> Result<LeasedLookupResult, KvError> {
+        auto count = self.tables.len()
+        if count == 0:usize {
+            return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::NotFound)
+        }
+
+        auto idx# = count
+        loop idx > 0:usize {
+            idx = idx - 1:usize
+            {
+                auto &handle_ref = self.tables.borrow(idx)
+                if handle_ref.meta.level == 0:u32 &&
+                   key.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 &&
+                   key.as_str().cmp(handle_ref.meta.largest_key.as_str()) <= 0:i32 {
+                    auto r_get = handle_ref.reader.get_lease_at_seq(
+                        key.clone(), target_seq, cache_opt
+                    )
+                    if r_get.is_err() {
+                        return Result<LeasedLookupResult, KvError>::Err(r_get.unwrap_err())
+                    }
+                    auto result = r_get.unwrap()
+                    match cede result {
+                        auto LeasedLookupResult::Hit('lease) => {
+                            return Result<LeasedLookupResult, KvError>::Ok(
+                                LeasedLookupResult::Hit(cede 'lease)
+                            )
+                        }
+                        auto LeasedLookupResult::Deleted => {
+                            return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::Deleted)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        auto l1_idx# = 0:usize
+        loop l1_idx < count {
+            {
+                auto &handle_ref = self.tables.borrow(l1_idx)
+                if handle_ref.meta.level == 1:u32 &&
+                   key.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 &&
+                   key.as_str().cmp(handle_ref.meta.largest_key.as_str()) <= 0:i32 {
+                    auto r_get = handle_ref.reader.get_lease_at_seq(
+                        key.clone(), target_seq, cache_opt
+                    )
+                    if r_get.is_err() {
+                        return Result<LeasedLookupResult, KvError>::Err(r_get.unwrap_err())
+                    }
+                    auto result = r_get.unwrap()
+                    match cede result {
+                        auto LeasedLookupResult::Hit('lease) => {
+                            return Result<LeasedLookupResult, KvError>::Ok(
+                                LeasedLookupResult::Hit(cede 'lease)
+                            )
+                        }
+                        auto LeasedLookupResult::Deleted => {
+                            return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::Deleted)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            l1_idx = l1_idx + 1:usize
+        }
+
+        return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::NotFound)
+    }
+
+    pub fn get_lease_with_cache(
+        self,
+        key: string,
+        cache_opt: Option<&BlockCache>
+    ) -> Result<LeasedLookupResult, KvError> {
+        return self.get_lease_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
     }
 
     /// Point lookup across active SSTables without external cache:

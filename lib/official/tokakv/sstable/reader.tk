@@ -9,13 +9,25 @@ import core/option::{Option}
 import std/vec::{Vec}
 import std/data_file::{ReadDataFile}
 import official/tokakv/types::{Entry, KvError, LookupResult}
-import official/tokakv/cache/block_cache::{BlockCache}
+import official/tokakv/cache/block_cache::{
+    BlockCache, ValueLease, LeasedLookupResult, lookup_lease_at_seq
+}
 import official/tokakv/sstable/format::{
     IndexEntry, FOOTER_SIZE, decode_and_validate_footer
 }
 import official/tokakv/sstable/block::{
     decode_and_validate_index_block, decode_and_validate_data_block,
     find_candidate_block, find_entry_in_block, find_entry_in_block_at_seq
+}
+
+fn owned_lookup_to_lease(cede lookup: LookupResult) -> LeasedLookupResult {
+    match cede lookup {
+        auto LookupResult::Hit('value) => {
+            return LeasedLookupResult::Hit(ValueLease::from_owned(cede 'value))
+        }
+        auto LookupResult::Deleted => return LeasedLookupResult::Deleted
+        _ => return LeasedLookupResult::NotFound
+    }
 }
 
 /// SSTableReader encapsulates a ReadDataFile and its decoded, validated in-memory index block.
@@ -173,6 +185,71 @@ impl SSTableReader {
     /// Point lookup for a key with optional block cache:
     pub fn get_with_cache(self, key: string, cache_opt: Option<&BlockCache>) -> Result<LookupResult, KvError> {
         return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
+    }
+
+    /// Point lookup retaining the hit's storage behind a ValueLease.
+    pub fn get_lease_with_cache(
+        self,
+        key: string,
+        cache_opt: Option<&BlockCache>
+    ) -> Result<LeasedLookupResult, KvError> {
+        return self.get_lease_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
+    }
+
+    /// Point lookup at a sequence watermark without cloning a cached hit.
+    /// Uncached hits are promoted into ValueLease-owned string storage.
+    pub fn get_lease_at_seq(
+        self,
+        key: string,
+        target_seq: u64,
+        cache_opt: Option<&BlockCache>
+    ) -> Result<LeasedLookupResult, KvError> {
+        match cache_opt {
+            auto Option<&BlockCache>::Some(&cache) => {
+                // A directly opened reader has no stable manifest file
+                // identity (`file_number == 0`). It must not enter a cache
+                // keyed only by (file_number, block_offset), because two
+                // unrelated direct readers would otherwise alias at (0, 0).
+                if self.file_number != 0:u64 {
+                    if self.min_seq > target_seq {
+                        return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::NotFound)
+                    }
+
+                    auto candidate_opt = self.find_candidate_block(key.as_str())
+                    if candidate_opt.is_none() {
+                        return Result<LeasedLookupResult, KvError>::Ok(LeasedLookupResult::NotFound)
+                    }
+                    auto block_entry = candidate_opt.unwrap()
+                    auto lease_res = cache.get_or_load(
+                        self.file_number,
+                        block_entry.offset,
+                        block_entry.length,
+                        self.path.clone()
+                    )
+                    if lease_res.is_err() {
+                        return Result<LeasedLookupResult, KvError>::Err(lease_res.unwrap_err())
+                    }
+                    auto lease = lease_res.unwrap()
+                    return Result<LeasedLookupResult, KvError>::Ok(
+                        lookup_lease_at_seq(cede lease, key.as_str(), target_seq)
+                    )
+                }
+            }
+            _ => {}
+        }
+
+        auto copied_res = self.get_at_seq(
+            key,
+            target_seq,
+            Option<&BlockCache>::None
+        )
+        if copied_res.is_err() {
+            return Result<LeasedLookupResult, KvError>::Err(copied_res.unwrap_err())
+        }
+        auto copied = copied_res.unwrap()
+        return Result<LeasedLookupResult, KvError>::Ok(
+            owned_lookup_to_lease(cede copied)
+        )
     }
 
     /// Point lookup for a key at a specific sequence watermark:

@@ -28,33 +28,33 @@ pub fn encode_data_block(entries: Vec<Entry>) -> Result<Vec<u8>, KvError> {
 
     auto i# = 0:usize
     loop i < count {
-        unsafe {
-            auto *entry = entries.unsafe_get(i)
-            // Verify internal key monotonicity
-            if i > 0:usize {
-                auto *prev = entries.unsafe_get(i - 1:usize)
-                auto cmp = compare_internal_key(prev.key.as_str(), prev.seq, entry.key.as_str(), entry.seq)
-                if cmp >= 0:i32 {
-                    return Result<Vec<u8>, KvError>::Err(KvError::corrupted("non_monotonic_data_block_keys"))
-                }
+        auto &entry = entries.borrow(i)
+        // Verify internal key monotonicity
+        if i > 0:usize {
+            auto &prev = entries.borrow(i - 1:usize)
+            auto cmp = compare_internal_key(prev.key.as_str(), prev.seq, entry.key.as_str(), entry.seq)
+            if cmp >= 0:i32 {
+                return Result<Vec<u8>, KvError>::Err(KvError::corrupted("non_monotonic_data_block_keys"))
             }
+        }
 
-            auto klen = entry.key.len()
-            auto vlen# = 0:usize
-            if !entry.is_del {
-                vlen = entry.value.len()
-            }
+        auto klen = entry.key.len()
+        auto vlen# = 0:usize
+        if !entry.is_del {
+            vlen = entry.value.len()
+        }
 
-            if entry.is_del {
-                payload#.push(1:u8)
-            } else {
-                payload#.push(0:u8)
-            }
+        if entry.is_del {
+            payload#.push(1:u8)
+        } else {
+            payload#.push(0:u8)
+        }
 
-            put_u64_le(payload#, entry.seq)
-            put_u32_le(payload#, klen as u32)
+        put_u64_le(payload#, entry.seq)
+        put_u32_le(payload#, klen as u32)
 
-            if klen > 0:usize {
+        if klen > 0:usize {
+            unsafe {
                 auto *k_bytes = (entry.key.c_str() as usize) as *[u8]
                 auto k# = 0:usize
                 loop k < klen {
@@ -62,9 +62,11 @@ pub fn encode_data_block(entries: Vec<Entry>) -> Result<Vec<u8>, KvError> {
                     k = k + 1:usize
                 }
             }
+        }
 
-            put_u32_le(payload#, vlen as u32)
-            if vlen > 0:usize {
+        put_u32_le(payload#, vlen as u32)
+        if vlen > 0:usize {
+            unsafe {
                 auto *v_bytes = (entry.value.c_str() as usize) as *[u8]
                 auto v# = 0:usize
                 loop v < vlen {
@@ -170,12 +172,10 @@ pub fn decode_and_validate_data_block(buf: Vec<u8>, expected_len: u64) -> Result
 
         // Validate internal key monotonicity
         if entries.len() > 0:usize {
-            unsafe {
-                auto *prev = entries.unsafe_get(entries.len() - 1:usize)
-                auto cmp = compare_internal_key(prev.key.as_str(), prev.seq, key.as_str(), seq)
-                if cmp >= 0:i32 {
-                    return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("non_monotonic_keys_in_data_block"))
-                }
+            auto &prev = entries.borrow(entries.len() - 1:usize)
+            auto cmp = compare_internal_key(prev.key.as_str(), prev.seq, key.as_str(), seq)
+            if cmp >= 0:i32 {
+                return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("non_monotonic_keys_in_data_block"))
             }
         }
 
@@ -243,19 +243,19 @@ pub fn encode_index_block(entries: Vec<IndexEntry>) -> Result<Vec<u8>, KvError> 
 
     auto i# = 0:usize
     loop i < count {
-        unsafe {
-            auto *entry = entries.unsafe_get(i)
-            // Verify last_key monotonicity
-            if i > 0:usize {
-                auto *prev = entries.unsafe_get(i - 1:usize)
-                if prev.last_key.as_str().cmp(entry.last_key.as_str()) >= 0:i32 {
-                    return Result<Vec<u8>, KvError>::Err(KvError::corrupted("non_monotonic_index_last_keys"))
-                }
+        auto &entry = entries.borrow(i)
+        // Verify last_key monotonicity
+        if i > 0:usize {
+            auto &prev = entries.borrow(i - 1:usize)
+            if prev.last_key.as_str().cmp(entry.last_key.as_str()) >= 0:i32 {
+                return Result<Vec<u8>, KvError>::Err(KvError::corrupted("non_monotonic_index_last_keys"))
             }
+        }
 
-            auto klen = entry.last_key.len()
-            put_u32_le(payload#, klen as u32)
-            if klen > 0:usize {
+        auto klen = entry.last_key.len()
+        put_u32_le(payload#, klen as u32)
+        if klen > 0:usize {
+            unsafe {
                 auto *k_bytes = (entry.last_key.c_str() as usize) as *[u8]
                 auto k# = 0:usize
                 loop k < klen {
@@ -263,9 +263,9 @@ pub fn encode_index_block(entries: Vec<IndexEntry>) -> Result<Vec<u8>, KvError> 
                     k = k + 1:usize
                 }
             }
-            put_u64_le(payload#, entry.offset)
-            put_u64_le(payload#, entry.length)
         }
+        put_u64_le(payload#, entry.offset)
+        put_u64_le(payload#, entry.length)
         i = i + 1:usize
     }
 
@@ -354,14 +354,12 @@ pub fn decode_and_validate_index_block(
                 return Result<Vec<IndexEntry>, KvError>::Err(KvError::corrupted("first_data_block_offset_not_zero"))
             }
         } else {
-            unsafe {
-                auto *prev = entries.unsafe_get(entries.len() - 1:usize)
-                if prev.last_key.as_str().cmp(last_key.as_str()) >= 0:i32 {
-                    return Result<Vec<IndexEntry>, KvError>::Err(KvError::corrupted("non_monotonic_index_last_keys"))
-                }
-                if blk_offset != prev.offset + prev.length {
-                    return Result<Vec<IndexEntry>, KvError>::Err(KvError::corrupted("non_contiguous_data_blocks"))
-                }
+            auto &prev = entries.borrow(entries.len() - 1:usize)
+            if prev.last_key.as_str().cmp(last_key.as_str()) >= 0:i32 {
+                return Result<Vec<IndexEntry>, KvError>::Err(KvError::corrupted("non_monotonic_index_last_keys"))
+            }
+            if blk_offset != prev.offset + prev.length {
+                return Result<Vec<IndexEntry>, KvError>::Err(KvError::corrupted("non_contiguous_data_blocks"))
             }
         }
 
@@ -374,8 +372,8 @@ pub fn decode_and_validate_index_block(
     }
 
     // Verify that the last block ends exactly at index_offset
-    unsafe {
-        auto *last_entry = entries.unsafe_get(entries.len() - 1:usize)
+    {
+        auto &last_entry = entries.borrow(entries.len() - 1:usize)
         if last_entry.offset + last_entry.length != index_offset {
             return Result<Vec<IndexEntry>, KvError>::Err(KvError::corrupted("data_blocks_do_not_abut_index_block"))
         }
@@ -396,22 +394,18 @@ pub fn find_candidate_block(index_entries: Vec<IndexEntry>, key: string) -> Opti
 
     loop low < high {
         auto mid = low + ((high - low) / 2:usize)
-        unsafe {
-            auto *entry = index_entries.unsafe_get(mid)
-            if entry.last_key.as_str().cmp(key.as_str()) < 0:i32 {
-                low = mid + 1:usize
-            } else {
-                high = mid
-            }
+        auto &entry = index_entries.borrow(mid)
+        if entry.last_key.as_str().cmp(key.as_str()) < 0:i32 {
+            low = mid + 1:usize
+        } else {
+            high = mid
         }
     }
 
     if low < count {
-        unsafe {
-            auto *cand_ptr = index_entries.unsafe_get(low)
-            auto lk = cand_ptr.last_key.clone()
-            return Option<IndexEntry>::Some(IndexEntry::new(cede lk, cand_ptr.offset, cand_ptr.length))
-        }
+        auto &candidate = index_entries.borrow(low)
+        auto lk = candidate.last_key.clone()
+        return Option<IndexEntry>::Some(IndexEntry::new(cede lk, candidate.offset, candidate.length))
     }
     return Option<IndexEntry>::None
 }

@@ -234,17 +234,17 @@ fn migrate_v1_to_v2(
     put_u32_le(payload#, active_tables.len() as u32)
     auto t_i# = 0:usize
     loop t_i < active_tables.len() {
-        unsafe {
-            auto *t = active_tables.unsafe_get(t_i)
-            put_u32_le(payload#, t.level)
-            put_u64_le(payload#, t.file_number)
-            put_u64_le(payload#, t.file_size)
-            put_u64_le(payload#, t.min_seq)
-            put_u64_le(payload#, t.max_seq)
+        auto &t = active_tables.borrow(t_i)
+        put_u32_le(payload#, t.level)
+        put_u64_le(payload#, t.file_number)
+        put_u64_le(payload#, t.file_size)
+        put_u64_le(payload#, t.min_seq)
+        put_u64_le(payload#, t.max_seq)
 
-            auto sk_len = t.smallest_key.len()
-            put_u32_le(payload#, sk_len as u32)
-            if sk_len > 0:usize {
+        auto sk_len = t.smallest_key.len()
+        put_u32_le(payload#, sk_len as u32)
+        if sk_len > 0:usize {
+            unsafe {
                 auto *sk_bytes = (t.smallest_key.c_str() as usize) as *[u8]
                 auto sk_idx# = 0:usize
                 loop sk_idx < sk_len {
@@ -252,10 +252,12 @@ fn migrate_v1_to_v2(
                     sk_idx = sk_idx + 1:usize
                 }
             }
+        }
 
-            auto lk_len = t.largest_key.len()
-            put_u32_le(payload#, lk_len as u32)
-            if lk_len > 0:usize {
+        auto lk_len = t.largest_key.len()
+        put_u32_le(payload#, lk_len as u32)
+        if lk_len > 0:usize {
+            unsafe {
                 auto *lk_bytes = (t.largest_key.c_str() as usize) as *[u8]
                 auto lk_idx# = 0:usize
                 loop lk_idx < lk_len {
@@ -316,20 +318,20 @@ fn migrate_v1_to_v2(
     auto handles# = Vec<TableHandle>::new()
     auto tbl_i# = 0:usize
     loop tbl_i < active_tables.len() {
-        unsafe {
-            auto *t_meta_ptr = active_tables.unsafe_get(tbl_i)
-            auto t_path = build_table_path(db_dir.clone(), t_meta_ptr.file_number)
+        {
+            auto &t_meta = active_tables.borrow(tbl_i)
+            auto t_path = build_table_path(db_dir.clone(), t_meta.file_number)
             auto r_res = SSTableReader::open(t_path)
             if r_res.is_err() {
                 return Result<VersionSet, KvError>::Err(r_res.unwrap_err())
             }
             auto reader# = r_res.unwrap()
-            reader#.set_file_number(t_meta_ptr.file_number)
-            auto sk = t_meta_ptr.smallest_key.clone()
-            auto lk = t_meta_ptr.largest_key.clone()
+            reader#.set_file_number(t_meta.file_number)
+            auto sk = t_meta.smallest_key.clone()
+            auto lk = t_meta.largest_key.clone()
             auto meta = TableMetadata::new(
-                t_meta_ptr.file_number, t_meta_ptr.file_size, t_meta_ptr.min_seq, t_meta_ptr.max_seq,
-                cede sk, cede lk, t_meta_ptr.level
+                t_meta.file_number, t_meta.file_size, t_meta.min_seq, t_meta.max_seq,
+                cede sk, cede lk, t_meta.level
             )
             auto handle = TableHandle::new(cede meta, cede reader)
             handles#.push(cede handle)
@@ -392,17 +394,17 @@ pub fn migrate_v2_to_v3(
     put_u32_le(payload#, active_tables.len() as u32)
     auto t_i# = 0:usize
     loop t_i < active_tables.len() {
-        unsafe {
-            auto *t = active_tables.unsafe_get(t_i)
-            put_u32_le(payload#, t.level)
-            put_u64_le(payload#, t.file_number)
-            put_u64_le(payload#, t.file_size)
-            put_u64_le(payload#, t.min_seq)
-            put_u64_le(payload#, t.max_seq)
+        auto &t = active_tables.borrow(t_i)
+        put_u32_le(payload#, t.level)
+        put_u64_le(payload#, t.file_number)
+        put_u64_le(payload#, t.file_size)
+        put_u64_le(payload#, t.min_seq)
+        put_u64_le(payload#, t.max_seq)
 
-            auto sk_len = t.smallest_key.len()
-            put_u32_le(payload#, sk_len as u32)
-            if sk_len > 0:usize {
+        auto sk_len = t.smallest_key.len()
+        put_u32_le(payload#, sk_len as u32)
+        if sk_len > 0:usize {
+            unsafe {
                 auto *sk_bytes = (t.smallest_key.c_str() as usize) as *[u8]
                 auto sk_idx# = 0:usize
                 loop sk_idx < sk_len {
@@ -410,10 +412,12 @@ pub fn migrate_v2_to_v3(
                     sk_idx = sk_idx + 1:usize
                 }
             }
+        }
 
-            auto lk_len = t.largest_key.len()
-            put_u32_le(payload#, lk_len as u32)
-            if lk_len > 0:usize {
+        auto lk_len = t.largest_key.len()
+        put_u32_le(payload#, lk_len as u32)
+        if lk_len > 0:usize {
+            unsafe {
                 auto *lk_bytes = (t.largest_key.c_str() as usize) as *[u8]
                 auto lk_idx# = 0:usize
                 loop lk_idx < lk_len {
@@ -465,20 +469,20 @@ pub fn migrate_v2_to_v3(
     auto handles# = Vec<TableHandle>::new()
     auto tbl_i# = 0:usize
     loop tbl_i < active_tables.len() {
-        unsafe {
-            auto *t_meta_ptr = active_tables.unsafe_get(tbl_i)
-            auto t_path = build_table_path(db_dir.clone(), t_meta_ptr.file_number)
+        {
+            auto &t_meta = active_tables.borrow(tbl_i)
+            auto t_path = build_table_path(db_dir.clone(), t_meta.file_number)
             auto r_res = SSTableReader::open(t_path)
             if r_res.is_err() {
                 return Result<VersionSet, KvError>::Err(r_res.unwrap_err())
             }
             auto reader# = r_res.unwrap()
-            reader#.set_file_number(t_meta_ptr.file_number)
-            auto sk = t_meta_ptr.smallest_key.clone()
-            auto lk = t_meta_ptr.largest_key.clone()
+            reader#.set_file_number(t_meta.file_number)
+            auto sk = t_meta.smallest_key.clone()
+            auto lk = t_meta.largest_key.clone()
             auto meta = TableMetadata::new(
-                t_meta_ptr.file_number, t_meta_ptr.file_size, t_meta_ptr.min_seq, t_meta_ptr.max_seq,
-                cede sk, cede lk, t_meta_ptr.level
+                t_meta.file_number, t_meta.file_size, t_meta.min_seq, t_meta.max_seq,
+                cede sk, cede lk, t_meta.level
             )
             auto handle = TableHandle::new(cede meta, cede reader)
             handles#.push(cede handle)
@@ -825,8 +829,8 @@ impl VersionSet {
                         auto filtered# = Vec<TableMetadata>::new()
                         auto t_idx# = 0:usize
                         loop t_idx < active_tables.len() {
-                            unsafe {
-                                auto *cur_t = active_tables.unsafe_get(t_idx)
+                            {
+                                auto &cur_t = active_tables.borrow(t_idx)
                                 if cur_t.file_number != del_fnum {
                                     auto sk = cur_t.smallest_key.clone()
                                     auto lk = cur_t.largest_key.clone()
@@ -951,8 +955,8 @@ impl VersionSet {
                         auto filtered# = Vec<TableMetadata>::new()
                         auto t_idx# = 0:usize
                         loop t_idx < active_tables.len() {
-                            unsafe {
-                                auto *cur_t = active_tables.unsafe_get(t_idx)
+                            {
+                                auto &cur_t = active_tables.borrow(t_idx)
                                 if cur_t.file_number != del_fnum {
                                     auto sk = cur_t.smallest_key.clone()
                                     auto lk = cur_t.largest_key.clone()
@@ -1081,8 +1085,8 @@ impl VersionSet {
                         auto filtered# = Vec<TableMetadata>::new()
                         auto t_idx# = 0:usize
                         loop t_idx < active_tables.len() {
-                            unsafe {
-                                auto *cur_t = active_tables.unsafe_get(t_idx)
+                            {
+                                auto &cur_t = active_tables.borrow(t_idx)
                                 if cur_t.file_number != del_fnum {
                                     auto sk = cur_t.smallest_key.clone()
                                     auto lk = cur_t.largest_key.clone()
@@ -1133,20 +1137,20 @@ impl VersionSet {
         auto handles# = Vec<TableHandle>::new()
         auto t_i# = 0:usize
         loop t_i < active_tables.len() {
-            unsafe {
-                auto *t_meta_ptr = active_tables.unsafe_get(t_i)
-                auto t_path = build_table_path(db_dir.clone(), t_meta_ptr.file_number)
+            {
+                auto &t_meta = active_tables.borrow(t_i)
+                auto t_path = build_table_path(db_dir.clone(), t_meta.file_number)
                 auto r_res = SSTableReader::open(t_path)
                 if r_res.is_err() {
                     return Result<VersionSet, KvError>::Err(r_res.unwrap_err())
                 }
                 auto r_reader# = r_res.unwrap()
-                r_reader#.set_file_number(t_meta_ptr.file_number)
-                auto sk = t_meta_ptr.smallest_key.clone()
-                auto lk = t_meta_ptr.largest_key.clone()
+                r_reader#.set_file_number(t_meta.file_number)
+                auto sk = t_meta.smallest_key.clone()
+                auto lk = t_meta.largest_key.clone()
                 auto meta = TableMetadata::new(
-                    t_meta_ptr.file_number, t_meta_ptr.file_size, t_meta_ptr.min_seq, t_meta_ptr.max_seq,
-                    cede sk, cede lk, t_meta_ptr.level
+                    t_meta.file_number, t_meta.file_size, t_meta.min_seq, t_meta.max_seq,
+                    cede sk, cede lk, t_meta.level
                 )
                 auto handle = TableHandle::new(cede meta, cede r_reader)
                 handles#.push(cede handle)
@@ -1235,9 +1239,9 @@ impl VersionSet {
         // Validate table sequence ranges
         auto v_idx# = 0:usize
         loop v_idx < edit_with_seq.add_tables.len() {
-            unsafe {
-                auto *meta_ptr = edit_with_seq.add_tables.unsafe_get(v_idx)
-                if meta_ptr.min_seq == 0:u64 || meta_ptr.min_seq > meta_ptr.max_seq || meta_ptr.max_seq > last_p_seq {
+            {
+                auto &meta = edit_with_seq.add_tables.borrow(v_idx)
+                if meta.min_seq == 0:u64 || meta.min_seq > meta.max_seq || meta.max_seq > last_p_seq {
                     return Result<(), KvError>::Err(KvError::corrupted("invalid_table_sequence_bounds"))
                 }
             }
@@ -1298,18 +1302,18 @@ impl VersionSet {
         put_u32_le(payload#, edit_with_seq.add_tables.len() as u32)
         auto i# = 0:usize
         loop i < edit_with_seq.add_tables.len() {
-            unsafe {
-                auto *t = edit_with_seq.add_tables.unsafe_get(i)
-                put_u32_le(payload#, t.level)
-                put_u64_le(payload#, t.file_number)
-                put_u64_le(payload#, t.file_size)
-                put_u64_le(payload#, t.min_seq)
-                put_u64_le(payload#, t.max_seq)
+            auto &t = edit_with_seq.add_tables.borrow(i)
+            put_u32_le(payload#, t.level)
+            put_u64_le(payload#, t.file_number)
+            put_u64_le(payload#, t.file_size)
+            put_u64_le(payload#, t.min_seq)
+            put_u64_le(payload#, t.max_seq)
 
-                // Smallest key
-                auto sk_len = t.smallest_key.len()
-                put_u32_le(payload#, sk_len as u32)
-                if sk_len > 0:usize {
+            // Smallest key
+            auto sk_len = t.smallest_key.len()
+            put_u32_le(payload#, sk_len as u32)
+            if sk_len > 0:usize {
+                unsafe {
                     auto *sk_bytes = (t.smallest_key.c_str() as usize) as *[u8]
                     auto sk_idx# = 0:usize
                     loop sk_idx < sk_len {
@@ -1317,11 +1321,13 @@ impl VersionSet {
                         sk_idx = sk_idx + 1:usize
                     }
                 }
+            }
 
-                // Largest key
-                auto lk_len = t.largest_key.len()
-                put_u32_le(payload#, lk_len as u32)
-                if lk_len > 0:usize {
+            // Largest key
+            auto lk_len = t.largest_key.len()
+            put_u32_le(payload#, lk_len as u32)
+            if lk_len > 0:usize {
+                unsafe {
                     auto *lk_bytes = (t.largest_key.c_str() as usize) as *[u8]
                     auto lk_idx# = 0:usize
                     loop lk_idx < lk_len {
@@ -1389,20 +1395,20 @@ impl VersionSet {
 
         auto a# = 0:usize
         loop a < edit_with_seq.add_tables.len() {
-            unsafe {
-                auto *add_ptr = edit_with_seq.add_tables.unsafe_get(a)
-                auto t_path = build_table_path(self.db_dir.clone(), add_ptr.file_number)
+            {
+                auto &add = edit_with_seq.add_tables.borrow(a)
+                auto t_path = build_table_path(self.db_dir.clone(), add.file_number)
                 auto r_res = SSTableReader::open(t_path)
                 if r_res.is_err() {
                     return Result<(), KvError>::Err(r_res.unwrap_err())
                 }
                 auto r_reader# = r_res.unwrap()
-                r_reader#.set_file_number(add_ptr.file_number)
-                auto sk = add_ptr.smallest_key.clone()
-                auto lk = add_ptr.largest_key.clone()
+                r_reader#.set_file_number(add.file_number)
+                auto sk = add.smallest_key.clone()
+                auto lk = add.largest_key.clone()
                 auto meta = TableMetadata::new(
-                    add_ptr.file_number, add_ptr.file_size, add_ptr.min_seq, add_ptr.max_seq,
-                    cede sk, cede lk, add_ptr.level
+                    add.file_number, add.file_size, add.min_seq, add.max_seq,
+                    cede sk, cede lk, add.level
                 )
                 auto handle = TableHandle::new(cede meta, cede r_reader)
                 new_handles#.push(cede handle)

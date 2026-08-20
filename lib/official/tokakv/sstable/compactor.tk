@@ -110,25 +110,25 @@ impl Compactor {
             auto seen_below# = false
             auto i# = 0:usize
             loop i < group_len {
-                unsafe {
-                    auto *e_ptr = group.unsafe_get(i)
-                    if e_ptr.seq >= min_snap {
+                {
+                    auto &group_entry = group.borrow(i)
+                    if group_entry.seq >= min_snap {
                         auto e = Entry(
-                            key = e_ptr.key.clone(),
-                            value = e_ptr.value.clone(),
-                            seq = e_ptr.seq,
-                            is_del = e_ptr.is_del
+                            key = group_entry.key.clone(),
+                            value = group_entry.value.clone(),
+                            seq = group_entry.seq,
+                            is_del = group_entry.is_del
                         )
                         kept#.push(cede e)
                     } else {
                         if !seen_below {
                             seen_below = true
-                            if !e_ptr.is_del {
+                            if !group_entry.is_del {
                                 auto e = Entry(
-                                    key = e_ptr.key.clone(),
-                                    value = e_ptr.value.clone(),
-                                    seq = e_ptr.seq,
-                                    is_del = e_ptr.is_del
+                                    key = group_entry.key.clone(),
+                                    value = group_entry.value.clone(),
+                                    seq = group_entry.seq,
+                                    is_del = group_entry.is_del
                                 )
                                 kept#.push(cede e)
                             }
@@ -139,14 +139,14 @@ impl Compactor {
             }
         } else {
             // No snapshots active: only inspect the highest-sequence entry
-            unsafe {
-                auto *first_ptr = group.unsafe_get(0)
-                if !first_ptr.is_del {
+            {
+                auto &first_group_entry = group.borrow(0:usize)
+                if !first_group_entry.is_del {
                     auto e = Entry(
-                        key = first_ptr.key.clone(),
-                        value = first_ptr.value.clone(),
-                        seq = first_ptr.seq,
-                        is_del = first_ptr.is_del
+                        key = first_group_entry.key.clone(),
+                        value = first_group_entry.value.clone(),
+                        seq = first_group_entry.seq,
+                        is_del = first_group_entry.is_del
                     )
                     kept#.push(cede e)
                 }
@@ -173,9 +173,9 @@ impl Compactor {
         auto iters# = Vec<SSTableIterator>::with_capacity(total_inputs)
         auto l0_i# = 0:usize
         loop l0_i < plan.input_l0_handles.len() {
-            unsafe {
-                auto *h_ptr = plan.input_l0_handles.unsafe_get(l0_i)
-                auto it_res = SSTableIterator::open(h_ptr.reader)
+            {
+                auto &l0_handle = plan.input_l0_handles.borrow(l0_i)
+                auto it_res = SSTableIterator::open(l0_handle.reader)
                 if it_res.is_err() {
                     return Result<Vec<TableMetadata>, KvError>::Err(it_res.unwrap_err())
                 }
@@ -187,9 +187,9 @@ impl Compactor {
 
         auto l1_i# = 0:usize
         loop l1_i < plan.input_l1_handles.len() {
-            unsafe {
-                auto *h_ptr = plan.input_l1_handles.unsafe_get(l1_i)
-                auto it_res = SSTableIterator::open(h_ptr.reader)
+            {
+                auto &l1_handle = plan.input_l1_handles.borrow(l1_i)
+                auto it_res = SSTableIterator::open(l1_handle.reader)
                 if it_res.is_err() {
                     return Result<Vec<TableMetadata>, KvError>::Err(it_res.unwrap_err())
                 }
@@ -229,9 +229,9 @@ impl Compactor {
                     auto group_bytes# = 0:usize
                     auto g_i# = 0:usize
                     loop g_i < kept_entries.len() {
-                        unsafe {
-                            auto *e_ptr = kept_entries.unsafe_get(g_i)
-                            group_bytes = group_bytes + e_ptr.key.len() + e_ptr.value.len() + 16:usize
+                        {
+                            auto &kept_size_entry = kept_entries.borrow(g_i)
+                            group_bytes = group_bytes + kept_size_entry.key.len() + kept_size_entry.value.len() + 16:usize
                         }
                         g_i = g_i + 1:usize
                     }
@@ -258,13 +258,13 @@ impl Compactor {
 
                     auto k_i# = 0:usize
                     loop k_i < kept_entries.len() {
-                        unsafe {
-                            auto *e_ptr = kept_entries.unsafe_get(k_i)
+                        {
+                            auto &kept_copy_entry = kept_entries.borrow(k_i)
                             auto e = Entry(
-                                key = e_ptr.key.clone(),
-                                value = e_ptr.value.clone(),
-                                seq = e_ptr.seq,
-                                is_del = e_ptr.is_del
+                                key = kept_copy_entry.key.clone(),
+                                value = kept_copy_entry.value.clone(),
+                                seq = kept_copy_entry.seq,
+                                is_del = kept_copy_entry.is_del
                             )
                             current_chunk#.push(cede e)
                         }
@@ -290,9 +290,9 @@ impl Compactor {
                 auto group_bytes# = 0:usize
                 auto g_i# = 0:usize
                 loop g_i < kept_entries.len() {
-                    unsafe {
-                        auto *e_ptr = kept_entries.unsafe_get(g_i)
-                        group_bytes = group_bytes + e_ptr.key.len() + e_ptr.value.len() + 16:usize
+                    {
+                        auto &final_size_entry = kept_entries.borrow(g_i)
+                        group_bytes = group_bytes + final_size_entry.key.len() + final_size_entry.value.len() + 16:usize
                     }
                     g_i = g_i + 1:usize
                 }
@@ -318,13 +318,13 @@ impl Compactor {
 
                 auto k_i# = 0:usize
                 loop k_i < kept_entries.len() {
-                    unsafe {
-                        auto *e_ptr = kept_entries.unsafe_get(k_i)
+                    {
+                        auto &final_copy_entry = kept_entries.borrow(k_i)
                         auto e = Entry(
-                            key = e_ptr.key.clone(),
-                            value = e_ptr.value.clone(),
-                            seq = e_ptr.seq,
-                            is_del = e_ptr.is_del
+                            key = final_copy_entry.key.clone(),
+                            value = final_copy_entry.value.clone(),
+                            seq = final_copy_entry.seq,
+                            is_del = final_copy_entry.is_del
                         )
                         current_chunk#.push(cede e)
                     }
@@ -370,9 +370,9 @@ impl Compactor {
         auto iters# = Vec<SSTableIterator>::with_capacity(old_count)
         auto h_idx# = 0:usize
         loop h_idx < old_count {
-            unsafe {
-                auto *handle_ptr = old_handles.unsafe_get(h_idx)
-                auto it_res = SSTableIterator::open(handle_ptr.reader)
+            {
+                auto &old_handle = old_handles.borrow(h_idx)
+                auto it_res = SSTableIterator::open(old_handle.reader)
                 if it_res.is_err() {
                     return Result<TableMetadata, KvError>::Err(it_res.unwrap_err())
                 }
@@ -403,13 +403,13 @@ impl Compactor {
                 auto kept# = Compactor::filter_user_key_group(current_group, oldest_snapshot_opt)
                 auto k_i# = 0:usize
                 loop k_i < kept.len() {
-                    unsafe {
-                        auto *e_ptr = kept.unsafe_get(k_i)
+                    {
+                        auto &kept_entry = kept.borrow(k_i)
                         auto e = Entry(
-                            key = e_ptr.key.clone(),
-                            value = e_ptr.value.clone(),
-                            seq = e_ptr.seq,
-                            is_del = e_ptr.is_del
+                            key = kept_entry.key.clone(),
+                            value = kept_entry.value.clone(),
+                            seq = kept_entry.seq,
+                            is_del = kept_entry.is_del
                         )
                         deduped#.push(cede e)
                     }
@@ -430,13 +430,13 @@ impl Compactor {
             auto kept# = Compactor::filter_user_key_group(current_group, oldest_snapshot_opt)
             auto k_i# = 0:usize
             loop k_i < kept.len() {
-                unsafe {
-                    auto *e_ptr = kept.unsafe_get(k_i)
+                {
+                    auto &final_kept_entry = kept.borrow(k_i)
                     auto e = Entry(
-                        key = e_ptr.key.clone(),
-                        value = e_ptr.value.clone(),
-                        seq = e_ptr.seq,
-                        is_del = e_ptr.is_del
+                        key = final_kept_entry.key.clone(),
+                        value = final_kept_entry.value.clone(),
+                        seq = final_kept_entry.seq,
+                        is_del = final_kept_entry.is_del
                     )
                     deduped#.push(cede e)
                 }

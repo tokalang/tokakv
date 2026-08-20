@@ -126,15 +126,15 @@ impl Version {
 
         auto i# = 0:usize
         loop i < in_len {
-            unsafe {
-                auto *h_ptr = in_tables.unsafe_get(i)
-                auto sk = h_ptr.meta.smallest_key.clone()
-                auto lk = h_ptr.meta.largest_key.clone()
+            {
+                auto &handle_ref = in_tables.borrow(i)
+                auto sk = handle_ref.meta.smallest_key.clone()
+                auto lk = handle_ref.meta.largest_key.clone()
                 auto meta = TableMetadata::new(
-                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
-                    cede sk, cede lk, h_ptr.meta.level
+                    handle_ref.meta.file_number, handle_ref.meta.file_size, handle_ref.meta.min_seq, handle_ref.meta.max_seq,
+                    cede sk, cede lk, handle_ref.meta.level
                 )
-                auto r_clone = h_ptr.reader.clone()
+                auto r_clone = handle_ref.reader.clone()
                 auto handle = TableHandle::new(cede meta, cede r_clone)
                 if handle.meta.level == 0:u32 {
                     l0_tables#.push(cede handle)
@@ -142,8 +142,12 @@ impl Version {
                     auto ins_idx# = l1_tables.len()
                     auto j# = 0:usize
                     loop j < l1_tables.len() {
-                        auto *other_ptr = l1_tables.unsafe_get(j)
-                        if handle.meta.smallest_key.as_str().cmp(other_ptr.meta.smallest_key.as_str()) < 0:i32 {
+                        auto comes_before# = false
+                        {
+                            auto &other = l1_tables.borrow(j)
+                            comes_before = handle.meta.smallest_key.as_str().cmp(other.meta.smallest_key.as_str()) < 0:i32
+                        }
+                        if comes_before {
                             ins_idx = j
                             break
                         }
@@ -162,15 +166,15 @@ impl Version {
         auto final_tables# = Vec<TableHandle>::with_capacity(in_len)
         auto l0_i# = 0:usize
         loop l0_i < l0_tables.len() {
-            unsafe {
-                auto *h_ptr = l0_tables.unsafe_get(l0_i)
-                auto sk = h_ptr.meta.smallest_key.clone()
-                auto lk = h_ptr.meta.largest_key.clone()
+            {
+                auto &handle_ref = l0_tables.borrow(l0_i)
+                auto sk = handle_ref.meta.smallest_key.clone()
+                auto lk = handle_ref.meta.largest_key.clone()
                 auto meta = TableMetadata::new(
-                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
-                    cede sk, cede lk, h_ptr.meta.level
+                    handle_ref.meta.file_number, handle_ref.meta.file_size, handle_ref.meta.min_seq, handle_ref.meta.max_seq,
+                    cede sk, cede lk, handle_ref.meta.level
                 )
-                auto r_clone = h_ptr.reader.clone()
+                auto r_clone = handle_ref.reader.clone()
                 auto handle = TableHandle::new(cede meta, cede r_clone)
                 final_tables#.push(cede handle)
             }
@@ -179,15 +183,15 @@ impl Version {
 
         auto l1_i# = 0:usize
         loop l1_i < l1_tables.len() {
-            unsafe {
-                auto *h_ptr = l1_tables.unsafe_get(l1_i)
-                auto sk = h_ptr.meta.smallest_key.clone()
-                auto lk = h_ptr.meta.largest_key.clone()
+            {
+                auto &handle_ref = l1_tables.borrow(l1_i)
+                auto sk = handle_ref.meta.smallest_key.clone()
+                auto lk = handle_ref.meta.largest_key.clone()
                 auto meta = TableMetadata::new(
-                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
-                    cede sk, cede lk, h_ptr.meta.level
+                    handle_ref.meta.file_number, handle_ref.meta.file_size, handle_ref.meta.min_seq, handle_ref.meta.max_seq,
+                    cede sk, cede lk, handle_ref.meta.level
                 )
-                auto r_clone = h_ptr.reader.clone()
+                auto r_clone = handle_ref.reader.clone()
                 auto handle = TableHandle::new(cede meta, cede r_clone)
                 final_tables#.push(cede handle)
             }
@@ -219,9 +223,9 @@ impl Version {
         auto cnt# = 0:usize
         auto i# = 0:usize
         loop i < self.tables.len() {
-            unsafe {
-                auto *h = self.tables.unsafe_get(i)
-                if h.meta.level == 0:u32 {
+            {
+                auto &handle_ref = self.tables.borrow(i)
+                if handle_ref.meta.level == 0:u32 {
                     cnt = cnt + 1:usize
                 }
             }
@@ -231,15 +235,15 @@ impl Version {
     }
 
     pub fn get_table(self, index: usize) -> TableHandle {
-        unsafe {
-            auto *h_ptr = self.tables.unsafe_get(index)
-            auto m_sk = h_ptr.meta.smallest_key.clone()
-            auto m_lk = h_ptr.meta.largest_key.clone()
+        {
+            auto &handle_ref = self.tables.borrow(index)
+            auto m_sk = handle_ref.meta.smallest_key.clone()
+            auto m_lk = handle_ref.meta.largest_key.clone()
             auto meta = TableMetadata::new(
-                h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
-                cede m_sk, cede m_lk, h_ptr.meta.level
+                handle_ref.meta.file_number, handle_ref.meta.file_size, handle_ref.meta.min_seq, handle_ref.meta.max_seq,
+                cede m_sk, cede m_lk, handle_ref.meta.level
             )
-            auto r_clone = h_ptr.reader.clone()
+            auto r_clone = handle_ref.reader.clone()
             return TableHandle::new(cede meta, cede r_clone)
         }
     }
@@ -257,10 +261,10 @@ impl Version {
         auto idx# = count
         loop idx > 0:usize {
             idx = idx - 1:usize
-            unsafe {
-                auto *h_ptr = self.tables.unsafe_get(idx)
-                if h_ptr.meta.level == 0:u32 {
-                    if key.as_str().cmp(h_ptr.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(h_ptr.meta.largest_key.as_str()) <= 0:i32 {
+            {
+                auto &handle_ref = self.tables.borrow(idx)
+                if handle_ref.meta.level == 0:u32 {
+                    if key.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(handle_ref.meta.largest_key.as_str()) <= 0:i32 {
                         auto cache_arg# = Option<BlockCache>::None
                         match cache_opt {
                             auto Option::Some(&bc) => {
@@ -268,7 +272,7 @@ impl Version {
                             }
                             _ => {}
                         }
-                        auto r_get = h_ptr.reader.get_at_seq(key.clone(), target_seq, cache_arg)
+                        auto r_get = handle_ref.reader.get_at_seq(key.clone(), target_seq, cache_arg)
                         if r_get.is_err() {
                             return r_get
                         }
@@ -290,10 +294,10 @@ impl Version {
         // 2. Search Level 1 tables (which are disjoint and non-overlapping)
         auto l1_idx# = 0:usize
         loop l1_idx < count {
-            unsafe {
-                auto *h_ptr = self.tables.unsafe_get(l1_idx)
-                if h_ptr.meta.level == 1:u32 {
-                    if key.as_str().cmp(h_ptr.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(h_ptr.meta.largest_key.as_str()) <= 0:i32 {
+            {
+                auto &handle_ref = self.tables.borrow(l1_idx)
+                if handle_ref.meta.level == 1:u32 {
+                    if key.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(handle_ref.meta.largest_key.as_str()) <= 0:i32 {
                         auto cache_arg# = Option<BlockCache>::None
                         match cache_opt {
                             auto Option::Some(&bc) => {
@@ -301,7 +305,7 @@ impl Version {
                             }
                             _ => {}
                         }
-                        auto r_get = h_ptr.reader.get_at_seq(key.clone(), target_seq, cache_arg)
+                        auto r_get = handle_ref.reader.get_at_seq(key.clone(), target_seq, cache_arg)
                         if r_get.is_err() {
                             return r_get
                         }
@@ -342,22 +346,22 @@ impl Version {
 
         auto i# = 0:usize
         loop i < count {
-            unsafe {
-                auto *h_ptr = self.tables.unsafe_get(i)
-                if h_ptr.meta.level > 1:u32 {
+            {
+                auto &handle_ref = self.tables.borrow(i)
+                if handle_ref.meta.level > 1:u32 {
                     return Result<(), KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
                 }
-                if h_ptr.meta.level == 1:u32 {
-                    if h_ptr.meta.smallest_key.as_str().cmp(h_ptr.meta.largest_key.as_str()) > 0:i32 {
+                if handle_ref.meta.level == 1:u32 {
+                    if handle_ref.meta.smallest_key.as_str().cmp(handle_ref.meta.largest_key.as_str()) > 0:i32 {
                         return Result<(), KvError>::Err(KvError::corrupted("invalid_table_key_bounds"))
                     }
                     if has_prev_l1 {
-                        if prev_l1_largest.as_str().cmp(h_ptr.meta.smallest_key.as_str()) >= 0:i32 {
+                        if prev_l1_largest.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 {
                             return Result<(), KvError>::Err(KvError::corrupted("level1_tables_overlap_or_unsorted"))
                         }
                     }
                     has_prev_l1 = true
-                    prev_l1_largest = h_ptr.meta.largest_key.clone()
+                    prev_l1_largest = handle_ref.meta.largest_key.clone()
                 }
             }
             i = i + 1:usize
@@ -369,15 +373,15 @@ impl Version {
         auto copy_tables# = Vec<TableHandle>::with_capacity(self.tables.len())
         auto i# = 0:usize
         loop i < self.tables.len() {
-            unsafe {
-                auto *h_ptr = self.tables.unsafe_get(i)
-                auto m_sk = h_ptr.meta.smallest_key.clone()
-                auto m_lk = h_ptr.meta.largest_key.clone()
+            {
+                auto &handle_ref = self.tables.borrow(i)
+                auto m_sk = handle_ref.meta.smallest_key.clone()
+                auto m_lk = handle_ref.meta.largest_key.clone()
                 auto meta = TableMetadata::new(
-                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
-                    cede m_sk, cede m_lk, h_ptr.meta.level
+                    handle_ref.meta.file_number, handle_ref.meta.file_size, handle_ref.meta.min_seq, handle_ref.meta.max_seq,
+                    cede m_sk, cede m_lk, handle_ref.meta.level
                 )
-                auto r_clone = h_ptr.reader.clone()
+                auto r_clone = handle_ref.reader.clone()
                 auto handle = TableHandle::new(cede meta, cede r_clone)
                 copy_tables#.push(cede handle)
             }
@@ -395,22 +399,26 @@ pub fn validate_l1_disjoint(untouched_l1: Vec<TableHandle>, new_l1: Vec<TableMet
     auto all_l1# = Vec<TableMetadata>::new()
     auto u_i# = 0:usize
     loop u_i < untouched_l1.len() {
-        unsafe {
-            auto *h_ptr = untouched_l1.unsafe_get(u_i)
-            if h_ptr.meta.level > 1:u32 {
+        {
+            auto &handle_ref = untouched_l1.borrow(u_i)
+            if handle_ref.meta.level > 1:u32 {
                 return Result<(), KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
             }
-            auto sk = h_ptr.meta.smallest_key.clone()
-            auto lk = h_ptr.meta.largest_key.clone()
+            auto sk = handle_ref.meta.smallest_key.clone()
+            auto lk = handle_ref.meta.largest_key.clone()
             auto meta = TableMetadata::new(
-                h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
-                cede sk, cede lk, h_ptr.meta.level
+                handle_ref.meta.file_number, handle_ref.meta.file_size, handle_ref.meta.min_seq, handle_ref.meta.max_seq,
+                cede sk, cede lk, handle_ref.meta.level
             )
             auto ins_idx# = all_l1.len()
             auto j# = 0:usize
             loop j < all_l1.len() {
-                auto *other = all_l1.unsafe_get(j)
-                if meta.smallest_key.as_str().cmp(other.smallest_key.as_str()) < 0:i32 {
+                auto comes_before# = false
+                {
+                    auto &other = all_l1.borrow(j)
+                    comes_before = meta.smallest_key.as_str().cmp(other.smallest_key.as_str()) < 0:i32
+                }
+                if comes_before {
                     ins_idx = j
                     break
                 }
@@ -427,22 +435,26 @@ pub fn validate_l1_disjoint(untouched_l1: Vec<TableHandle>, new_l1: Vec<TableMet
 
     auto n_i# = 0:usize
     loop n_i < new_l1.len() {
-        unsafe {
-            auto *m_ptr = new_l1.unsafe_get(n_i)
-            if m_ptr.level > 1:u32 {
+        {
+            auto &new_meta = new_l1.borrow(n_i)
+            if new_meta.level > 1:u32 {
                 return Result<(), KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
             }
-            auto sk = m_ptr.smallest_key.clone()
-            auto lk = m_ptr.largest_key.clone()
+            auto sk = new_meta.smallest_key.clone()
+            auto lk = new_meta.largest_key.clone()
             auto meta = TableMetadata::new(
-                m_ptr.file_number, m_ptr.file_size, m_ptr.min_seq, m_ptr.max_seq,
-                cede sk, cede lk, m_ptr.level
+                new_meta.file_number, new_meta.file_size, new_meta.min_seq, new_meta.max_seq,
+                cede sk, cede lk, new_meta.level
             )
             auto ins_idx# = all_l1.len()
             auto j# = 0:usize
             loop j < all_l1.len() {
-                auto *other = all_l1.unsafe_get(j)
-                if meta.smallest_key.as_str().cmp(other.smallest_key.as_str()) < 0:i32 {
+                auto comes_before# = false
+                {
+                    auto &other = all_l1.borrow(j)
+                    comes_before = meta.smallest_key.as_str().cmp(other.smallest_key.as_str()) < 0:i32
+                }
+                if comes_before {
                     ins_idx = j
                     break
                 }
@@ -461,18 +473,18 @@ pub fn validate_l1_disjoint(untouched_l1: Vec<TableHandle>, new_l1: Vec<TableMet
     auto has_prev# = false
     auto chk_i# = 0:usize
     loop chk_i < all_l1.len() {
-        unsafe {
-            auto *m_ptr = all_l1.unsafe_get(chk_i)
-            if m_ptr.smallest_key.as_str().cmp(m_ptr.largest_key.as_str()) > 0:i32 {
+        {
+            auto &meta_ref = all_l1.borrow(chk_i)
+            if meta_ref.smallest_key.as_str().cmp(meta_ref.largest_key.as_str()) > 0:i32 {
                 return Result<(), KvError>::Err(KvError::corrupted("invalid_table_key_bounds"))
             }
             if has_prev {
-                if prev_largest.as_str().cmp(m_ptr.smallest_key.as_str()) >= 0:i32 {
+                if prev_largest.as_str().cmp(meta_ref.smallest_key.as_str()) >= 0:i32 {
                     return Result<(), KvError>::Err(KvError::corrupted("level1_tables_overlap_or_unsorted"))
                 }
             }
             has_prev = true
-            prev_largest = m_ptr.largest_key.clone()
+            prev_largest = meta_ref.largest_key.clone()
         }
         chk_i = chk_i + 1:usize
     }
@@ -600,13 +612,13 @@ impl VersionEdit {
         auto at# = Vec<TableMetadata>::with_capacity(self.add_tables.len())
         auto i# = 0:usize
         loop i < self.add_tables.len() {
-            unsafe {
-                auto *tm_ptr = self.add_tables.unsafe_get(i)
-                auto sk = tm_ptr.smallest_key.clone()
-                auto lk = tm_ptr.largest_key.clone()
+            {
+                auto &table_meta = self.add_tables.borrow(i)
+                auto sk = table_meta.smallest_key.clone()
+                auto lk = table_meta.largest_key.clone()
                 auto tm = TableMetadata::new(
-                    tm_ptr.file_number, tm_ptr.file_size, tm_ptr.min_seq, tm_ptr.max_seq,
-                    cede sk, cede lk, tm_ptr.level
+                    table_meta.file_number, table_meta.file_size, table_meta.min_seq, table_meta.max_seq,
+                    cede sk, cede lk, table_meta.level
                 )
                 at#.push(cede tm)
             }

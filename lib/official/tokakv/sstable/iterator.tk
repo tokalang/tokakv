@@ -56,19 +56,17 @@ impl SSTableIterator {
         return Result<(), KvError>::Ok(())
     }
 
-    pub fn is_valid(self#) -> bool {
+    pub fn is_valid(self) -> bool {
         return self.valid
     }
 
-    pub fn current(self#) -> Option<Entry> {
+    pub fn current(self) -> Option<Entry> {
         if !self.valid {
             return Option<Entry>::None
         }
         if self.entry_index < self.current_entries.len() {
-            unsafe {
-                auto *entry_ptr = self.current_entries.unsafe_get(self.entry_index)
-                return Option<Entry>::Some(entry_ptr.clone())
-            }
+            auto &entry = self.current_entries.borrow(self.entry_index)
+            return Option<Entry>::Some(entry.clone())
         }
         return Option<Entry>::None
     }
@@ -89,10 +87,8 @@ impl SSTableIterator {
         auto copy_entries# = Vec<Entry>::with_capacity(self.current_entries.len())
         auto i# = 0:usize
         loop i < self.current_entries.len() {
-            unsafe {
-                auto *entry_ptr = self.current_entries.unsafe_get(i)
-                copy_entries#.push(entry_ptr.clone())
-            }
+            auto &entry = self.current_entries.borrow(i)
+            copy_entries#.push(entry.clone())
             i = i + 1:usize
         }
         return SSTableIterator(

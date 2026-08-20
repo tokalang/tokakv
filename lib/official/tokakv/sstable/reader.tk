@@ -145,26 +145,22 @@ impl SSTableReader {
 
         loop low < high {
             auto mid = low + ((high - low) / 2:usize)
-            unsafe {
-                auto *entry = self.index.unsafe_get(mid)
-                if entry.last_key.as_str().cmp(key_slice) < 0:i32 {
-                    low = mid + 1:usize
-                } else {
-                    high = mid
-                }
+            auto &entry = self.index.borrow(mid)
+            if entry.last_key.as_str().cmp(key_slice) < 0:i32 {
+                low = mid + 1:usize
+            } else {
+                high = mid
             }
         }
 
         if low < count {
-            unsafe {
-                auto *cand = self.index.unsafe_get(low)
-                auto lk = cand.last_key.clone()
-                return Option<IndexEntry>::Some(IndexEntry(
-                    offset = cand.offset,
-                    length = cand.length,
-                    last_key = cede lk
-                ))
-            }
+            auto &candidate = self.index.borrow(low)
+            auto lk = candidate.last_key.clone()
+            return Option<IndexEntry>::Some(IndexEntry(
+                offset = candidate.offset,
+                length = candidate.length,
+                last_key = cede lk
+            ))
         }
         return Option<IndexEntry>::None
     }
@@ -232,32 +228,30 @@ impl SSTableReader {
         if block_idx >= self.index.len() {
             return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("block_index_out_of_bounds"))
         }
-        unsafe {
-            auto *entry_ptr = self.index.unsafe_get(block_idx)
-            auto blk_len = entry_ptr.length as usize
-            auto blk_buf# = Vec<u8>::with_capacity(blk_len)
-            auto read_res = self.file.read_at(cede blk_buf, entry_ptr.offset, blk_len)
-            if read_res.is_err() {
-                auto r_err = read_res.unwrap_err()
-                return Result<Vec<Entry>, KvError>::Err(KvError::io(r_err.error))
-            }
-            auto read_out = read_res.unwrap()
-            if read_out.bytes_read != blk_len {
-                return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("truncated_data_block_read"))
-            }
-            return decode_and_validate_data_block(read_out.take_buffer(), entry_ptr.length)
+        auto &entry = self.index.borrow(block_idx)
+        auto blk_len = entry.length as usize
+        auto blk_offset = entry.offset
+        auto blk_length = entry.length
+        auto blk_buf# = Vec<u8>::with_capacity(blk_len)
+        auto read_res = self.file.read_at(cede blk_buf, blk_offset, blk_len)
+        if read_res.is_err() {
+            auto r_err = read_res.unwrap_err()
+            return Result<Vec<Entry>, KvError>::Err(KvError::io(r_err.error))
         }
+        auto read_out = read_res.unwrap()
+        if read_out.bytes_read != blk_len {
+            return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("truncated_data_block_read"))
+        }
+        return decode_and_validate_data_block(read_out.take_buffer(), blk_length)
     }
 
     pub fn clone(self) -> SSTableReader {
         auto copy_idx# = Vec<IndexEntry>::with_capacity(self.index.len())
         auto i# = 0:usize
         loop i < self.index.len() {
-            unsafe {
-                auto *entry_ptr = self.index.unsafe_get(i)
-                auto k = entry_ptr.last_key.clone()
-                copy_idx#.push(IndexEntry::new(cede k, entry_ptr.offset, entry_ptr.length))
-            }
+            auto &entry = self.index.borrow(i)
+            auto k = entry.last_key.clone()
+            copy_idx#.push(IndexEntry::new(cede k, entry.offset, entry.length))
             i = i + 1:usize
         }
         return SSTableReader(

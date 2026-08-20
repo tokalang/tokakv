@@ -12,7 +12,7 @@ import std/fs::{metadata, create_dir, sync_directory}
 import std/error::{IoError}
 import std/data_file::{ReadDataFile}
 import std/sync::{Mutex, RwMutex}
-import std/thread::{JoinHandle, sleep_ms, yield_now}
+import std/thread::{thread_spawn_with_state, JoinHandle, sleep_ms, yield_now}
 import official/tokakv/types::{
     OP_PUT, OP_DELETE, Entry, KvError, LookupResult
 }
@@ -212,6 +212,18 @@ pub shape WriterState (
 
 impl WriterState@Encap {}
 impl WriterState@Send {}
+
+shape MaintenanceWorkerState (
+    ~reader: RwMutex<ReadState>,
+    ~writer: Mutex<WriterState>,
+    ~health: SharedHealth,
+    ~snapshots: Mutex<SnapshotRegistry>,
+    ~maintenance: Mutex<MaintenanceState>,
+    l0_compaction_threshold: usize
+)
+
+impl MaintenanceWorkerState@Encap {}
+impl MaintenanceWorkerState@Send {}
 
 /// Capability required to acquire a snapshot lease.
 /// Unconstructible by external callers due to @Encap and absence of public factories.
@@ -1000,24 +1012,51 @@ impl TokaKvEngine {
             l0_stop_writes_threshold = l0_stop_writes_threshold
         )
 
+        auto worker_state = MaintenanceWorkerState(
+            ~reader = engine.~reader,
+            ~writer = engine.~writer,
+            ~health = engine.~health,
+            ~snapshots = engine.~snapshots,
+            ~maintenance = engine.~maintenance,
+            l0_compaction_threshold = engine.l0_compaction_threshold
+        )
+        auto worker_entry = { state =>
+            return cede TokaKvEngine::run_maintenance_worker_loop(state)
+        }:fn(MaintenanceWorkerState) -> cede i32
+        auto worker_handle = thread_spawn_with_state<MaintenanceWorkerState, i32>(
+            cede worker_state,
+            worker_entry
+        )
+        {
+            auto handle_lock_res = engine.worker.lock()
+            if handle_lock_res.is_err() {
+                engine.health.set(HEALTH_POISONED as i32)
+                worker_handle#.detach()
+                return Result<TokaKvEngine, KvError>::Err(KvError::poisoned())
+            }
+            auto handle_lock = handle_lock_res.unwrap()
+            auto &handle_slot# = handle_lock.get_ref()
+            handle_slot = Option<JoinHandle<i32>>::Some(cede worker_handle)
+        }
+
         return Result<TokaKvEngine, KvError>::Ok(cede engine)
     }
 
-    fn run_maintenance_worker_loop(self) {
+    fn run_maintenance_worker_loop(state: MaintenanceWorkerState) -> cede i32 {
         loop {
             auto should_stop# = false
             auto do_flush# = false
             auto do_compaction# = false
 
             {
-                auto m_lock_res = self.maintenance.lock()
+                auto m_lock_res = state.maintenance.lock()
                 if m_lock_res.is_err() {
                     break
                 }
                 auto m_lock = m_lock_res.unwrap()
                 auto &ms# = m_lock.get_ref()
 
-                if ms.shutdown || self.health.get() == (HEALTH_POISONED as i32) || self.health.get() == (HEALTH_CLOSED as i32) {
+                if ms.shutdown || state.health.get() == (HEALTH_POISONED as i32) || state.health.get() == (HEALTH_CLOSED as i32) {
                     should_stop = true
                 }
 
@@ -1037,9 +1076,9 @@ impl TokaKvEngine {
             }
 
             if do_flush {
-                auto f_res = internal_flush_frozen_step(self.~reader, self.~writer, self.~health)
+                auto f_res = internal_flush_frozen_step(state.~reader, state.~writer, state.~health)
                 {
-                    auto m_lock_res2 = self.maintenance.lock()
+                    auto m_lock_res2 = state.maintenance.lock()
                     if m_lock_res2.is_ok() {
                         auto m_lock2 = m_lock_res2.unwrap()
                         auto &ms2# = m_lock2.get_ref()
@@ -1047,16 +1086,16 @@ impl TokaKvEngine {
                     }
                 }
                 if f_res.is_err() {
-                    self.health.set(HEALTH_POISONED as i32)
+                    state.health.set(HEALTH_POISONED as i32)
                     break
                 }
                 // Check if L0 compaction needed after flush
-                auto r_lock_res = self.reader.read_lock()
+                auto r_lock_res = state.reader.read_lock()
                 if r_lock_res.is_ok() {
                     auto r_lock = r_lock_res.unwrap()
                     auto &rs = r_lock.get_ref()
-                    if rs.current_version.l0_count() >= self.l0_compaction_threshold {
-                        auto m_lock_res3 = self.maintenance.lock()
+                    if rs.current_version.l0_count() >= state.l0_compaction_threshold {
+                        auto m_lock_res3 = state.maintenance.lock()
                         if m_lock_res3.is_ok() {
                             auto m_lock3 = m_lock_res3.unwrap()
                             auto &ms3# = m_lock3.get_ref()
@@ -1065,9 +1104,9 @@ impl TokaKvEngine {
                     }
                 }
             } else if do_compaction {
-                auto c_res = internal_compact_l0_step(self.~reader, self.~writer, self.~health, self.~snapshots)
+                auto c_res = internal_compact_l0_step(state.~reader, state.~writer, state.~health, state.~snapshots)
                 {
-                    auto m_lock_res4 = self.maintenance.lock()
+                    auto m_lock_res4 = state.maintenance.lock()
                     if m_lock_res4.is_ok() {
                         auto m_lock4 = m_lock_res4.unwrap()
                         auto &ms4# = m_lock4.get_ref()
@@ -1075,13 +1114,14 @@ impl TokaKvEngine {
                     }
                 }
                 if c_res.is_err() {
-                    self.health.set(HEALTH_POISONED as i32)
+                    state.health.set(HEALTH_POISONED as i32)
                     break
                 }
             } else {
                 sleep_ms(2:u32)
             }
         }
+        return cede 0:i32
     }
 
     /// Checks if engine is poisoned (fail-closed state).

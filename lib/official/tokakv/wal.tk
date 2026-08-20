@@ -98,7 +98,8 @@ impl WalWriter {
         }
 
         auto frame_len = enc_res.unwrap()
-        auto write_res = self.wal_file#.write_all_at(cede self.write_buf, self.current_offset)
+        auto outbound# = self.write_buf#.take()
+        auto write_res = self.wal_file#.write_all_at(cede outbound, self.current_offset)
         if write_res.is_err() {
             self.poisoned = true
             auto write_err = write_res.unwrap_err()

@@ -26,7 +26,7 @@ impl SSTableWriter {
             return Result<TableMetadata, KvError>::Err(KvError::corrupted("cannot_create_empty_sstable"))
         }
         auto all_entries = frozen_in.take_entries()
-        return SSTableWriter::write_entries(target_path, cede all_entries)
+        return SSTableWriter::write_entries(target_path, all_entries)
     }
 
     /// Writes a sorted, deduplicated sequence of entries into an SSTable file and returns its TableMetadata.

@@ -141,9 +141,7 @@ impl ReadState {
     }
 
     pub fn rotate_active(self#, flush_id: u64) -> FrozenMemTable {
-        auto old_mem = self.active_mem
-        self.active_mem = MemTable::new()
-        return old_mem.freeze_with_id(flush_id)
+        return self.active_mem#.take_and_freeze(flush_id)
     }
 
     pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<&BlockCache>) -> Result<Option<string>, KvError> {
@@ -566,7 +564,7 @@ fn internal_flush_frozen_step(
         if del_idx >= 0:i64 {
             auto _ = rs2.frozen_mems#.remove(del_idx as usize)
         }
-        rs2.current_version = new_version.clone()
+        rs2.current_version = cede new_version
     }
 
     auto p_idx# = 0:usize
@@ -706,7 +704,7 @@ fn internal_compact_l0_step(
     {
         auto r_wlock = r_wlock_res.unwrap()
         auto &rs# = r_wlock.get_ref()
-        rs.current_version = new_version.clone()
+        rs.current_version = cede new_version
     }
 
     check_test_failpoint("before_compaction_old_file_unlink")
@@ -1709,9 +1707,8 @@ impl TokaKvEngine {
         check_test_failpoint("after_wal_rotation_manifest_commit")
 
         // 4. Switch active WalWriter in WriterState
-        auto old_writer# = cede w.wal_writer
+        w.wal_writer#.close()
         w.wal_writer = cede new_writer
-        old_writer#.close()
 
         // Test-only failpoint 3: After switching writer, before unlinking pruned logs
         check_test_failpoint("before_wal_rotation_old_log_unlink")

@@ -15,6 +15,15 @@ import official/tokakv/crc32::{crc32_ieee}
 
 pub const RECORD_HEADER_SIZE: usize = 8:usize
 
+fn copy_record_string(buffer: Vec<u8>, start: usize, length: usize) -> string {
+    if length == 0:usize {
+        return string::new()
+    }
+    auto buffer_view = bytes_from_vec(buffer)
+    auto value_view = buffer_view.slice_bytes(start, start + length)
+    return copy_bytes_to_string(value_view)
+}
+
 /// Decoded record result containing Entry and total consumed frame bytes (Header + Payload).
 pub shape DecodedRecord (
     entry: Entry,
@@ -223,12 +232,7 @@ pub fn decode_record(
     }
 
     auto key_bytes_start = k_offset + 4:usize
-    auto key_str# = string::new()
-    if key_len > 0:usize {
-        auto buffer_view = bytes_from_vec(buffer)
-        auto key_view = buffer_view.slice_bytes(key_bytes_start, key_bytes_start + key_len)
-        key_str = copy_bytes_to_string(key_view)
-    }
+    auto key_str# = copy_record_string(buffer, key_bytes_start, key_len)
 
     // 7. Parse ValLen (4B LE) + ValBytes
     auto v_offset = key_bytes_start + key_len
@@ -253,21 +257,16 @@ pub fn decode_record(
     }
 
     auto val_bytes_start = v_offset + 4:usize
-    auto val_str# = string::new()
-    if op == OP_PUT && val_len > 0:usize {
-        auto buffer_view = bytes_from_vec(buffer)
-        auto val_view = buffer_view.slice_bytes(val_bytes_start, val_bytes_start + val_len)
-        val_str = copy_bytes_to_string(val_view)
-    }
-
-    auto dummy = string::new()
-    auto entry# = Entry::new_delete(cede dummy, seq)
     if op == OP_PUT {
-        entry = Entry::new_put(cede key_str, cede val_str, seq)
-    } else {
-        entry = Entry::new_delete(cede key_str, seq)
+        auto val_str = copy_record_string(buffer, val_bytes_start, val_len)
+        auto entry = Entry::new_put(cede key_str, cede val_str, seq)
+        return Result<DecodedRecord, KvError>::Ok(DecodedRecord(
+            entry = cede entry,
+            frame_bytes = total_frame_len
+        ))
     }
 
+    auto entry = Entry::new_delete(cede key_str, seq)
     return Result<DecodedRecord, KvError>::Ok(DecodedRecord(
         entry = cede entry,
         frame_bytes = total_frame_len

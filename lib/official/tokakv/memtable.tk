@@ -317,18 +317,7 @@ impl MemTable {
         auto sz = self.size_bytes
         auto mn = self.min_seq
         auto mx = self.max_seq
-        auto taken_entries# = Vec<Entry>::new()
-        unsafe {
-            if self.entries.*buf != null {
-                auto *p_buf = self.entries.*buf
-                auto l = self.entries.len
-                auto c = self.entries.cap
-                self.entries.*buf = null
-                self.entries.len = 0
-                self.entries.cap = 0
-                taken_entries = Vec<Entry>::from_raw(*p_buf, l, c)
-            }
-        }
+        auto taken_entries# = self.entries#.take()
         self.size_bytes = 0:usize
         self.min_seq = 0:u64
         self.max_seq = 0:u64

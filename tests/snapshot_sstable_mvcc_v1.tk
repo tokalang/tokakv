@@ -1,0 +1,67 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/snapshot_sstable_mvcc_v1.tk
+// Verification of multi-version snapshot point-in-time lookups traversing SSTables and MemTables.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Generation 1: writes and flush to SSTable 1
+    db#.put(string::from("key_A"), string::from("val_A_v1")).unwrap()
+    db#.put(string::from("key_B"), string::from("val_B_v1")).unwrap()
+    auto s1 = db#.acquire_snapshot().unwrap()
+    assert(s1.sequence() == 2:u64, "s1 seq must be 2")
+    db#.flush_active_memtable().unwrap()
+
+    // 2. Generation 2: overwrite key_A, delete key_B, and flush to SSTable 2
+    db#.put(string::from("key_A"), string::from("val_A_v2")).unwrap()
+    db#.delete(string::from("key_B")).unwrap()
+    auto s2 = db#.acquire_snapshot().unwrap()
+    assert(s2.sequence() == 4:u64, "s2 seq must be 4")
+    db#.flush_active_memtable().unwrap()
+
+    // 3. Generation 3: overwrite key_A in active MemTable
+    db#.put(string::from("key_A"), string::from("val_A_v3")).unwrap()
+    db#.put(string::from("key_B"), string::from("val_B_v3")).unwrap()
+    auto s3 = db#.acquire_snapshot().unwrap()
+    assert(s3.sequence() == 6:u64, "s3 seq must be 6")
+
+    // 4. Verify Snapshot 1 reads from SSTable 1
+    auto r1_a = db#.get_at_snapshot(string::from("key_A"), s1).unwrap()
+    assert(r1_a.is_some(), "s1 must find key_A")
+    assert(r1_a.unwrap().as_str().equals("val_A_v1"), "s1 must see val_A_v1")
+
+    auto r1_b = db#.get_at_snapshot(string::from("key_B"), s1).unwrap()
+    assert(r1_b.is_some(), "s1 must find key_B")
+    assert(r1_b.unwrap().as_str().equals("val_B_v1"), "s1 must see val_B_v1")
+
+    // 5. Verify Snapshot 2 reads from SSTable 2
+    auto r2_a = db#.get_at_snapshot(string::from("key_A"), s2).unwrap()
+    assert(r2_a.is_some(), "s2 must find key_A")
+    assert(r2_a.unwrap().as_str().equals("val_A_v2"), "s2 must see val_A_v2")
+
+    auto r2_b = db#.get_at_snapshot(string::from("key_B"), s2).unwrap()
+    assert(r2_b.is_none(), "s2 must see deleted key_B")
+
+    // 6. Verify Snapshot 3 reads from active MemTable
+    auto r3_a = db#.get_at_snapshot(string::from("key_A"), s3).unwrap()
+    assert(r3_a.is_some(), "s3 must find key_A")
+    assert(r3_a.unwrap().as_str().equals("val_A_v3"), "s3 must see val_A_v3")
+
+    auto r3_b = db#.get_at_snapshot(string::from("key_B"), s3).unwrap()
+    assert(r3_b.is_some(), "s3 must find key_B")
+    assert(r3_b.unwrap().as_str().equals("val_B_v3"), "s3 must see val_B_v3")
+
+    db#.close().unwrap()
+    tmp#.remove()
+
+    println("[TokaKV] snapshot_sstable_mvcc_v1 PASSED!")
+    return 0
+}

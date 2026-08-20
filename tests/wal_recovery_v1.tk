@@ -1,0 +1,156 @@
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp#.path()
+    db_path#.push_str("_db")
+
+    // 1. First session: open DB, perform 50 puts, 10 overwrites, 5 deletes
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    auto i# = 1:usize
+    loop i <= 50:usize {
+        auto k# = string::from("user:")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("value_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        auto p_res = db1#.put(cede k, cede v)
+        assert(p_res.is_ok(), "put failed")
+        i = i + 1:usize
+    }
+
+    // Overwrite first 10 keys
+    auto up_i# = 1:usize
+    loop up_i <= 10:usize {
+        auto k# = string::from("user:")
+        k#.push_str(string::from_int(up_i as i32).as_str())
+        auto v# = string::from("value_")
+        v#.push_str(string::from_int(up_i as i32).as_str())
+        v#.push_str("_v2")
+        auto p_res = db1#.put(cede k, cede v)
+        assert(p_res.is_ok(), "overwrite failed")
+        up_i = up_i + 1:usize
+    }
+
+    // Delete keys 45..49
+    auto del_i# = 45:usize
+    loop del_i <= 49:usize {
+        auto k# = string::from("user:")
+        k#.push_str(string::from_int(del_i as i32).as_str())
+        auto d_res = db1#.delete(cede k)
+        assert(d_res.is_ok(), "delete failed")
+        del_i = del_i + 1:usize
+    }
+
+    auto last_seq_s1 = db1#.current_seq()
+    assert(last_seq_s1 == 65:u64, "Total committed ops must be 50 + 10 + 5 = 65")
+
+    // Close session 1
+    assert(db1#.close().is_ok(), "db1 close failed")
+
+    // 2. Second session: reopen from WAL and verify 100% exact state recovery
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    assert(db2#.current_seq() == 65:u64, "Recovered current_seq must be 65")
+
+    // Check overwritten keys 1..10
+    auto v_chk1# = 1:usize
+    loop v_chk1 <= 10:usize {
+        auto k# = string::from("user:")
+        k#.push_str(string::from_int(v_chk1 as i32).as_str())
+        auto exp# = string::from("value_")
+        exp#.push_str(string::from_int(v_chk1 as i32).as_str())
+        exp#.push_str("_v2")
+        auto val_res = db2#.get(k)
+        assert(val_res.is_ok(), "query must succeed")
+        match val_res {
+            auto Result::Ok(Option::Some(&val_str)) => {
+                assert(val_str.as_str().equals(exp.as_str()), "overwritten val mismatch")
+            }
+            _ => {
+                assert(false, "overwritten key must exist")
+            }
+        }
+        v_chk1 = v_chk1 + 1:usize
+    }
+
+    // Check intact keys 11..44
+    auto v_chk2# = 11:usize
+    loop v_chk2 <= 44:usize {
+        auto k# = string::from("user:")
+        k#.push_str(string::from_int(v_chk2 as i32).as_str())
+        auto exp# = string::from("value_")
+        exp#.push_str(string::from_int(v_chk2 as i32).as_str())
+        auto val_res = db2#.get(k)
+        assert(val_res.is_ok(), "query must succeed")
+        match val_res {
+            auto Result::Ok(Option::Some(&val_str)) => {
+                assert(val_str.as_str().equals(exp.as_str()), "intact val mismatch")
+            }
+            _ => {
+                assert(false, "intact key must exist")
+            }
+        }
+        v_chk2 = v_chk2 + 1:usize
+    }
+
+    // Check deleted keys 45..49
+    auto v_chk3# = 45:usize
+    loop v_chk3 <= 49:usize {
+        auto k# = string::from("user:")
+        k#.push_str(string::from_int(v_chk3 as i32).as_str())
+        auto val_res = db2#.get(k)
+        assert(val_res.is_ok(), "query must succeed")
+        match val_res {
+            auto Result::Ok(Option::None) => {}
+            _ => {
+                assert(false, "deleted key must return None")
+            }
+        }
+        v_chk3 = v_chk3 + 1:usize
+    }
+
+    // Check intact key 50
+    auto k50 = string::from("user:50")
+    auto val50_res = db2#.get(k50)
+    assert(val50_res.is_ok(), "query 50 must succeed")
+    match val50_res {
+        auto Result::Ok(Option::Some(&val_str)) => {
+            assert(val_str.as_str().equals("value_50"), "key 50 val mismatch")
+        }
+        _ => {
+            assert(false, "key 50 must exist")
+        }
+    }
+
+    // 3. Continue writing in session 2: sequence must continue from 66
+    auto k51 = string::from("user:51")
+    auto v51 = string::from("value_51")
+    auto p51_res = db2#.put(cede k51, cede v51)
+    assert(p51_res.is_ok(), "session 2 put failed")
+    assert(p51_res.unwrap() == 66:u64, "Sequence must be 66")
+    assert(db2#.current_seq() == 66:u64, "Current seq must be 66")
+
+    assert(db2#.close().is_ok(), "db2 close failed")
+
+    // 4. Third session: reopen and verify key 51 is preserved
+    auto db3# = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db3#.current_seq() == 66:u64, "Session 3 recovered current_seq must be 66")
+    auto k51_check = string::from("user:51")
+    auto g51_res = db3#.get(k51_check)
+    assert(g51_res.is_ok(), "session 3 query must succeed")
+    match g51_res {
+        auto Result::Ok(Option::Some(&val_str)) => {
+            assert(val_str.as_str().equals("value_51"), "key 51 val mismatch")
+        }
+        _ => {
+            assert(false, "key 51 must exist in session 3")
+        }
+    }
+
+    assert(db3#.close().is_ok(), "db3 close failed")
+    println("[TokaKV] WAL Full Recovery & Continuity Test PASSED!")
+    return 0
+}

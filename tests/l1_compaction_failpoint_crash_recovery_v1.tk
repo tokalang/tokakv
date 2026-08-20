@@ -1,0 +1,126 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/l1_compaction_failpoint_crash_recovery_v1.tk
+// Verification of crash failpoints and durable file number advance during L0->L1 leveled compaction.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/env::{args_count, get_arg, set_var}
+import std/process::{Command}
+import official/tokakv::{TokaKvEngine}
+
+fn seed_l0_data(db: TokaKvEngine) {
+    db.put(string::from("k1"), string::from("v1_old")).unwrap()
+    db.put(string::from("k2"), string::from("v2_old")).unwrap()
+    db.flush_active_memtable().unwrap()
+
+    db.put(string::from("k2"), string::from("v2_new")).unwrap()
+    db.put(string::from("k3"), string::from("v3_new")).unwrap()
+    db.flush_active_memtable().unwrap()
+}
+
+fn run_worker(db_path: string, fp_name: string) {
+    auto db = TokaKvEngine::open(db_path).unwrap()
+    seed_l0_data(db.clone())
+    set_var(string::from("TOKA_FAILPOINT"), fp_name)
+    db.compact_l0().unwrap()
+}
+
+fn test_crash_before_manifest(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_fp_pre")
+
+    // Run worker process that crashes after L1 SSTables written, before Manifest commit
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-pre-manifest"))
+    cmd#.arg(db_path.clone())
+    auto out_res = cmd#.output()
+    assert(out_res.is_ok(), "Command execution must complete")
+    auto out = out_res.unwrap()
+    assert(!out.status.success(), "Child process must crash with failpoint")
+
+    // Reopen in parent: Manifest was NOT updated, so active Version retains 2 old L0 SSTables.
+    auto db = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db.current_version().tables_count() == 2:usize, "Active Version must retain 2 old SSTables")
+
+    auto q_k1 = db.get(string::from("k1")).unwrap()
+    assert(q_k1.is_some(), "k1 must exist")
+    assert(q_k1.unwrap().as_str().equals("v1_old"), "k1 value correct")
+
+    auto q_k2 = db.get(string::from("k2")).unwrap()
+    assert(q_k2.is_some(), "k2 must exist")
+    assert(q_k2.unwrap().as_str().equals("v2_new"), "k2 value correct")
+
+    // Write new data and flush to verify next_file_number does not reuse orphan numbers
+    db.put(string::from("k4"), string::from("v4")).unwrap()
+    db.flush_active_memtable().unwrap()
+
+    assert(db.current_version().tables_count() == 3:usize, "Version now has 3 SSTables")
+
+    db.close().unwrap()
+    tmp#.remove()
+    println("[PASS] Crash Before Manifest Verified Cleanly")
+}
+
+fn test_crash_after_manifest(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_fp_post")
+
+    // Run worker process that crashes after Manifest commit, before unlinking old files
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-post-manifest"))
+    cmd#.arg(db_path.clone())
+    auto out_res = cmd#.output()
+    assert(out_res.is_ok(), "Command execution must complete")
+    auto out = out_res.unwrap()
+    assert(!out.status.success(), "Child process must crash with failpoint")
+
+    // Reopen in parent: Manifest WAS committed, so recovery loads new L1 SSTable.
+    auto db = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db.current_version().tables_count() >= 1:usize, "Active Version must have new L1 table")
+    assert(db.current_version().get_table(0:usize).meta.level == 1:u32, "Table must be level 1")
+
+    auto q_k1 = db.get(string::from("k1")).unwrap()
+    assert(q_k1.is_some(), "k1 must exist")
+    assert(q_k1.unwrap().as_str().equals("v1_old"), "k1 value correct")
+
+    auto q_k2 = db.get(string::from("k2")).unwrap()
+    assert(q_k2.is_some(), "k2 must exist")
+    assert(q_k2.unwrap().as_str().equals("v2_new"), "k2 value correct")
+
+    auto q_k3 = db.get(string::from("k3")).unwrap()
+    assert(q_k3.is_some(), "k3 must exist")
+    assert(q_k3.unwrap().as_str().equals("v3_new"), "k3 value correct")
+
+    db.close().unwrap()
+    tmp#.remove()
+    println("[PASS] Crash After Manifest Verified Cleanly")
+}
+
+fn main() -> i32 {
+    auto argc = args_count()
+    if argc >= 3:i32 {
+        auto flag = get_arg(1:i32)
+        auto path = get_arg(2:i32)
+        if flag.as_str().equals("--worker-pre-manifest") {
+            run_worker(path, string::from("after_l1_sstables_written_before_manifest"))
+            return 0
+        }
+        if flag.as_str().equals("--worker-post-manifest") {
+            run_worker(path, string::from("after_l1_manifest_commit_before_unlink"))
+            return 0
+        }
+    }
+
+    auto exe = get_arg(0:i32)
+    test_crash_before_manifest(exe.clone())
+    test_crash_after_manifest(exe.clone())
+
+    println("[TokaKV] l1_compaction_failpoint_crash_recovery_v1 PASSED!")
+    return 0
+}

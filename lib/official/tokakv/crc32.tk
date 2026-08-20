@@ -1,0 +1,29 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/crc32.tk
+// Standard IEEE 802.3 CRC32 implementation in pure Toka.
+
+import core/types::{usize}
+import std/vec::{Vec}
+
+/// Computes IEEE 802.3 CRC32 checksum for a slice of bytes starting at `start` with length `len`.
+pub fn crc32_ieee(buf: Vec<u8>, start: usize, len: usize) -> u32 {
+    auto crc# = 0xFFFFFFFF:u32
+    auto i# = start
+    auto end = start + len
+    loop i < end {
+        auto b = buf.get(i) as u32
+        crc = crc ^ b
+        auto j# = 0:usize
+        loop j < 8:usize {
+            auto mask = (crc & 1:u32)
+            if mask != 0:u32 {
+                crc = (crc >> 1:u32) ^ 0xEDB88320:u32
+            } else {
+                crc = crc >> 1:u32
+            }
+            j = j + 1:usize
+        }
+        i = i + 1:usize
+    }
+    return crc ^ 0xFFFFFFFF:u32
+}

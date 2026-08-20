@@ -1,0 +1,150 @@
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import std/env::{set_var}
+import std/vec::{Vec}
+import std/data_file::{WalFile}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/wal::{WalWriter, replay_and_recover}
+import official/tokakv/types::{OP_PUT, KvError}
+import official/tokakv/record::{encode_record}
+
+fn main() -> i32 {
+    // 1. Test Non-ENOENT Open Error:
+    // Opening a path under a non-directory file path should produce an I/O error, NOT an empty DB!
+    auto not_a_dir = string::from("/dev/null/mydb")
+    auto bad_open = TokaKvEngine::open(not_a_dir)
+    assert(bad_open.is_err(), "Opening path under regular file MUST FAIL!")
+    auto bad_err = bad_open.unwrap_err()
+    assert(bad_err.kind.as_str().equals("io"), "Error kind must be io")
+    assert(bad_err.code != 0:i32, "OS error code must be non-zero")
+
+    // 2. Test Sequence Monotonicity Gating:
+    auto tmp1_res = create_temp_file_system()
+    assert(tmp1_res.is_ok(), "create_temp_file_system failed")
+    auto tmp1# = tmp1_res.unwrap()
+    auto valid_file_path = tmp1.path().clone()
+
+    // Writer monotonicity gate
+    auto writer_res = WalWriter::open(valid_file_path.clone(), 0:u64, 10:u64)
+    assert(writer_res.is_ok(), "writer open failed")
+    auto writer# = writer_res.unwrap()
+
+    // Regressing sequence (seq=9 when last=10)
+    auto reg_res = writer#.append(OP_PUT, 9:u64, string::from("k"), string::from("v"))
+    assert(reg_res.is_err(), "Regressing sequence must be rejected")
+    assert(reg_res.unwrap_err().message.as_str().equals("non_monotonic_sequence"), "Must report non_monotonic_sequence")
+
+    // Jumping sequence (seq=12 when last=10)
+    auto jump_res = writer#.append(OP_PUT, 12:u64, string::from("k"), string::from("v"))
+    assert(jump_res.is_err(), "Gapped sequence must be rejected")
+    assert(jump_res.unwrap_err().message.as_str().equals("non_monotonic_sequence"), "Must report non_monotonic_sequence")
+
+    // Valid consecutive sequence (seq=11 when last=10)
+    auto ok_seq_res = writer#.append(OP_PUT, 11:u64, string::from("k"), string::from("v"))
+    assert(ok_seq_res.is_ok(), "Consecutive sequence must succeed")
+    assert(writer.last_seq() == 11:u64, "last_seq must update to 11")
+    writer#.close()
+
+    // Replayer monotonicity gate: craft WAL with out-of-order records
+    auto tmp_seq_res = create_temp_file_system()
+    auto tmp_seq# = tmp_seq_res.unwrap()
+    auto seq_bad_path = tmp_seq.path().clone()
+
+    auto bad_wal_buf# = Vec<u8>::new()
+    encode_record(bad_wal_buf#, OP_PUT, 1:u64, string::from("k1"), string::from("v1"))
+    encode_record(bad_wal_buf#, OP_PUT, 1:u64, string::from("k2"), string::from("v2")) // duplicate seq=1
+
+    auto raw_wal_res = WalFile::open(seq_bad_path.clone())
+    assert(raw_wal_res.is_ok(), "WalFile open failed")
+    auto raw_wal# = raw_wal_res.unwrap()
+    auto raw_w_res = raw_wal#.write_all_at(cede bad_wal_buf, 0:u64)
+    assert(raw_w_res.is_ok(), "raw write failed")
+    raw_wal#.sync_all()
+    raw_wal#.close()
+
+    auto bad_replay = replay_and_recover(seq_bad_path.clone())
+    assert(bad_replay.is_err(), "Non-monotonic replay MUST FAIL!")
+    assert(bad_replay.unwrap_err().message.as_str().equals("non_monotonic_sequence"), "Must fail-closed on non-monotonic sequence in replay")
+
+    tmp_seq#.remove()
+    tmp1#.remove()
+
+    // 3. Test Real I/O Failpoint Poisoning in TokaKvEngine:
+    auto tmp2_res = create_temp_file_system()
+    assert(tmp2_res.is_ok(), "create_temp_file_system 2 failed")
+    auto tmp2# = tmp2_res.unwrap()
+    auto engine_path# = tmp2.path().clone()
+    engine_path#.push_str("_db")
+
+    auto eng_res = TokaKvEngine::open(engine_path.clone())
+    assert(eng_res.is_ok(), "engine open failed")
+    auto eng# = eng_res.unwrap()
+
+    assert(!eng#.is_poisoned(), "engine must not be poisoned initially")
+    auto ek1 = string::from("user:1")
+    auto ev1 = string::from("val:1")
+    assert(eng#.put(cede ek1, cede ev1).is_ok(), "put 1 failed")
+    assert(eng#.current_seq() == 1:u64, "seq must be 1")
+
+    // --- A. Inject forced_pwrite_error failpoint ---
+    set_var(string::from("TOKA_FAILPOINT"), string::from("forced_pwrite_error"))
+
+    auto ek2 = string::from("user:2")
+    auto ev2 = string::from("val:2")
+    auto put_fail_res = eng#.put(cede ek2, cede ev2)
+    assert(put_fail_res.is_err(), "put with forced_pwrite_error must fail")
+    assert(eng#.is_poisoned(), "Engine MUST BE POISONED after pwrite error!")
+    assert(eng#.current_seq() == 1:u64, "Sequence MUST NOT increment on failed write!")
+
+    // Subsequent calls must return KvError::poisoned (code -6)
+    auto ek3 = string::from("user:3")
+    auto ev3 = string::from("val:3")
+    auto post_put = eng#.put(cede ek3, cede ev3)
+    assert(post_put.is_err(), "post_put must fail")
+    auto err_p = post_put.unwrap_err()
+    assert(err_p.kind.as_str().equals("poisoned"), "Must report poisoned")
+    assert(err_p.code == -6:i32, "Poisoned code must be -6")
+
+    auto del_k = string::from("user:1")
+    auto post_del = eng#.delete(cede del_k)
+    assert(post_del.is_err(), "post_del must fail")
+    auto err_d = post_del.unwrap_err()
+    assert(err_d.kind.as_str().equals("poisoned"), "Must report poisoned")
+
+    auto post_rot = eng#.rotate_memtable()
+    assert(post_rot.is_err(), "post_rot must fail")
+    auto err_r = post_rot.unwrap_err()
+    assert(err_r.kind.as_str().equals("poisoned"), "Must report poisoned")
+
+    auto post_cls = eng#.close()
+    assert(post_cls.is_err(), "post_cls must fail")
+    auto err_c = post_cls.unwrap_err()
+    assert(err_c.kind.as_str().equals("poisoned"), "Must report poisoned")
+
+    // Clear failpoint and recover via open
+    set_var(string::from("TOKA_FAILPOINT"), string::from(""))
+    auto eng_reopen = TokaKvEngine::open(engine_path.clone())
+    assert(eng_reopen.is_ok(), "Engine reopen & replay recovery must succeed after failpoint cleared")
+    auto eng_reopened# = eng_reopen.unwrap()
+    assert(!eng_reopened#.is_poisoned(), "Reopened engine must not be poisoned")
+    assert(eng_reopened#.current_seq() == 1:u64, "Recovered seq must be 1")
+    assert(eng_reopened#.get(string::from("user:1")).unwrap().unwrap().as_str().equals("val:1"), "user:1 must exist")
+    assert(eng_reopened#.get(string::from("user:2")).unwrap().is_none(), "unconfirmed user:2 must not exist")
+
+    // --- B. Inject forced_sync_error failpoint ---
+    set_var(string::from("TOKA_FAILPOINT"), string::from("forced_sync_error"))
+
+    auto ek4 = string::from("user:4")
+    auto ev4 = string::from("val:4")
+    auto sync_fail_res = eng_reopened#.put(cede ek4, cede ev4)
+    assert(sync_fail_res.is_err(), "put with forced_sync_error must fail")
+    assert(eng_reopened#.is_poisoned(), "Engine MUST BE POISONED after sync error!")
+    assert(eng_reopened#.current_seq() == 1:u64, "Sequence MUST NOT increment on sync failure!")
+
+    // Clear failpoint and cleanup
+    set_var(string::from("TOKA_FAILPOINT"), string::from(""))
+    tmp2#.remove()
+
+    println("[TokaKV] Sequence Monotonicity & Real Failpoint Poisoning Test PASSED!")
+    return 0
+}

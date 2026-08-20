@@ -1,0 +1,13 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_block_cache_cannot_mutate_inner.tk
+// Diagnostic test: accessing private ~inner of @Encap BlockCache must fail with E0418.
+
+import official/tokakv/cache/block_cache::{BlockCache}
+
+fn main() -> i32 {
+    auto cache = BlockCache::new(1024:usize)
+
+    // Attempting to access private ~inner must fail with error[E0418]
+    auto ~inn = cache.~inner
+    return 0
+}

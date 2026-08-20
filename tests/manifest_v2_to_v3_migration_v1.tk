@@ -1,0 +1,181 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/manifest_v2_to_v3_migration_v1.tk
+// Verification of TOKAMNF2 to TOKAMNF3 migration, crash recovery, and L1 invariant enforcement.
+
+import std/io::{println, print_line}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system, metadata, sync_directory, create_dir}
+import std/data_file::{WalFile, ReadDataFile}
+import std/env::{args_count, get_arg, set_var}
+import std/process::{Command}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/types::{OP_PUT}
+import official/tokakv/wal::{WalWriter}
+import official/tokakv/manifest/format::{
+    put_u32_le, put_u64_le, frame_manifest_payload, TAG_VERSION_BATCH
+}
+import official/tokakv/manifest/version_set::{
+    build_manifest_path, build_wal_path
+}
+
+fn create_legacy_v2_database(db_path: string) {
+    println("create_legacy_v2_database 1")
+    create_dir(db_path.clone())
+
+    println("create_legacy_v2_database 2")
+    // 1. Write MANIFEST with TOKAMNF2 header
+    auto manifest_path = build_manifest_path(db_path.clone())
+    auto wal_m# = WalFile::open(manifest_path.clone()).unwrap()
+
+    println("create_legacy_v2_database 3")
+    // 8-byte TOKAMNF2 magic
+    auto v2_hdr# = Vec<u8>::with_capacity(8:usize)
+    v2_hdr#.push(0x54:u8) // 'T'
+    v2_hdr#.push(0x4F:u8) // 'O'
+    v2_hdr#.push(0x4B:u8) // 'K'
+    v2_hdr#.push(0x41:u8) // 'A'
+    v2_hdr#.push(0x4D:u8) // 'M'
+    v2_hdr#.push(0x4E:u8) // 'N'
+    v2_hdr#.push(0x46:u8) // 'F'
+    v2_hdr#.push(0x32:u8) // '2'
+    wal_m#.write_all_at(cede v2_hdr, 0:u64).unwrap()
+
+    println("create_legacy_v2_database 4")
+    // V2 batch payload (includes active_log=1, sealed_count=0, add_tables=0, del_tables=0)
+    auto payload# = Vec<u8>::with_capacity(49:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64) // version_seq = 1
+    put_u64_le(payload#, 2:u64) // next_file_number = 2
+    put_u64_le(payload#, 0:u64) // last_persisted_seq = 0
+    put_u64_le(payload#, 1:u64) // active_log_num = 1
+    put_u64_le(payload#, 1:u64) // active_log_first_seq = 1
+    put_u32_le(payload#, 0:u32) // sealed_logs_count = 0
+    put_u32_le(payload#, 0:u32) // add_tables_count = 0
+    put_u32_le(payload#, 0:u32) // del_tables_count = 0
+
+    println("create_legacy_v2_database 5")
+    auto frame# = frame_manifest_payload(payload).unwrap()
+    wal_m#.write_all_at(cede frame, 8:u64).unwrap()
+    wal_m#.sync_all().unwrap()
+    wal_m#.close().unwrap()
+
+    // 2. Write 000001.log WAL with 10 records
+    auto wal_1_p = build_wal_path(db_path.clone(), 1:u64)
+    auto wal_w_res = WalWriter::open(wal_1_p, 0:u64, 0:u64)
+    auto wal_w# = wal_w_res.unwrap()
+
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("v2_mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("v2_mig_val_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        wal_w#.append(OP_PUT, i as u64, cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    wal_w#.close()
+    sync_directory(db_path.clone())
+}
+
+fn test_v2_to_v3_migration() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    create_legacy_v2_database(db_path.clone())
+
+    // Open with TokaKvEngine (triggers TOKAMNF2 -> TOKAMNF3 migration)
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // Verify all 10 records
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("v2_mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("v2_mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db#.get(cede k).unwrap()
+        assert(res.is_some(), "Key must be found after v2->v3 migration")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch")
+        i = i + 1:usize
+    }
+
+    // Write a new record
+    db#.put(string::from("v2_mig_key_11"), string::from("v2_mig_val_11")).unwrap()
+    assert(db#.current_seq() == 11:u64, "Current seq must be 11")
+    db#.close().unwrap()
+
+    // Read MANIFEST header to verify it was upgraded to TOKAMNF3
+    {
+        auto manifest_p = build_manifest_path(db_path.clone())
+        auto r_m = ReadDataFile::open(manifest_p).unwrap()
+        auto hdr_buf# = Vec<u8>::with_capacity(8:usize)
+        auto hdr_out = r_m.read_at(cede hdr_buf, 0:u64, 8:usize).unwrap().take_buffer()
+        assert(hdr_out.get(7:usize) == 0x33:u8, "Manifest header must be TOKAMNF3 ('3')")
+    }
+
+    // Reopen and verify
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto res11 = db2#.get(string::from("v2_mig_key_11")).unwrap()
+    assert(res11.is_some(), "v2_mig_key_11 must exist")
+    assert(res11.unwrap().as_str().equals("v2_mig_val_11"), "val11 mismatch")
+    db2#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn run_worker_v2_v3_crash(db_path: string, fp_name: string) {
+    create_legacy_v2_database(db_path.clone())
+    set_var(string::from("TOKA_FAILPOINT"), fp_name)
+    auto db# = TokaKvEngine::open(db_path).unwrap()
+    db#.close().unwrap()
+}
+
+fn test_v2_to_v3_failpoint_crash_recovery(exec_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto mut_cmd# = Command::new(exec_path)
+    mut_cmd#.arg(string::from("--subproc-v2-to-v3-crash"))
+    mut_cmd#.arg(db_path.clone())
+    mut_cmd#.arg(string::from("after_v2_to_v3_migration_manifest_replace"))
+    auto out = mut_cmd#.output().unwrap()
+    assert(!out.status.success(), "Subprocess must crash at failpoint")
+
+    // Reopen after crash: must recover completely
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("v2_mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("v2_mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db#.get(cede k).unwrap()
+        assert(res.is_some(), "Key must be recovered after crash")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Val mismatch")
+        i = i + 1:usize
+    }
+    db#.close().unwrap()
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    if args_count() >= 4 {
+        auto arg1 = get_arg(1)
+        auto target_db = get_arg(2)
+        auto fp_name = get_arg(3)
+        if arg1.as_str().equals("--subproc-v2-to-v3-crash") {
+            run_worker_v2_v3_crash(target_db, fp_name)
+            return 0
+        }
+    }
+
+    test_v2_to_v3_migration()
+
+    auto exec_path = get_arg(0)
+    test_v2_to_v3_failpoint_crash_recovery(exec_path)
+
+    println("[TokaKV] manifest_v2_to_v3_migration_v1 PASSED!")
+    return 0
+}

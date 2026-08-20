@@ -1,0 +1,141 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/l0_compaction_v1.tk
+// Verification of single-writer deterministic Level-0 compaction, sequence deduplication, and atomic Version replacement.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn test_l0_compaction_deduplication_and_tombstones() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_dir# = tmp.path().clone()
+    db_dir#.push_str("_db")
+
+    auto db = TokaKvEngine::open(db_dir.clone()).unwrap()
+
+    // Flush 1: k1="v1", k2="v2_old", k3="v3_old"
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db.put(cede k1, cede v1).unwrap()
+
+    auto k2_1 = string::from("k2")
+    auto v2_1 = string::from("v2_old")
+    db.put(cede k2_1, cede v2_1).unwrap()
+
+    auto k3_1 = string::from("k3")
+    auto v3_1 = string::from("v3_old")
+    db.put(cede k3_1, cede v3_1).unwrap()
+
+    db.flush_active_memtable().unwrap()
+
+    // Flush 2: k2="v2_updated", k4="v4"
+    auto k2_2 = string::from("k2")
+    auto v2_2 = string::from("v2_updated")
+    db.put(cede k2_2, cede v2_2).unwrap()
+
+    auto k4 = string::from("k4")
+    auto v4 = string::from("v4")
+    db.put(cede k4, cede v4).unwrap()
+
+    db.flush_active_memtable().unwrap()
+
+    // Flush 3: delete k3 (tombstone), k5="v5"
+    auto k3_del = string::from("k3")
+    db.delete(cede k3_del).unwrap()
+
+    auto k5 = string::from("k5")
+    auto v5 = string::from("v5")
+    db.put(cede k5, cede v5).unwrap()
+
+    db.flush_active_memtable().unwrap()
+
+    // Prior to compaction: 3 active SSTables
+    auto ver_pre = db.current_version()
+    assert(ver_pre.tables_count() == 3:usize, "Must have 3 L0 SSTables before compaction")
+
+    // Check queries before compaction
+    auto q_k1 = db.get(string::from("k1")).unwrap()
+    assert(q_k1.is_some(), "k1 must exist")
+    assert(q_k1.unwrap().as_str().cmp("v1") == 0:i32, "k1 must be v1")
+
+    auto q_k2 = db.get(string::from("k2")).unwrap()
+    assert(q_k2.is_some(), "k2 must exist")
+    assert(q_k2.unwrap().as_str().cmp("v2_updated") == 0:i32, "k2 must be v2_updated")
+
+    auto q_k3 = db.get(string::from("k3")).unwrap()
+    assert(q_k3.is_none(), "k3 must be deleted")
+
+    auto q_k4 = db.get(string::from("k4")).unwrap()
+    assert(q_k4.is_some(), "k4 must exist")
+    assert(q_k4.unwrap().as_str().cmp("v4") == 0:i32, "k4 must be v4")
+
+    auto q_k5 = db.get(string::from("k5")).unwrap()
+    assert(q_k5.is_some(), "k5 must exist")
+    assert(q_k5.unwrap().as_str().cmp("v5") == 0:i32, "k5 must be v5")
+
+    // Trigger synchronous Level-0 compaction
+    db.compact_l0().unwrap()
+
+    // After compaction: Consolidated into 1 SSTable
+    auto ver_post = db.current_version()
+    assert(ver_post.tables_count() == 1:usize, "Must have exactly 1 consolidated SSTable after compaction")
+
+    // Check queries after compaction
+    auto a_k1 = db.get(string::from("k1")).unwrap()
+    assert(a_k1.is_some(), "After compact: k1 must exist")
+    assert(a_k1.unwrap().as_str().cmp("v1") == 0:i32, "After compact: k1 must be v1")
+
+    auto a_k2 = db.get(string::from("k2")).unwrap()
+    assert(a_k2.is_some(), "After compact: k2 must exist")
+    assert(a_k2.unwrap().as_str().cmp("v2_updated") == 0:i32, "After compact: k2 must be v2_updated")
+
+    auto a_k3 = db.get(string::from("k3")).unwrap()
+    assert(a_k3.is_none(), "After compact: k3 must stay deleted (no resurrection)")
+
+    auto a_k4 = db.get(string::from("k4")).unwrap()
+    assert(a_k4.is_some(), "After compact: k4 must exist")
+    assert(a_k4.unwrap().as_str().cmp("v4") == 0:i32, "After compact: k4 must be v4")
+
+    auto a_k5 = db.get(string::from("k5")).unwrap()
+    assert(a_k5.is_some(), "After compact: k5 must exist")
+    assert(a_k5.unwrap().as_str().cmp("v5") == 0:i32, "After compact: k5 must be v5")
+
+    db.close().unwrap()
+
+    // Reopen engine and verify durable state
+    auto db2 = TokaKvEngine::open(db_dir.clone()).unwrap()
+    assert(db2.current_version().tables_count() == 1:usize, "Reopened engine must have 1 SSTable")
+
+    auto r_k1 = db2.get(string::from("k1")).unwrap()
+    assert(r_k1.is_some(), "Reopen: k1 must exist")
+    assert(r_k1.unwrap().as_str().cmp("v1") == 0:i32, "Reopen: k1 must be v1")
+
+    auto r_k2 = db2.get(string::from("k2")).unwrap()
+    assert(r_k2.is_some(), "Reopen: k2 must exist")
+    assert(r_k2.unwrap().as_str().cmp("v2_updated") == 0:i32, "Reopen: k2 must be v2_updated")
+
+    auto r_k3 = db2.get(string::from("k3")).unwrap()
+    assert(r_k3.is_none(), "Reopen: k3 must stay deleted")
+
+    auto r_k4 = db2.get(string::from("k4")).unwrap()
+    assert(r_k4.is_some(), "Reopen: k4 must exist")
+    assert(r_k4.unwrap().as_str().cmp("v4") == 0:i32, "Reopen: k4 must be v4")
+
+    auto r_k5 = db2.get(string::from("k5")).unwrap()
+    assert(r_k5.is_some(), "Reopen: k5 must exist")
+    assert(r_k5.unwrap().as_str().cmp("v5") == 0:i32, "Reopen: k5 must be v5")
+
+    db2.close().unwrap()
+    println("[PASS] test_l0_compaction_deduplication_and_tombstones passed")
+}
+
+fn main() -> i32 {
+    println("=== Running l0_compaction_v1 tests ===")
+    test_l0_compaction_deduplication_and_tombstones()
+    println("=== ALL l0_compaction_v1 TESTS PASSED ===")
+    return 0
+}

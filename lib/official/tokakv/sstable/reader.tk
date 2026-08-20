@@ -1,0 +1,279 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/sstable/reader.tk
+// SSTableReader: thread-safe immutable SSTable point lookup and fail-closed validation.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import std/data_file::{ReadDataFile}
+import official/tokakv/types::{Entry, KvError, LookupResult}
+import official/tokakv/cache/block_cache::{BlockCache}
+import official/tokakv/sstable/format::{
+    IndexEntry, FOOTER_SIZE, decode_and_validate_footer
+}
+import official/tokakv/sstable/block::{
+    decode_and_validate_index_block, decode_and_validate_data_block,
+    find_candidate_block, find_entry_in_block, find_entry_in_block_at_seq
+}
+
+/// SSTableReader encapsulates a ReadDataFile and its decoded, validated in-memory index block.
+pub shape SSTableReader (
+    path: string,
+    file_number#: u64,
+    file#: ReadDataFile,
+    index#: Vec<IndexEntry>,
+    min_seq#: u64,
+    max_seq#: u64,
+    file_size#: u64
+)
+
+impl SSTableReader@Send {}
+impl SSTableReader@Sync {}
+
+impl SSTableReader {
+    /// Opens and validates an SSTable file:
+    /// 1. Reads physical size via ReadDataFile::size().
+    /// 2. Reads and validates the 48-byte footer (Magic "TOKASST1", CRC32, range gates).
+    /// 3. Reads and validates the index block (CRC32, continuity, key monotonic order).
+    pub fn open(path: string) -> Result<SSTableReader, KvError> {
+        auto file_res = ReadDataFile::open(path.clone())
+        if file_res.is_err() {
+            auto io_err = file_res.unwrap_err()
+            return Result<SSTableReader, KvError>::Err(KvError::io(io_err))
+        }
+        auto file = file_res.unwrap()
+
+        auto size_res = file.size()
+        if size_res.is_err() {
+            auto io_err = size_res.unwrap_err()
+            return Result<SSTableReader, KvError>::Err(KvError::io(io_err))
+        }
+        auto file_size = size_res.unwrap()
+
+        if file_size < (FOOTER_SIZE as u64) {
+            return Result<SSTableReader, KvError>::Err(KvError::corrupted("sstable_file_smaller_than_footer"))
+        }
+
+        // Read 48-byte footer from end of file
+        auto footer_offset = file_size - (FOOTER_SIZE as u64)
+        auto f_buf# = Vec<u8>::with_capacity(FOOTER_SIZE)
+        auto f_read_res = file.read_at(cede f_buf, footer_offset, FOOTER_SIZE)
+        if f_read_res.is_err() {
+            auto r_err = f_read_res.unwrap_err()
+            return Result<SSTableReader, KvError>::Err(KvError::io(r_err.error))
+        }
+        auto f_out = f_read_res.unwrap()
+        if f_out.bytes_read != FOOTER_SIZE {
+            return Result<SSTableReader, KvError>::Err(KvError::corrupted("truncated_footer_read"))
+        }
+
+        auto footer_res = decode_and_validate_footer(f_out.take_buffer(), file_size)
+        if footer_res.is_err() {
+            return Result<SSTableReader, KvError>::Err(footer_res.unwrap_err())
+        }
+        auto footer = footer_res.unwrap()
+
+        // Read and validate the index block
+        auto idx_len = footer.index_length as usize
+        auto idx_buf# = Vec<u8>::with_capacity(idx_len)
+        auto idx_read_res = file.read_at(cede idx_buf, footer.index_offset, idx_len)
+        if idx_read_res.is_err() {
+            auto r_err = idx_read_res.unwrap_err()
+            return Result<SSTableReader, KvError>::Err(KvError::io(r_err.error))
+        }
+        auto idx_out = idx_read_res.unwrap()
+        if idx_out.bytes_read != idx_len {
+            return Result<SSTableReader, KvError>::Err(KvError::corrupted("truncated_index_block_read"))
+        }
+
+        auto index_res = decode_and_validate_index_block(idx_out.take_buffer(), footer.index_length, footer.index_offset)
+        if index_res.is_err() {
+            return Result<SSTableReader, KvError>::Err(index_res.unwrap_err())
+        }
+        auto index_entries = index_res.unwrap()
+
+        return Result<SSTableReader, KvError>::Ok(SSTableReader(
+            path = path.clone(),
+            file_number = 0:u64,
+            file = cede file,
+            index = cede index_entries,
+            min_seq = footer.min_seq,
+            max_seq = footer.max_seq,
+            file_size = file_size
+        ))
+    }
+
+    pub fn set_file_number(self#, file_number: u64) {
+        self.file_number = file_number
+    }
+
+    pub fn min_seq(self) -> u64 {
+        return self.min_seq
+    }
+
+    pub fn max_seq(self) -> u64 {
+        return self.max_seq
+    }
+
+    pub fn file_size(self) -> u64 {
+        return self.file_size
+    }
+
+    pub fn path(self) -> string {
+        return self.path.clone()
+    }
+
+    pub fn blocks_count(self) -> usize {
+        return self.index.len()
+    }
+
+    pub fn block_count(self) -> usize {
+        return self.index.len()
+    }
+
+    /// Binary search in index block to find the single candidate data block for key.
+    pub fn find_candidate_block(self, key_slice: str) -> Option<IndexEntry> {
+        auto count = self.index.len()
+        if count == 0:usize {
+            return Option<IndexEntry>::None
+        }
+
+        auto low# = 0:usize
+        auto high# = count
+
+        loop low < high {
+            auto mid = low + ((high - low) / 2:usize)
+            unsafe {
+                auto *entry = self.index.unsafe_get(mid)
+                if entry.last_key.as_str().cmp(key_slice) < 0:i32 {
+                    low = mid + 1:usize
+                } else {
+                    high = mid
+                }
+            }
+        }
+
+        if low < count {
+            unsafe {
+                auto *cand = self.index.unsafe_get(low)
+                auto lk = cand.last_key.clone()
+                return Option<IndexEntry>::Some(IndexEntry(
+                    offset = cand.offset,
+                    length = cand.length,
+                    last_key = cede lk
+                ))
+            }
+        }
+        return Option<IndexEntry>::None
+    }
+
+    /// Point lookup for a key without external cache:
+    pub fn get(self, key: string) -> Result<LookupResult, KvError> {
+        return self.get_with_cache(key, Option<BlockCache>::None)
+    }
+
+    /// Point lookup for a key with optional block cache:
+    pub fn get_with_cache(self, key: string, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+        return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
+    }
+
+    /// Point lookup for a key at a specific sequence watermark:
+    /// - Ok(LookupResult::Hit(value)): newest version <= target_seq is a Put
+    /// - Ok(LookupResult::Deleted): newest version <= target_seq is a Delete (Tombstone)
+    /// - Ok(LookupResult::NotFound): no version <= target_seq present in this SSTable
+    /// - Err(KvError): CRC corruption, framing error, or I/O failure (Fail-Closed)
+    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+        if self.min_seq > target_seq {
+            return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
+        }
+
+        auto candidate_opt = self.find_candidate_block(key.as_str())
+        if candidate_opt.is_none() {
+            return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
+        }
+        auto block_entry = candidate_opt.unwrap()
+
+        if cache_opt.is_some() {
+            auto cache = cache_opt.unwrap()
+            auto lease_res = cache.get_or_load(self.file_number, block_entry.offset, block_entry.length, self.path.clone())
+            if lease_res.is_err() {
+                return Result<LookupResult, KvError>::Err(lease_res.unwrap_err())
+            }
+            auto lease = lease_res.unwrap()
+            return Result<LookupResult, KvError>::Ok(lease.lookup_at_seq(key.as_str(), target_seq))
+        } else {
+            auto blk_len = block_entry.length as usize
+            auto blk_buf# = Vec<u8>::with_capacity(blk_len)
+            auto read_res = self.file.read_at(cede blk_buf, block_entry.offset, blk_len)
+            if read_res.is_err() {
+                auto r_err = read_res.unwrap_err()
+                return Result<LookupResult, KvError>::Err(KvError::io(r_err.error))
+            }
+            auto read_out = read_res.unwrap()
+            if read_out.bytes_read != blk_len {
+                return Result<LookupResult, KvError>::Err(
+                    KvError::corrupted("truncated_data_block_read")
+                )
+            }
+
+            auto entries_res = decode_and_validate_data_block(read_out.take_buffer(), block_entry.length)
+            if entries_res.is_err() {
+                return Result<LookupResult, KvError>::Err(entries_res.unwrap_err())
+            }
+            auto entries = entries_res.unwrap()
+            return Result<LookupResult, KvError>::Ok(find_entry_in_block_at_seq(entries, key.as_str(), target_seq))
+        }
+    }
+
+    /// Reads and decodes all entries in a specific data block by block index.
+    pub fn read_block_entries(self, block_idx: usize) -> Result<Vec<Entry>, KvError> {
+        if block_idx >= self.index.len() {
+            return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("block_index_out_of_bounds"))
+        }
+        unsafe {
+            auto *entry_ptr = self.index.unsafe_get(block_idx)
+            auto blk_len = entry_ptr.length as usize
+            auto blk_buf# = Vec<u8>::with_capacity(blk_len)
+            auto read_res = self.file.read_at(cede blk_buf, entry_ptr.offset, blk_len)
+            if read_res.is_err() {
+                auto r_err = read_res.unwrap_err()
+                return Result<Vec<Entry>, KvError>::Err(KvError::io(r_err.error))
+            }
+            auto read_out = read_res.unwrap()
+            if read_out.bytes_read != blk_len {
+                return Result<Vec<Entry>, KvError>::Err(KvError::corrupted("truncated_data_block_read"))
+            }
+            return decode_and_validate_data_block(read_out.take_buffer(), entry_ptr.length)
+        }
+    }
+
+    pub fn clone(self) -> SSTableReader {
+        auto copy_idx# = Vec<IndexEntry>::with_capacity(self.index.len())
+        auto i# = 0:usize
+        loop i < self.index.len() {
+            unsafe {
+                auto *entry_ptr = self.index.unsafe_get(i)
+                auto k = entry_ptr.last_key.clone()
+                copy_idx#.push(IndexEntry::new(cede k, entry_ptr.offset, entry_ptr.length))
+            }
+            i = i + 1:usize
+        }
+        return SSTableReader(
+            path = self.path.clone(),
+            file_number = self.file_number,
+            file = self.file.clone(),
+            index = cede copy_idx,
+            min_seq = self.min_seq,
+            max_seq = self.max_seq,
+            file_size = self.file_size
+        )
+    }
+}
+
+impl SSTableReader@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}

@@ -1,0 +1,453 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/wal_manifest_migration_v1.tk
+// Verification of crash-durable TOKAMNF1 to TOKAMNF2 Manifest migration,
+// legacy wal.log to 000001.log transition, and post-migration data integrity.
+
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system, metadata, sync_directory, create_dir}
+import std/data_file::{WalFile, ReadDataFile}
+import std/env::{args_count, get_arg, set_var}
+import std/process::{Command}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/types::{OP_PUT}
+import official/tokakv/wal::{WalWriter}
+import official/tokakv/manifest/format::{
+    put_u32_le, put_u64_le, frame_manifest_payload, TAG_VERSION_BATCH
+}
+import official/tokakv/manifest/version_set::{
+    build_manifest_path, build_wal_path, resolve_legacy_wal_path
+}
+
+fn create_legacy_v1_database(db_path: string) {
+    create_dir(db_path.clone())
+
+    // 1. Write legacy MANIFEST with TOKAMNF1 header
+    auto manifest_path = build_manifest_path(db_path.clone())
+    auto wal_m# = WalFile::open(manifest_path.clone()).unwrap()
+
+    // 8-byte TOKAMNF1 magic
+    auto v1_hdr# = Vec<u8>::with_capacity(8:usize)
+    v1_hdr#.push(0x54:u8) // 'T'
+    v1_hdr#.push(0x4F:u8) // 'O'
+    v1_hdr#.push(0x4B:u8) // 'K'
+    v1_hdr#.push(0x41:u8) // 'A'
+    v1_hdr#.push(0x4D:u8) // 'M'
+    v1_hdr#.push(0x4E:u8) // 'N'
+    v1_hdr#.push(0x46:u8) // 'F'
+    v1_hdr#.push(0x31:u8) // '1'
+    wal_m#.write_all_at(cede v1_hdr, 0:u64).unwrap()
+
+    // Legacy v1 batch payload (29 bytes)
+    auto payload# = Vec<u8>::with_capacity(29:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64) // version_seq = 1
+    put_u64_le(payload#, 2:u64) // next_file_number = 2
+    put_u64_le(payload#, 0:u64) // last_persisted_seq = 0
+    put_u32_le(payload#, 0:u32) // add_tables_count = 0
+    put_u32_le(payload#, 0:u32) // del_tables_count = 0
+
+    auto frame# = frame_manifest_payload(payload).unwrap()
+    wal_m#.write_all_at(cede frame, 8:u64).unwrap()
+    wal_m#.sync_all().unwrap()
+    wal_m#.close().unwrap()
+
+    // 2. Write legacy wal.log with 10 records
+    auto legacy_wal_p = resolve_legacy_wal_path(db_path.clone())
+    auto wal_w_res = WalWriter::open(legacy_wal_p.clone(), 0:u64, 0:u64)
+    auto wal_w# = wal_w_res.unwrap()
+
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("mig_val_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        wal_w#.append(OP_PUT, i as u64, cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    wal_w#.close()
+    sync_directory(db_path.clone())
+}
+
+fn test_legacy_v1_migration() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // Setup legacy database with TOKAMNF1 and wal.log
+    create_legacy_v1_database(db_path.clone())
+
+    // Verify initial layout: wal.log exists, 000001.log does not exist
+    auto legacy_wal_p = resolve_legacy_wal_path(db_path.clone())
+    auto v2_wal_1_p = build_wal_path(db_path.clone(), 1:u64)
+    assert(metadata(legacy_wal_p.clone()).is_ok(), "legacy wal.log must exist initially")
+    assert(metadata(v2_wal_1_p.clone()).is_err(), "000001.log must not exist initially")
+
+    // Open with TokaKvEngine (triggers migration)
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Verify all 10 legacy records are recovered correctly
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db#.get(cede k).unwrap()
+        assert(res.is_some(), "Migrated key must be found")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Migrated value mismatch")
+        i = i + 1:usize
+    }
+
+    // 2. Put new record 11 into migrated engine
+    auto k11 = string::from("mig_key_11")
+    auto v11 = string::from("mig_val_11")
+    db#.put(cede k11, cede v11).unwrap()
+    assert(db#.current_seq() == 11:u64, "Current seq must be 11")
+
+    db#.close().unwrap()
+
+    // 3. Verify disk state post-migration
+    assert(metadata(legacy_wal_p).is_err(), "Legacy wal.log must be unlinked after migration")
+    assert(metadata(v2_wal_1_p).is_ok(), "000001.log must exist after migration")
+
+    // Read MANIFEST header to verify it was upgraded to TOKAMNF3
+    auto manifest_p = build_manifest_path(db_path.clone())
+    auto r_m = ReadDataFile::open(manifest_p).unwrap()
+    auto hdr_buf# = Vec<u8>::with_capacity(8:usize)
+    auto hdr_out = r_m.read_at(cede hdr_buf, 0:u64, 8:usize).unwrap().take_buffer()
+    assert(hdr_out.get(7:usize) == 0x33:u8, "Manifest header must be TOKAMNF3 ('3')")
+
+    // 4. Reopen migrated engine and verify all 11 records
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+    i = 1:usize
+    loop i <= 11:usize {
+        auto k# = string::from("mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db2#.get(cede k).unwrap()
+        assert(res.is_some(), "Key must exist in reopened migrated DB")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch in reopened migrated DB")
+        i = i + 1:usize
+    }
+    db2#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn test_legacy_wal_is_dir_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_dir_fail")
+
+    create_dir(db_path.clone())
+    auto manifest_path = build_manifest_path(db_path.clone())
+    auto wal_m# = WalFile::open(manifest_path.clone()).unwrap()
+    auto v1_hdr# = Vec<u8>::with_capacity(8:usize)
+    v1_hdr#.push(0x54:u8)
+    v1_hdr#.push(0x4F:u8)
+    v1_hdr#.push(0x4B:u8)
+    v1_hdr#.push(0x41:u8)
+    v1_hdr#.push(0x4D:u8)
+    v1_hdr#.push(0x4E:u8)
+    v1_hdr#.push(0x46:u8)
+    v1_hdr#.push(0x31:u8)
+    wal_m#.write_all_at(cede v1_hdr, 0:u64).unwrap()
+    auto payload# = Vec<u8>::with_capacity(29:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64)
+    put_u64_le(payload#, 2:u64)
+    put_u64_le(payload#, 0:u64)
+    put_u32_le(payload#, 0:u32)
+    put_u32_le(payload#, 0:u32)
+    auto frame# = frame_manifest_payload(payload).unwrap()
+    wal_m#.write_all_at(cede frame, 8:u64).unwrap()
+    wal_m#.sync_all().unwrap()
+    wal_m#.close().unwrap()
+
+    // Create directory named wal.log
+    auto legacy_wal_p = resolve_legacy_wal_path(db_path.clone())
+    create_dir(legacy_wal_p)
+
+    // Open must fail closed
+    auto open_res = TokaKvEngine::open(db_path.clone())
+    assert(open_res.is_err(), "Migration must fail closed when legacy wal.log is a directory")
+
+    tmp#.remove()
+}
+
+fn test_legacy_wal_missing_on_nonempty_db_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_missing_fail")
+
+    create_dir(db_path.clone())
+    auto manifest_path = build_manifest_path(db_path.clone())
+    auto wal_m# = WalFile::open(manifest_path.clone()).unwrap()
+    auto v1_hdr# = Vec<u8>::with_capacity(8:usize)
+    v1_hdr#.push(0x54:u8)
+    v1_hdr#.push(0x4F:u8)
+    v1_hdr#.push(0x4B:u8)
+    v1_hdr#.push(0x41:u8)
+    v1_hdr#.push(0x4D:u8)
+    v1_hdr#.push(0x4E:u8)
+    v1_hdr#.push(0x46:u8)
+    v1_hdr#.push(0x31:u8)
+    wal_m#.write_all_at(cede v1_hdr, 0:u64).unwrap()
+    auto payload# = Vec<u8>::with_capacity(29:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64)
+    put_u64_le(payload#, 2:u64)
+    put_u64_le(payload#, 5:u64) // last_persisted_seq = 5 (non-empty DB)
+    put_u32_le(payload#, 0:u32)
+    put_u32_le(payload#, 0:u32)
+    auto frame# = frame_manifest_payload(payload).unwrap()
+    wal_m#.write_all_at(cede frame, 8:u64).unwrap()
+    wal_m#.sync_all().unwrap()
+    wal_m#.close().unwrap()
+
+    // No wal.log and no 000001.log -> open must fail closed
+    auto open_res = TokaKvEngine::open(db_path.clone())
+    assert(open_res.is_err(), "Migration must fail closed when legacy wal.log is missing on non-empty DB")
+
+    tmp#.remove()
+}
+
+fn run_worker_mig_fp(db_path: string, fp_name: string) {
+    create_legacy_v1_database(db_path.clone())
+    set_var(string::from("TOKA_FAILPOINT"), fp_name)
+    auto db# = TokaKvEngine::open(db_path).unwrap()
+    db#.close().unwrap()
+}
+
+fn test_migration_crash_recovery(exe_path: string, fp_name: string, sub_name: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str(sub_name.as_str())
+
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-mig"))
+    cmd#.arg(db_path.clone())
+    cmd#.arg(fp_name.clone())
+    auto out = cmd#.output().unwrap()
+    assert(!out.status.success(), "Worker crash point must exit non-zero via SIGKILL")
+
+    // Reopen in parent: migration finishes or resumes cleanly, all 10 records intact
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db#.get(cede k).unwrap()
+        assert(res.is_some(), "Key must exist after migration crash reopen")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch after migration crash reopen")
+        i = i + 1:usize
+    }
+    db#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn test_target_wal_is_dir_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_target_dir_fail")
+
+    // Setup legacy database with TOKAMNF1 and valid wal.log
+    create_legacy_v1_database(db_path.clone())
+
+    // Create 000001.log as a directory
+    auto target_wal_1 = build_wal_path(db_path.clone(), 1:u64)
+    create_dir(target_wal_1.clone())
+
+    // Open must fail closed
+    auto open_res = TokaKvEngine::open(db_path.clone())
+    assert(open_res.is_err(), "Migration must fail closed when target 000001.log is a directory")
+
+    // Assert failure path invariants:
+    // 1. wal.log must still exist and be intact
+    auto legacy_wal_p = resolve_legacy_wal_path(db_path.clone())
+    assert(metadata(legacy_wal_p).is_ok(), "wal.log must NOT be deleted on failed migration")
+
+    // 2. MANIFEST must still be TOKAMNF1 (not replaced with V2)
+    auto manifest_p = build_manifest_path(db_path.clone())
+    auto r_m = ReadDataFile::open(manifest_p).unwrap()
+    auto hdr_buf# = Vec<u8>::with_capacity(8:usize)
+    auto hdr_out = r_m.read_at(cede hdr_buf, 0:u64, 8:usize).unwrap().take_buffer()
+    assert(hdr_out.get(7:usize) == 0x31:u8, "Manifest header must remain TOKAMNF1 ('1') on failure")
+
+    tmp#.remove()
+}
+
+fn test_target_wal_corrupt_overwritten_by_legacy_wal() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_target_corrupt_overwrite")
+
+    // Setup legacy database with TOKAMNF1 and valid wal.log (10 records)
+    create_legacy_v1_database(db_path.clone())
+
+    // Create 000001.log with 100 bytes of garbage
+    auto target_wal_1 = build_wal_path(db_path.clone(), 1:u64)
+    auto junk# = Vec<u8>::with_capacity(100:usize)
+    auto j_i# = 0:usize
+    loop j_i < 100:usize {
+        junk#.push(0xEE:u8)
+        j_i = j_i + 1:usize
+    }
+    auto j_f# = WalFile::open(target_wal_1.clone()).unwrap()
+    j_f#.write_all_at(cede junk, 0:u64).unwrap()
+    j_f#.sync_all().unwrap()
+    j_f#.close().unwrap()
+
+    // Open must succeed by overwriting corrupt 000001.log with authoritative wal.log
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db#.get(cede k).unwrap()
+        assert(res.is_some(), "Key must exist from authoritative wal.log")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch from authoritative wal.log")
+        i = i + 1:usize
+    }
+    db#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn test_legacy_wal_missing_but_target_wal_exists_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_isolated_target_fail")
+
+    create_dir(db_path.clone())
+    auto manifest_path = build_manifest_path(db_path.clone())
+    auto wal_m# = WalFile::open(manifest_path.clone()).unwrap()
+    auto v1_hdr# = Vec<u8>::with_capacity(8:usize)
+    v1_hdr#.push(0x54:u8)
+    v1_hdr#.push(0x4F:u8)
+    v1_hdr#.push(0x4B:u8)
+    v1_hdr#.push(0x41:u8)
+    v1_hdr#.push(0x4D:u8)
+    v1_hdr#.push(0x4E:u8)
+    v1_hdr#.push(0x46:u8)
+    v1_hdr#.push(0x31:u8)
+    wal_m#.write_all_at(cede v1_hdr, 0:u64).unwrap()
+    auto payload# = Vec<u8>::with_capacity(29:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64)
+    put_u64_le(payload#, 2:u64)
+    put_u64_le(payload#, 5:u64) // last_persisted_seq = 5 (non-empty DB)
+    put_u32_le(payload#, 0:u32)
+    put_u32_le(payload#, 0:u32)
+    auto frame# = frame_manifest_payload(payload).unwrap()
+    wal_m#.write_all_at(cede frame, 8:u64).unwrap()
+    wal_m#.sync_all().unwrap()
+    wal_m#.close().unwrap()
+
+    // Create 000001.log but no wal.log
+    auto target_wal_1 = build_wal_path(db_path.clone(), 1:u64)
+    auto f# = WalFile::open(target_wal_1.clone()).unwrap()
+    f#.close().unwrap()
+
+    // Open must fail closed (do NOT trust isolated 000001.log under V1 manifest)
+    auto open_res = TokaKvEngine::open(db_path.clone())
+    assert(open_res.is_err(), "Migration must fail closed on missing wal.log even if 000001.log exists")
+
+    tmp#.remove()
+}
+
+fn test_legacy_wal_non_enoent_error_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_non_enoent_fail")
+
+    // Setup legacy database with TOKAMNF1 and valid wal.log
+    create_legacy_v1_database(db_path.clone())
+    auto legacy_wal_p = resolve_legacy_wal_path(db_path.clone())
+
+    // Change permissions to 000 to trigger EACCES (non-ENOENT)
+    auto chmod_cmd# = Command::new(string::from("chmod"))
+    chmod_cmd#.arg(string::from("000"))
+    chmod_cmd#.arg(legacy_wal_p.clone())
+    auto chmod_out = chmod_cmd#.output().unwrap()
+    assert(chmod_out.status.success(), "chmod 000 must succeed")
+
+    // Open must fail closed with I/O error
+    auto open_res = TokaKvEngine::open(db_path.clone())
+    assert(open_res.is_err(), "Migration must fail closed on non-ENOENT EACCES")
+    auto err = open_res.unwrap_err()
+    assert(err.kind.as_str().equals("io"), "Error kind must be io")
+    assert(err.code == 13:i32, "Error code must be EACCES (13)")
+
+    // Assert failure path invariants:
+    // 1. MANIFEST must still be TOKAMNF1 (not upgraded to V2)
+    auto manifest_p = build_manifest_path(db_path.clone())
+    auto r_m = ReadDataFile::open(manifest_p).unwrap()
+    auto hdr_buf# = Vec<u8>::with_capacity(8:usize)
+    auto hdr_out = r_m.read_at(cede hdr_buf, 0:u64, 8:usize).unwrap().take_buffer()
+    assert(hdr_out.get(7:usize) == 0x31:u8, "Manifest header must remain TOKAMNF1 ('1') on non-ENOENT failure")
+
+    // Restore permissions
+    auto chmod_fix# = Command::new(string::from("chmod"))
+    chmod_fix#.arg(string::from("644"))
+    chmod_fix#.arg(legacy_wal_p.clone())
+    auto fix_out = chmod_fix#.output().unwrap()
+    assert(fix_out.status.success(), "chmod 644 must succeed")
+
+    // 2. wal.log must still exist and be readable
+    assert(metadata(legacy_wal_p).is_ok(), "wal.log must NOT be deleted on non-ENOENT failure")
+
+    // 3. Subsequent open now succeeds and recovers all 10 records
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("mig_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto exp_v# = string::from("mig_val_")
+        exp_v#.push_str(string::from_int(i as i32).as_str())
+        auto res = db#.get(cede k).unwrap()
+        assert(res.is_some(), "Key must exist after permissions restored")
+        assert(res.unwrap().as_str().equals(exp_v.as_str()), "Value mismatch after permissions restored")
+        i = i + 1:usize
+    }
+    db#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    auto argc = args_count()
+    if argc >= 4 {
+        auto flag = get_arg(1)
+        auto target_db = get_arg(2)
+        auto fp_name = get_arg(3)
+        if flag.as_str().equals("--worker-mig") {
+            run_worker_mig_fp(target_db, fp_name)
+            return 0
+        }
+    }
+
+    test_legacy_v1_migration()
+    test_legacy_wal_is_dir_fail_closed()
+    test_legacy_wal_missing_on_nonempty_db_fail_closed()
+    test_target_wal_is_dir_fail_closed()
+    test_target_wal_corrupt_overwritten_by_legacy_wal()
+    test_legacy_wal_missing_but_target_wal_exists_fail_closed()
+    test_legacy_wal_non_enoent_error_fail_closed()
+
+    auto exe = get_arg(0)
+    test_migration_crash_recovery(exe.clone(), string::from("after_migration_log_copy"), string::from("_db_crash_1"))
+    test_migration_crash_recovery(exe.clone(), string::from("after_migration_manifest_replace"), string::from("_db_crash_2"))
+    test_migration_crash_recovery(exe.clone(), string::from("after_migration_legacy_wal_unlink"), string::from("_db_crash_3"))
+
+    println("[PASS] TOKAMNF1 to TOKAMNF2 Manifest Migration Qualified Successfully!")
+    return 0
+}

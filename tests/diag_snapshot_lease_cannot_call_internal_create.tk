@@ -1,0 +1,11 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_snapshot_lease_cannot_call_internal_create.tk
+// Compile-fail diagnostic test: external callers cannot call non-existent or private constructor.
+
+import official/tokakv::{SnapshotLease}
+
+fn main() -> i32 {
+    // Attempt to call non-existent or private constructor
+    auto forged = SnapshotLease::internal_create(1:u64)
+    return 0
+}

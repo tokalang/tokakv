@@ -1,0 +1,190 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/merging_iterator_v1.tk
+// Unit tests for SSTableIterator and MergingIterator (multi-way merge & sequence ordering).
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println, toka_print_str, toka_print_i32}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import official/tokakv/types::{Entry, KvError}
+import official/tokakv/memtable::{MemTable}
+import official/tokakv/sstable/writer::{SSTableWriter}
+import official/tokakv/sstable/reader::{SSTableReader}
+import official/tokakv/sstable/iterator::{SSTableIterator}
+import official/tokakv/sstable/merger::{MergingIterator}
+
+fn test_single_sstable_iterator() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto sst_path# = tmp.path().clone()
+    sst_path#.push_str("_test_single.sst")
+
+    // Write 5 entries into SSTable
+    auto mem# = MemTable::new()
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    mem#.put(1:u64, cede k1, cede v1)
+
+    auto k2 = string::from("k2")
+    auto v2 = string::from("v2")
+    mem#.put(2:u64, cede k2, cede v2)
+
+    auto k3 = string::from("k3")
+    auto v3 = string::from("v3")
+    mem#.put(3:u64, cede k3, cede v3)
+
+    auto k4 = string::from("k4")
+    auto v4 = string::from("v4")
+    mem#.put(4:u64, cede k4, cede v4)
+
+    auto k5 = string::from("k5")
+    auto v5 = string::from("v5")
+    mem#.put(5:u64, cede k5, cede v5)
+
+    auto frozen = mem#.take_and_freeze(1:u64)
+    SSTableWriter::write(sst_path.clone(), cede frozen).unwrap()
+
+    auto r_reader = SSTableReader::open(sst_path.clone()).unwrap()
+    auto iter# = SSTableIterator::open(r_reader).unwrap()
+
+    auto expected_keys# = Vec<string>::new()
+    auto ek1 = string::from("k1")
+    expected_keys#.push(cede ek1)
+    auto ek2 = string::from("k2")
+    expected_keys#.push(cede ek2)
+    auto ek3 = string::from("k3")
+    expected_keys#.push(cede ek3)
+    auto ek4 = string::from("k4")
+    expected_keys#.push(cede ek4)
+    auto ek5 = string::from("k5")
+    expected_keys#.push(cede ek5)
+
+    auto count# = 0:usize
+    loop iter#.is_valid() {
+        auto opt = iter#.current()
+        assert(opt.is_some(), "Current entry must be present when valid")
+        auto entry = opt.unwrap()
+        assert(entry.key.as_str().cmp(expected_keys.get(count).as_str()) == 0:i32, "Key mismatch")
+        count = count + 1:usize
+        iter#.advance().unwrap()
+    }
+    assert(count == 5:usize, "Total iterated count must be 5")
+    println("[PASS] test_single_sstable_iterator passed")
+}
+
+fn test_merging_iterator_interleaved_and_sequences() {
+    auto tmp# = create_temp_file_system().unwrap()
+
+    // Table 1: ("a", seq=1, "v1"), ("c", seq=2, "v2_old"), ("e", seq=3, "v3")
+    auto sst1_path# = tmp.path().clone()
+    sst1_path#.push_str("_t1.sst")
+    auto mem1# = MemTable::new()
+    auto k_a1 = string::from("a")
+    auto v_a1 = string::from("v1")
+    mem1#.put(1:u64, cede k_a1, cede v_a1)
+
+    auto k_c1 = string::from("c")
+    auto v_c1 = string::from("v2_old")
+    mem1#.put(2:u64, cede k_c1, cede v_c1)
+
+    auto k_e1 = string::from("e")
+    auto v_e1 = string::from("v3")
+    mem1#.put(3:u64, cede k_e1, cede v_e1)
+    auto frozen1 = mem1#.take_and_freeze(1:u64)
+    SSTableWriter::write(sst1_path.clone(), cede frozen1).unwrap()
+
+    // Table 2: ("b", seq=4, "v4"), ("c", seq=10, "v2_new"), ("d", seq=5, "v5")
+    auto sst2_path# = tmp.path().clone()
+    sst2_path#.push_str("_t2.sst")
+    auto mem2# = MemTable::new()
+    auto k_b2 = string::from("b")
+    auto v_b2 = string::from("v4")
+    mem2#.put(4:u64, cede k_b2, cede v_b2)
+
+    auto k_c2 = string::from("c")
+    auto v_c2 = string::from("v2_new")
+    mem2#.put(10:u64, cede k_c2, cede v_c2)
+
+    auto k_d2 = string::from("d")
+    auto v_d2 = string::from("v5")
+    mem2#.put(5:u64, cede k_d2, cede v_d2)
+    auto frozen2 = mem2#.take_and_freeze(2:u64)
+    SSTableWriter::write(sst2_path.clone(), cede frozen2).unwrap()
+
+    // Table 3: ("c", seq=15, tombstone), ("f", seq=6, "v6")
+    auto sst3_path# = tmp.path().clone()
+    sst3_path#.push_str("_t3.sst")
+    auto mem3# = MemTable::new()
+    auto k_c3 = string::from("c")
+    mem3#.delete(15:u64, cede k_c3)
+
+    auto k_f3 = string::from("f")
+    auto v_f3 = string::from("v6")
+    mem3#.put(6:u64, cede k_f3, cede v_f3)
+    auto frozen3 = mem3#.take_and_freeze(3:u64)
+    SSTableWriter::write(sst3_path.clone(), cede frozen3).unwrap()
+
+    auto r1 = SSTableReader::open(sst1_path.clone()).unwrap()
+    auto r2 = SSTableReader::open(sst2_path.clone()).unwrap()
+    auto r3 = SSTableReader::open(sst3_path.clone()).unwrap()
+
+    auto it1 = SSTableIterator::open(r1).unwrap()
+    auto it2 = SSTableIterator::open(r2).unwrap()
+    auto it3 = SSTableIterator::open(r3).unwrap()
+
+    auto iters# = Vec<SSTableIterator>::new()
+    iters#.push(cede it1)
+    iters#.push(cede it2)
+    iters#.push(cede it3)
+
+    auto merger# = MergingIterator::new(cede iters)
+
+    // Expected sequence of entries emitted:
+    // 1. "a" (seq=1)
+    // 2. "b" (seq=4)
+    // 3. "c" (seq=15, tombstone) -> Highest sequence for "c" MUST come first!
+    // 4. "c" (seq=10, "v2_new")
+    // 5. "c" (seq=2, "v2_old")
+    // 6. "d" (seq=5)
+    // 7. "e" (seq=3)
+    // 8. "f" (seq=6)
+
+    auto e1 = merger#.next_entry().unwrap().unwrap()
+    assert(e1.key.as_str().cmp("a") == 0:i32 && e1.seq == 1:u64, "1. Expected a(1)")
+
+    auto e2 = merger#.next_entry().unwrap().unwrap()
+    assert(e2.key.as_str().cmp("b") == 0:i32 && e2.seq == 4:u64, "2. Expected b(4)")
+
+    auto e3 = merger#.next_entry().unwrap().unwrap()
+    assert(e3.key.as_str().cmp("c") == 0:i32 && e3.seq == 15:u64 && e3.is_del, "3. Expected c(15, del)")
+
+    auto e4 = merger#.next_entry().unwrap().unwrap()
+    assert(e4.key.as_str().cmp("c") == 0:i32 && e4.seq == 10:u64 && !e4.is_del, "4. Expected c(10)")
+
+    auto e5 = merger#.next_entry().unwrap().unwrap()
+    assert(e5.key.as_str().cmp("c") == 0:i32 && e5.seq == 2:u64 && !e5.is_del, "5. Expected c(2)")
+
+    auto e6 = merger#.next_entry().unwrap().unwrap()
+    assert(e6.key.as_str().cmp("d") == 0:i32 && e6.seq == 5:u64, "6. Expected d(5)")
+
+    auto e7 = merger#.next_entry().unwrap().unwrap()
+    assert(e7.key.as_str().cmp("e") == 0:i32 && e7.seq == 3:u64, "7. Expected e(3)")
+
+    auto e8 = merger#.next_entry().unwrap().unwrap()
+    assert(e8.key.as_str().cmp("f") == 0:i32 && e8.seq == 6:u64, "8. Expected f(6)")
+
+    auto e9_opt = merger#.next_entry().unwrap()
+    assert(e9_opt.is_none(), "Merger must be exhausted")
+    assert(!merger#.is_valid(), "Merger must be invalid when exhausted")
+
+    println("[PASS] test_merging_iterator_interleaved_and_sequences passed")
+}
+
+fn main() -> i32 {
+    println("=== Running merging_iterator_v1 tests ===")
+    test_single_sstable_iterator()
+    test_merging_iterator_interleaved_and_sequences()
+    println("=== ALL merging_iterator_v1 TESTS PASSED ===")
+    return 0
+}

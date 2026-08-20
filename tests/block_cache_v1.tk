@@ -1,0 +1,386 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/block_cache_v1.tk
+// Single-threaded unit tests for BlockCache: LRU eviction, lease pinning, stats, and fail-closed validation.
+
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/data_file::{ReadDataFile, WalFile}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/types::{Entry, LookupResult}
+import official/tokakv/cache/block_cache::{BlockCache, BlockLease}
+import official/tokakv/manifest/version_set::{build_table_path}
+import official/tokakv/sstable/reader::{SSTableReader}
+
+fn make_key(i: usize) -> string {
+    auto s# = string::from("user:key:")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn make_val(i: usize) -> string {
+    auto s# = string::from("value_payload_data_")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn test_cache_hit_miss_and_stats() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // Open engine with 64KB cache
+    auto db# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 65536:usize).unwrap()
+
+    // Put 30 keys and flush to 000001.sst
+    auto i# = 1:usize
+    loop i <= 30:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+
+    auto s1 = db#.block_cache_stats()
+    assert(s1.hit_count == 0:u64, "Initial hit count must be 0")
+    assert(s1.miss_count == 0:u64, "Initial miss count must be 0")
+
+    // 1. First get: cache miss, loads from disk into cache
+    auto r1 = db#.get(make_key(10)).unwrap()
+    assert(r1.is_some(), "Key 10 must be found")
+    auto s2 = db#.block_cache_stats()
+    assert(s2.miss_count == 1:u64, "Must record 1 miss on first lookup")
+    assert(s2.hit_count == 0:u64, "Hit count must still be 0")
+    assert(s2.resident_bytes > 0:usize, "Resident bytes must be > 0 after loading block")
+
+    // 2. Second get for same key: cache hit!
+    auto r2 = db#.get(make_key(10)).unwrap()
+    assert(r2.is_some(), "Key 10 must be found")
+    auto s3 = db#.block_cache_stats()
+    assert(s3.hit_count == 1:u64, "Must record 1 hit on second lookup")
+    assert(s3.miss_count == 1:u64, "Miss count must remain 1")
+
+    // 3. Third get for another key in the same data block: cache hit!
+    auto r3 = db#.get(make_key(11)).unwrap()
+    assert(r3.is_some(), "Key 11 must be found")
+    auto s4 = db#.block_cache_stats()
+    assert(s4.hit_count == 2:u64, "Must record 2 hits for sibling key in same block")
+
+    db#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_lru_eviction_order() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // Create DB and flush 3 separate SSTables
+    auto db# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 65536:usize).unwrap()
+
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 1
+
+    loop i <= 20:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 2
+
+    loop i <= 30:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 3
+    db#.close().unwrap()
+
+    // Re-open with tight cache that can hold only ~1 block (e.g. 2000 bytes)
+    auto db2# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 2000:usize).unwrap()
+
+    // 1. Query Table 1 block -> miss, resident_bytes > 0
+    db2#.get(make_key(5)).unwrap()
+    auto s1 = db2#.block_cache_stats()
+    assert(s1.miss_count == 1:u64, "Miss count must be 1")
+    assert(s1.eviction_count == 0:u64, "Eviction count must be 0")
+
+    // 2. Query Table 2 block -> miss, exceeds capacity, evicts Table 1 block!
+    db2#.get(make_key(15)).unwrap()
+    auto s2 = db2#.block_cache_stats()
+    assert(s2.miss_count == 2:u64, "Miss count must be 2")
+    assert(s2.eviction_count == 1:u64, "Eviction count must be 1")
+
+    // 3. Query Table 2 block again -> hit!
+    db2#.get(make_key(15)).unwrap()
+    auto s3 = db2#.block_cache_stats()
+    assert(s3.hit_count == 1:u64, "Hit count must be 1")
+
+    // 4. Query Table 1 block -> miss again because it was evicted!
+    db2#.get(make_key(5)).unwrap()
+    auto s4 = db2#.block_cache_stats()
+    assert(s4.miss_count == 3:u64, "Table 1 block must miss after being evicted")
+    assert(s4.eviction_count == 2:u64, "Eviction count must advance to 2")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_hit_promotion_evicts_oldest() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 1
+
+    loop i <= 20:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 2
+
+    loop i <= 30:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 3
+    db#.close().unwrap()
+
+    // Open with capacity for ~2 blocks (~3000 bytes)
+    auto db2# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 3000:usize).unwrap()
+
+    // 1. Load Block 1 (from Table 1)
+    db2#.get(make_key(5)).unwrap()
+    // 2. Load Block 2 (from Table 2)
+    db2#.get(make_key(15)).unwrap()
+
+    // 3. Promote Block 1 to MRU by querying it again
+    db2#.get(make_key(5)).unwrap()
+
+    // 4. Load Block 3 (from Table 3) -> cache is full, evicts LRU (which is Block 2, NOT Block 1!)
+    db2#.get(make_key(25)).unwrap()
+
+    auto s1 = db2#.block_cache_stats()
+    assert(s1.eviction_count == 1:u64, "Eviction count must be 1")
+
+    // 5. Query Block 1 -> MUST BE A HIT because it was promoted to MRU!
+    auto hits_before = s1.hit_count
+    db2#.get(make_key(5)).unwrap()
+    auto s2 = db2#.block_cache_stats()
+    assert(s2.hit_count == hits_before + 1:u64, "Block 1 must HIT after promotion")
+
+    // 6. Query Block 2 -> MUST BE A MISS because it was evicted!
+    auto misses_before = s2.miss_count
+    db2#.get(make_key(15)).unwrap()
+    auto s3 = db2#.block_cache_stats()
+    assert(s3.miss_count == misses_before + 1:u64, "Block 2 must MISS because it was evicted")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_oversized_block_bypass() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k = make_key(1)
+    auto v = make_val(1)
+    db#.put(cede k, cede v).unwrap()
+    db#.flush_active_memtable().unwrap()
+    db#.close().unwrap()
+
+    // Open with capacity = 10 bytes (smaller than any block)
+    auto db2# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 10:usize).unwrap()
+
+    // Query key 1 -> bypasses LRU cache, returns valid un-cached lease
+    auto res = db2#.get(make_key(1)).unwrap()
+    assert(res.is_some(), "Key 1 must be found via un-cached lease")
+    assert(res.unwrap().as_str().equals(make_val(1).as_str()), "Value mismatch")
+
+    auto s = db2#.block_cache_stats()
+    assert(s.resident_bytes == 0:usize, "Resident bytes must remain 0 for oversized block")
+    assert(s.eviction_count == 0:u64, "Eviction count must remain 0")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_zero_capacity_cache() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k = make_key(1)
+    auto v = make_val(1)
+    db#.put(cede k, cede v).unwrap()
+    db#.flush_active_memtable().unwrap()
+    db#.close().unwrap()
+
+    // Open with capacity = 0 bytes
+    auto db2# = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 0:usize).unwrap()
+
+    auto res = db2#.get(make_key(1)).unwrap()
+    assert(res.is_some(), "Key 1 must be found in zero capacity mode")
+    assert(res.unwrap().as_str().equals(make_val(1).as_str()), "Value mismatch")
+
+    auto s = db2#.block_cache_stats()
+    assert(s.resident_bytes == 0:usize, "Resident bytes must be 0")
+    assert(s.hit_count == 0:u64, "Hit count must be 0")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_pinned_lease_eviction_isolation() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("alpha")
+    auto v1 = string::from("val_alpha")
+    db#.put(cede k1, cede v1).unwrap()
+    db#.flush_active_memtable().unwrap() // Table 1
+
+    auto k2 = string::from("beta")
+    auto v2 = string::from("val_beta")
+    db#.put(cede k2, cede v2).unwrap()
+    db#.flush_active_memtable().unwrap() // Table 2
+
+    auto cur_v = db#.current_version()
+    auto fnum1 = cur_v.get_table(0:usize).meta.file_number
+    auto fnum2 = cur_v.get_table(1:usize).meta.file_number
+    db#.close().unwrap()
+
+    auto cache = BlockCache::new(150:usize) // capacity for 1 block
+    auto sst1_path = build_table_path(db_path.clone(), fnum1)
+    auto sst2_path = build_table_path(db_path.clone(), fnum2)
+
+    auto r1_open# = SSTableReader::open(sst1_path.clone()).unwrap()
+    auto b1_cand = r1_open#.find_candidate_block(string::from("alpha").as_str()).unwrap()
+
+    auto r2_open# = SSTableReader::open(sst2_path.clone()).unwrap()
+    auto b2_cand = r2_open#.find_candidate_block(string::from("beta").as_str()).unwrap()
+
+    // 1. Obtain lease for Block 1 (Table 1)
+    auto lease1 = cache.get_or_load(fnum1, b1_cand.offset, b1_cand.length, sst1_path.clone()).unwrap()
+    assert(cache.stats().resident_bytes > 0:usize, "Resident bytes > 0")
+
+    // 2. Load Block 2 (Table 2) -> evicts Block 1 from cache map!
+    auto lease2 = cache.get_or_load(fnum2, b2_cand.offset, b2_cand.length, sst2_path.clone()).unwrap()
+    assert(cache.stats().eviction_count == 1:u64, "Block 1 must be evicted from map")
+
+    // 3. Query lease1 -> MUST BE FULLY ACCESSIBLE AND VALID!
+    auto r1 = lease1.lookup(string::from("alpha").as_str())
+    match r1 {
+        auto LookupResult::Hit(&val) => {
+            assert(val.as_str().equals("val_alpha"), "Lease 1 value mismatch")
+        }
+        _ => assert(false, "Lease 1 lookup must succeed on evicted block")
+    }
+
+    // 4. Query lease2
+    auto r2 = lease2.lookup(string::from("beta").as_str())
+    match r2 {
+        auto LookupResult::Hit(&val) => {
+            assert(val.as_str().equals("val_beta"), "Lease 2 value mismatch")
+        }
+        _ => assert(false, "Lease 2 lookup must succeed")
+    }
+
+    // Leases drop cleanly here
+    tmp#.remove()
+}
+
+fn test_corrupted_block_error_not_cached() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k = string::from("test_key")
+    auto v = string::from("test_val")
+    db#.put(cede k, cede v).unwrap()
+    db#.flush_active_memtable().unwrap()
+    auto cur_v = db#.current_version()
+    auto fnum = cur_v.get_table(0:usize).meta.file_number
+    db#.close().unwrap()
+
+    // Corrupt byte 20 in SSTable (inside data block payload)
+    auto sst_path = build_table_path(db_path.clone(), fnum)
+    auto r = ReadDataFile::open(sst_path.clone()).unwrap()
+    auto f_size = r.size().unwrap() as usize
+    auto buf# = Vec<u8>::with_capacity(f_size)
+    auto out = r.read_at(cede buf, 0:u64, f_size).unwrap().take_buffer()
+
+    auto corrupted_sst# = Vec<u8>::with_capacity(f_size)
+    auto i# = 0:usize
+    loop i < f_size {
+        if i == 20:usize {
+            corrupted_sst#.push(out.get(i) ^ 0x99:u8)
+        } else {
+            corrupted_sst#.push(out.get(i))
+        }
+        i = i + 1:usize
+    }
+
+    auto wal# = WalFile::open(sst_path.clone()).unwrap()
+    wal#.write_all_at(cede corrupted_sst, 0:u64).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Open engine and query
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto get_res = db2#.get(string::from("test_key"))
+    assert(get_res.is_err(), "Must fail closed with Err on corrupted block")
+
+    auto s = db2#.block_cache_stats()
+    assert(s.resident_bytes == 0:usize, "Corrupted block must NOT be inserted into cache")
+    assert(s.hit_count == 0:u64, "Hit count must remain 0")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    println("Running test_cache_hit_miss_and_stats...")
+    test_cache_hit_miss_and_stats()
+    println("Running test_lru_eviction_order...")
+    test_lru_eviction_order()
+    println("Running test_hit_promotion_evicts_oldest...")
+    test_hit_promotion_evicts_oldest()
+    println("Running test_oversized_block_bypass...")
+    test_oversized_block_bypass()
+    println("Running test_zero_capacity_cache...")
+    test_zero_capacity_cache()
+    println("Running test_pinned_lease_eviction_isolation...")
+    test_pinned_lease_eviction_isolation()
+    println("Running test_corrupted_block_error_not_cached...")
+    test_corrupted_block_error_not_cached()
+    println("[PASS] Block Cache v1 Unit Tests Qualified Successfully!")
+    return 0
+}

@@ -1,0 +1,364 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/memtable.tk
+// In-memory MemTable and immutable FrozenMemTable structures for TokaKV.
+
+import core/types::{usize}
+import core/traits::{@Dup, @Encap}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import official/tokakv/types::{Entry, KvError, LookupResult}
+
+/// Read-only snapshot of an active MemTable ready for flush.
+pub shape FrozenMemTable (
+    entries: Vec<Entry>,
+    size_bytes: usize,
+    min_seq: u64,
+    max_seq: u64,
+    flush_id: u64
+)
+
+impl FrozenMemTable@Encap {
+    fn drop(self#) {}
+}
+impl FrozenMemTable@Send {}
+impl FrozenMemTable@Sync {}
+
+pub fn compare_internal_key(key_a: str, seq_a: u64, key_b: str, seq_b: u64) -> i32 {
+    auto cmp = key_a.cmp(key_b)
+    if cmp != 0:i32 {
+        return cmp
+    }
+    // Same user key: higher sequence comes first (descending order)
+    if seq_a > seq_b {
+        return -1:i32
+    }
+    if seq_a < seq_b {
+        return 1:i32
+    }
+    return 0:i32
+}
+
+impl FrozenMemTable {
+    pub fn new(entries: cede Vec<Entry>, size_bytes: usize, min_seq: u64, max_seq: u64, flush_id: u64) -> FrozenMemTable {
+        return FrozenMemTable(
+            entries = cede entries,
+            size_bytes = size_bytes,
+            min_seq = min_seq,
+            max_seq = max_seq,
+            flush_id = flush_id
+        )
+    }
+
+    pub fn len(self) -> usize {
+        return self.entries.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        return self.entries.is_empty()
+    }
+
+    pub fn size_bytes(self) -> usize {
+        return self.size_bytes
+    }
+
+    pub fn min_seq(self) -> u64 {
+        return self.min_seq
+    }
+
+    pub fn max_seq(self) -> u64 {
+        return self.max_seq
+    }
+
+    pub fn flush_id(self) -> u64 {
+        return self.flush_id
+    }
+
+    pub fn take_entries(cede self) -> Vec<Entry> {
+        return cede self.entries
+    }
+
+    pub fn entries(self) -> Vec<Entry> {
+        auto copy_entries# = Vec<Entry>::with_capacity(self.entries.len())
+        auto i# = 0:usize
+        loop i < self.entries.len() {
+            unsafe {
+                auto *entry_ptr = self.entries.unsafe_get(i)
+                copy_entries#.push(Entry::clone_from_ptr((*entry_ptr)))
+            }
+            i = i + 1:usize
+        }
+        return cede copy_entries
+    }
+
+    pub fn clone(self) -> FrozenMemTable {
+        return FrozenMemTable::clone_from_ptr(*self)
+    }
+
+    pub fn clone_from_ptr(ptr: *FrozenMemTable) -> FrozenMemTable {
+        unsafe {
+            auto total = ptr.entries.len()
+            auto copy_entries# = Vec<Entry>::with_capacity(total)
+            auto i# = 0:usize
+            loop i < total {
+                auto *entry_ptr = ptr.entries.unsafe_get(i)
+                copy_entries#.push(Entry::clone_from_ptr((*entry_ptr)))
+                i = i + 1:usize
+            }
+            return FrozenMemTable(
+                entries = cede copy_entries,
+                size_bytes = ptr.size_bytes,
+                min_seq = ptr.min_seq,
+                max_seq = ptr.max_seq,
+                flush_id = ptr.flush_id
+            )
+        }
+    }
+
+    pub fn get_at_seq(self, key: string, target_seq: u64) -> LookupResult {
+        auto count = self.entries.len()
+        if count == 0:usize {
+            return LookupResult::NotFound
+        }
+        auto low# = 0:usize
+        auto high# = count
+        loop low < high {
+            auto mid = low + (high - low) / 2:usize
+            auto cmp# = 0:i32
+            unsafe {
+                auto *mid_entry = self.entries.unsafe_get(mid)
+                cmp = compare_internal_key(key.as_str(), target_seq, mid_entry.key.as_str(), mid_entry.seq)
+            }
+            if cmp <= 0:i32 {
+                high = mid
+            } else {
+                low = mid + 1:usize
+            }
+        }
+        if low < count {
+            unsafe {
+                auto *e = self.entries.unsafe_get(low)
+                if e.key.as_str().equals(key.as_str()) && e.seq <= target_seq {
+                    if e.is_del {
+                        return LookupResult::Deleted
+                    } else {
+                        return LookupResult::Hit(e.value.clone())
+                    }
+                }
+            }
+        }
+        return LookupResult::NotFound
+    }
+
+    pub fn get(self, key: string) -> LookupResult {
+        return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64)
+    }
+}
+
+impl FrozenMemTable@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}
+
+/// Single-writer active MemTable.
+pub shape MemTable (
+    entries#: Vec<Entry>,
+    size_bytes#: usize,
+    min_seq#: u64,
+    max_seq#: u64
+)
+
+impl MemTable@Encap {
+    fn drop(self#) {}
+}
+impl MemTable@Send {}
+impl MemTable@Sync {}
+
+impl MemTable {
+    pub fn new() -> MemTable {
+        return MemTable(
+            entries = Vec<Entry>::new(),
+            size_bytes = 0:usize,
+            min_seq = 0:u64,
+            max_seq = 0:u64
+        )
+    }
+
+    pub fn len(self) -> usize {
+        return self.entries.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        return self.entries.is_empty()
+    }
+
+    pub fn size_bytes(self) -> usize {
+        return self.size_bytes
+    }
+
+    pub fn min_seq(self) -> u64 {
+        return self.min_seq
+    }
+
+    pub fn max_seq(self) -> u64 {
+        return self.max_seq
+    }
+
+    pub fn binary_search_internal(self, key_slice: str, seq: u64) -> Result<usize, usize> {
+        auto count = self.entries.len()
+        if count == 0:usize {
+            return Result<usize, usize>::Err(0:usize)
+        }
+        auto low# = 0:usize
+        auto high# = count
+        loop low < high {
+            auto mid = low + (high - low) / 2:usize
+            auto cmp# = 0:i32
+            unsafe {
+                auto *mid_entry = self.entries.unsafe_get(mid)
+                cmp = compare_internal_key(key_slice, seq, mid_entry.key.as_str(), mid_entry.seq)
+            }
+            if cmp == 0:i32 {
+                return Result<usize, usize>::Ok(mid)
+            }
+            if cmp > 0:i32 {
+                low = mid + 1:usize
+            } else {
+                high = mid
+            }
+        }
+        return Result<usize, usize>::Err(low)
+    }
+
+    pub fn put(self#, seq: u64, cede key: string, cede value: string) {
+        if self.min_seq == 0:u64 || seq < self.min_seq {
+            self.min_seq = seq
+        }
+        if seq > self.max_seq {
+            self.max_seq = seq
+        }
+
+        auto entry_size = key.len() + value.len() + 16:usize
+        auto search_res = self.binary_search_internal(key.as_str(), seq)
+        auto new_entry = Entry::new_put(cede key, cede value, seq)
+
+        if search_res.is_ok() {
+            auto idx = search_res.unwrap()
+            self.entries#.set(idx, cede new_entry)
+        } else {
+            auto idx = search_res.unwrap_err()
+            self.entries#.insert(idx, cede new_entry)
+            self.size_bytes = self.size_bytes + entry_size
+        }
+    }
+
+    pub fn delete(self#, seq: u64, cede key: string) {
+        if self.min_seq == 0:u64 || seq < self.min_seq {
+            self.min_seq = seq
+        }
+        if seq > self.max_seq {
+            self.max_seq = seq
+        }
+
+        auto entry_size = key.len() + 16:usize
+        auto search_res = self.binary_search_internal(key.as_str(), seq)
+        auto new_entry = Entry::new_delete(cede key, seq)
+
+        if search_res.is_ok() {
+            auto idx = search_res.unwrap()
+            self.entries#.set(idx, cede new_entry)
+        } else {
+            auto idx = search_res.unwrap_err()
+            self.entries#.insert(idx, cede new_entry)
+            self.size_bytes = self.size_bytes + entry_size
+        }
+    }
+
+    pub fn get_at_seq(self, key: string, target_seq: u64) -> LookupResult {
+        auto count = self.entries.len()
+        if count == 0:usize {
+            return LookupResult::NotFound
+        }
+        auto low# = 0:usize
+        auto high# = count
+        loop low < high {
+            auto mid = low + (high - low) / 2:usize
+            auto cmp# = 0:i32
+            unsafe {
+                auto *mid_entry = self.entries.unsafe_get(mid)
+                cmp = compare_internal_key(key.as_str(), target_seq, mid_entry.key.as_str(), mid_entry.seq)
+            }
+            if cmp <= 0:i32 {
+                high = mid
+            } else {
+                low = mid + 1:usize
+            }
+        }
+        if low < count {
+            unsafe {
+                auto *e = self.entries.unsafe_get(low)
+                if e.key.as_str().equals(key.as_str()) && e.seq <= target_seq {
+                    if e.is_del {
+                        return LookupResult::Deleted
+                    } else {
+                        return LookupResult::Hit(e.value.clone())
+                    }
+                }
+            }
+        }
+        return LookupResult::NotFound
+    }
+
+    pub fn get(self, key: string) -> LookupResult {
+        return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64)
+    }
+
+    /// Freezes the active MemTable into an immutable snapshot with flush_id = 0.
+    pub fn freeze(cede self) -> FrozenMemTable {
+        return self.freeze_with_id(0:u64)
+    }
+
+    /// Freezes the active MemTable into an immutable snapshot with specific flush_id.
+    pub fn freeze_with_id(cede self, flush_id: u64) -> FrozenMemTable {
+        auto sz = self.size_bytes
+        auto mn = self.min_seq
+        auto mx = self.max_seq
+        return FrozenMemTable(
+            entries = cede self.entries,
+            size_bytes = sz,
+            min_seq = mn,
+            max_seq = mx,
+            flush_id = flush_id
+        )
+    }
+
+    /// Resets the active MemTable and returns an immutable frozen snapshot.
+    pub fn take_and_freeze(self#, flush_id: u64) -> FrozenMemTable {
+        auto sz = self.size_bytes
+        auto mn = self.min_seq
+        auto mx = self.max_seq
+        auto taken_entries# = Vec<Entry>::new()
+        unsafe {
+            if self.entries.*buf != null {
+                auto *p_buf = self.entries.*buf
+                auto l = self.entries.len
+                auto c = self.entries.cap
+                self.entries.*buf = null
+                self.entries.len = 0
+                self.entries.cap = 0
+                taken_entries = Vec<Entry>::from_raw(*p_buf, l, c)
+            }
+        }
+        self.size_bytes = 0:usize
+        self.min_seq = 0:u64
+        self.max_seq = 0:u64
+        return FrozenMemTable(
+            entries = cede taken_entries,
+            size_bytes = sz,
+            min_seq = mn,
+            max_seq = mx,
+            flush_id = flush_id
+        )
+    }
+}

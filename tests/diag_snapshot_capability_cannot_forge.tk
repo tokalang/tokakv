@@ -1,0 +1,11 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_snapshot_capability_cannot_forge.tk
+// Compile-fail diagnostic test: external callers cannot construct EngineSnapshotCapability with private fields.
+
+import official/tokakv::{EngineSnapshotCapability}
+
+fn main() -> i32 {
+    // Direct attempt to construct encapsulated shape must fail with E0418
+    auto cap = EngineSnapshotCapability(token = 1:u64, engine_id = 1:u64)
+    return 0
+}

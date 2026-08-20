@@ -1,0 +1,155 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/sstable_corruption_v1.tk
+// Verification of fail-closed corruption defense across Footer, Index Block, and Data Blocks.
+
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/data_file::{ReadDataFile, WalFile}
+import official/tokakv/memtable::{MemTable}
+import official/tokakv/sstable/writer::{SSTableWriter}
+import official/tokakv/sstable/reader::{SSTableReader}
+import official/tokakv/sstable/format::{FOOTER_SIZE}
+
+fn generate_sample_sstable(path: string) {
+    auto mem# = MemTable::new()
+    auto i# = 0:usize
+    loop i < 80:usize {
+        auto k# = string::from("key_")
+        auto n_str = string::from_i64(i as i64)
+        k#.push_str(n_str.as_str())
+
+        auto v# = string::from("value_payload_data_")
+        v#.push_str(n_str.as_str())
+        v#.push_str("_padding_bytes_to_cross_block_limits_1234567890")
+
+        mem#.put((i + 1:usize) as u64, cede k, cede v)
+        i = i + 1:usize
+    }
+    auto frozen = mem.freeze()
+    auto w_res = SSTableWriter::write(path, cede frozen)
+    assert(w_res.is_ok(), "SSTableWriter::write failed during setup")
+}
+
+fn corrupt_byte_at_offset(path: string, offset: u64, xor_mask: u8) {
+    auto file = ReadDataFile::open(path.clone()).unwrap()
+    auto sz = file.size().unwrap() as usize
+    auto buf# = Vec<u8>::with_capacity(sz)
+    auto r_res = file.read_at(cede buf, 0:u64, sz).unwrap()
+    auto data# = r_res.take_buffer()
+
+    auto orig = data.get(offset as usize)
+    data#.set(offset as usize, orig ^ xor_mask)
+
+    auto w_file = WalFile::open(path).unwrap()
+    w_file#.write_all_at(cede data, 0:u64).unwrap()
+    w_file#.sync_all().unwrap()
+    w_file#.close().unwrap()
+}
+
+fn test_empty_memtable_rejected() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto path# = tmp.path().clone()
+    path#.push_str("_empty.sst")
+
+    auto mem = MemTable::new()
+    auto frozen = mem.freeze()
+    auto w_res = SSTableWriter::write(path, cede frozen)
+    assert(w_res.is_err(), "Writing empty MemTable MUST BE REJECTED")
+
+    tmp#.remove()
+}
+
+fn test_footer_magic_corruption() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto path# = tmp.path().clone()
+    path#.push_str("_corrupt_magic.sst")
+    generate_sample_sstable(path.clone())
+
+    auto file = ReadDataFile::open(path.clone()).unwrap()
+    auto sz = file.size().unwrap()
+    // Magic starts at file_size - 48 + 32 = file_size - 16
+    corrupt_byte_at_offset(path.clone(), sz - 16:u64, 0xFF:u8)
+
+    auto r_res = SSTableReader::open(path)
+    assert(r_res.is_err(), "Corrupted Footer Magic MUST FAIL SSTableReader::open (Fail-Closed)")
+
+    tmp#.remove()
+}
+
+fn test_footer_crc_corruption() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto path# = tmp.path().clone()
+    path#.push_str("_corrupt_footer_crc.sst")
+    generate_sample_sstable(path.clone())
+
+    auto file = ReadDataFile::open(path.clone()).unwrap()
+    auto sz = file.size().unwrap()
+    // Footer CRC is at file_size - 48 + 40 = file_size - 8
+    corrupt_byte_at_offset(path.clone(), sz - 8:u64, 0xAA:u8)
+
+    auto r_res = SSTableReader::open(path)
+    assert(r_res.is_err(), "Corrupted Footer CRC MUST FAIL SSTableReader::open (Fail-Closed)")
+
+    tmp#.remove()
+}
+
+fn test_index_block_crc_corruption() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto path# = tmp.path().clone()
+    path#.push_str("_corrupt_index_crc.sst")
+    generate_sample_sstable(path.clone())
+
+    auto reader = SSTableReader::open(path.clone()).unwrap()
+    auto file = ReadDataFile::open(path.clone()).unwrap()
+    auto sz = file.size().unwrap()
+    auto f_buf# = Vec<u8>::with_capacity(FOOTER_SIZE)
+    auto f_read = file.read_at(cede f_buf, sz - 48:u64, FOOTER_SIZE).unwrap()
+    auto fb = f_read.take_buffer()
+
+    // Read IndexBlockOffset (bytes 0..7)
+    auto b0 = fb.get(0:usize) as u64
+    auto b1 = fb.get(1:usize) as u64
+    auto b2 = fb.get(2:usize) as u64
+    auto b3 = fb.get(3:usize) as u64
+    auto idx_offset = b0 | (b1 << 8:u64) | (b2 << 16:u64) | (b3 << 24:u64)
+
+    // Corrupt index block payload (at idx_offset + 10)
+    corrupt_byte_at_offset(path.clone(), idx_offset + 10:u64, 0x55:u8)
+
+    auto r_res = SSTableReader::open(path)
+    assert(r_res.is_err(), "Corrupted Index Block CRC MUST FAIL SSTableReader::open (Fail-Closed)")
+
+    tmp#.remove()
+}
+
+fn test_data_block_crc_corruption() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto path# = tmp.path().clone()
+    path#.push_str("_corrupt_data_crc.sst")
+    generate_sample_sstable(path.clone())
+
+    // Corrupt byte in Data Block 0 payload (offset 20)
+    corrupt_byte_at_offset(path.clone(), 20:u64, 0x77:u8)
+
+    // SSTableReader::open should succeed because index and footer are intact
+    auto r_res = SSTableReader::open(path)
+    assert(r_res.is_ok(), "Reader open succeeds with valid index and footer")
+    auto reader# = r_res.unwrap()
+
+    // Query key_0 (which lives in Data Block 0) -> MUST FAIL-CLOSED with CRC error!
+    auto get_res = reader#.get(string::from("key_0"))
+    assert(get_res.is_err(), "Corrupted Data Block MUST RETURN Err(KvError), NEVER downgraded to miss!")
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_empty_memtable_rejected()
+    test_footer_magic_corruption()
+    test_footer_crc_corruption()
+    test_index_block_crc_corruption()
+    test_data_block_crc_corruption()
+    println("[PASS] SSTable Corruption & Fail-Closed Suite Passed Cleanly!")
+    return 0
+}

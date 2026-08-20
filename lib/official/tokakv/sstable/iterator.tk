@@ -1,0 +1,112 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/sstable/iterator.tk
+// Streaming owned iterator over an SSTable file.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import official/tokakv/types::{Entry, KvError}
+import official/tokakv/sstable/reader::{SSTableReader}
+
+pub shape SSTableIterator (
+    reader#: SSTableReader,
+    block_index#: usize,
+    current_entries#: Vec<Entry>,
+    entry_index#: usize,
+    valid#: bool
+)
+
+impl SSTableIterator {
+    pub fn open(reader: SSTableReader) -> Result<SSTableIterator, KvError> {
+        auto r_clone = reader.clone()
+        auto iter# = SSTableIterator(
+            reader = cede r_clone,
+            block_index = 0:usize,
+            current_entries = Vec<Entry>::new(),
+            entry_index = 0:usize,
+            valid = false
+        )
+        auto r_load = iter#.load_current_block()
+        if r_load.is_err() {
+            return Result<SSTableIterator, KvError>::Err(r_load.unwrap_err())
+        }
+        return Result<SSTableIterator, KvError>::Ok(cede iter)
+    }
+
+    fn load_current_block(self#) -> Result<(), KvError> {
+        auto b_count = self.reader.block_count()
+        loop self.block_index < b_count {
+            auto dec_res = self.reader.read_block_entries(self.block_index)
+            if dec_res.is_err() {
+                self.valid = false
+                return Result<(), KvError>::Err(dec_res.unwrap_err())
+            }
+            auto entries = dec_res.unwrap()
+            if entries.len() > 0:usize {
+                self.current_entries = cede entries
+                self.entry_index = 0:usize
+                self.valid = true
+                return Result<(), KvError>::Ok(())
+            }
+            self.block_index = self.block_index + 1:usize
+        }
+        self.valid = false
+        return Result<(), KvError>::Ok(())
+    }
+
+    pub fn is_valid(self#) -> bool {
+        return self.valid
+    }
+
+    pub fn current(self#) -> Option<Entry> {
+        if !self.valid {
+            return Option<Entry>::None
+        }
+        if self.entry_index < self.current_entries.len() {
+            unsafe {
+                auto *entry_ptr = self.current_entries.unsafe_get(self.entry_index)
+                return Option<Entry>::Some(entry_ptr.clone())
+            }
+        }
+        return Option<Entry>::None
+    }
+
+    pub fn advance(self#) -> Result<(), KvError> {
+        if !self.valid {
+            return Result<(), KvError>::Ok(())
+        }
+        self.entry_index = self.entry_index + 1:usize
+        if self.entry_index < self.current_entries.len() {
+            return Result<(), KvError>::Ok(())
+        }
+        self.block_index = self.block_index + 1:usize
+        return self#.load_current_block()
+    }
+
+    pub fn clone(self) -> SSTableIterator {
+        auto copy_entries# = Vec<Entry>::with_capacity(self.current_entries.len())
+        auto i# = 0:usize
+        loop i < self.current_entries.len() {
+            unsafe {
+                auto *entry_ptr = self.current_entries.unsafe_get(i)
+                copy_entries#.push(entry_ptr.clone())
+            }
+            i = i + 1:usize
+        }
+        return SSTableIterator(
+            reader = self.reader.clone(),
+            block_index = self.block_index,
+            current_entries = cede copy_entries,
+            entry_index = self.entry_index,
+            valid = self.valid
+        )
+    }
+}
+
+impl SSTableIterator@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}

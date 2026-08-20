@@ -1,0 +1,25 @@
+// tokakv/tests/diag_engine_writer_state_not_sync.tk
+// Diagnostic test: WriterState must not implement @Sync; attempting to use in RwMutex must fail compilation with E0411.
+
+import std/sync::{RwMutex}
+import official/tokakv::{WriterState}
+import official/tokakv/wal::{WalWriter}
+import official/tokakv/manifest/version_set::{VersionSet}
+
+fn main() -> i32 {
+    // RwMutex requires 'T: @{Send, Sync}.
+    // WriterState only implements @Send (NEVER @Sync), which must trigger E0411.
+    auto w = WalWriter::open(string::from("wal.log"), 0:u64, 0:u64).unwrap()
+    auto vs = VersionSet::open_or_create(string::from(".")).unwrap()
+    auto ws = WriterState(
+        wal_writer = cede w,
+        version_set = cede vs,
+        next_seq = 1:u64,
+        next_flush_id = 1:u64,
+        opened = true,
+        poisoned = false,
+        db_dir = string::from(".")
+    )
+    auto rw = RwMutex<WriterState>::new(cede ws)
+    return 0
+}

@@ -1,0 +1,107 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/snapshot_multiple_queries_and_compaction_v1.tk
+// Verification of persistent SnapshotLease validity across repeated queries,
+// memtable flushes, overwrites, and compaction.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Initial generation (Gen 1)
+    db#.put(string::from("key1"), string::from("val1_v1")).unwrap()
+    db#.put(string::from("key2"), string::from("val2_v1")).unwrap()
+    db#.put(string::from("key3"), string::from("val3_v1")).unwrap()
+    auto s1# = db#.acquire_snapshot().unwrap()
+    assert(s1.sequence() == 3:u64, "s1 seq must be 3")
+
+    // 2. Second generation (Gen 2) - Overwrite key1, Delete key2, Add key4
+    db#.put(string::from("key1"), string::from("val1_v2")).unwrap()
+    db#.delete(string::from("key2")).unwrap()
+    db#.put(string::from("key4"), string::from("val4_v1")).unwrap()
+    auto s2# = db#.acquire_snapshot().unwrap()
+    assert(s2.sequence() == 6:u64, "s2 seq must be 6")
+
+    // 3. Repeated queries on s1 before flush
+    auto q_i# = 0:usize
+    loop q_i < 3:usize {
+        auto r1 = db#.get_at_snapshot(string::from("key1"), s1).unwrap()
+        assert(r1.is_some(), "s1 must find key1")
+        assert(r1.unwrap().as_str().equals("val1_v1"), "s1 must see val1_v1")
+
+        auto r2 = db#.get_at_snapshot(string::from("key2"), s1).unwrap()
+        assert(r2.is_some(), "s1 must find key2")
+        assert(r2.unwrap().as_str().equals("val2_v1"), "s1 must see val2_v1")
+
+        auto r3 = db#.get_at_snapshot(string::from("key3"), s1).unwrap()
+        assert(r3.is_some(), "s1 must find key3")
+        assert(r3.unwrap().as_str().equals("val3_v1"), "s1 must see val3_v1")
+
+        auto r4 = db#.get_at_snapshot(string::from("key4"), s1).unwrap()
+        assert(r4.is_none(), "s1 must not see key4")
+        q_i = q_i + 1:usize
+    }
+
+    // 4. Force flush MemTable to SSTable 1
+    db#.flush_active_memtable().unwrap()
+
+    // 5. Third generation (Gen 3) - Overwrite key1, Delete key3
+    db#.put(string::from("key1"), string::from("val1_v3")).unwrap()
+    db#.delete(string::from("key3")).unwrap()
+    db#.flush_active_memtable().unwrap()
+
+    // 6. Query s1 and s2 across flushed SSTables
+    auto r1_post_flush = db#.get_at_snapshot(string::from("key1"), s1).unwrap()
+    assert(r1_post_flush.is_some(), "s1 must find key1 after flush")
+    assert(r1_post_flush.unwrap().as_str().equals("val1_v1"), "s1 must see val1_v1 after flush")
+
+    auto r2_s2 = db#.get_at_snapshot(string::from("key1"), s2).unwrap()
+    assert(r2_s2.is_some(), "s2 must find key1")
+    assert(r2_s2.unwrap().as_str().equals("val1_v2"), "s2 must see val1_v2")
+
+    auto r2_s2_k2 = db#.get_at_snapshot(string::from("key2"), s2).unwrap()
+    assert(r2_s2_k2.is_none(), "s2 must see deleted key2")
+
+    // 7. Trigger compaction (merges L0 tables)
+    db#.compact_l0().unwrap()
+
+    // 8. Re-query s1 and s2 after compaction: leases must remain 100% valid and correct!
+    auto r1_post_compact = db#.get_at_snapshot(string::from("key1"), s1).unwrap()
+    assert(r1_post_compact.is_some(), "s1 must find key1 after compact")
+    assert(r1_post_compact.unwrap().as_str().equals("val1_v1"), "s1 must see val1_v1 after compact")
+
+    auto r2_post_compact = db#.get_at_snapshot(string::from("key2"), s1).unwrap()
+    assert(r2_post_compact.is_some(), "s1 must find key2 after compact")
+    assert(r2_post_compact.unwrap().as_str().equals("val2_v1"), "s1 must see val2_v1 after compact")
+
+    auto r3_post_compact = db#.get_at_snapshot(string::from("key3"), s1).unwrap()
+    assert(r3_post_compact.is_some(), "s1 must find key3 after compact")
+    assert(r3_post_compact.unwrap().as_str().equals("val3_v1"), "s1 must see val3_v1 after compact")
+
+    auto s2_post_compact = db#.get_at_snapshot(string::from("key1"), s2).unwrap()
+    assert(s2_post_compact.is_some(), "s2 must find key1 after compact")
+    assert(s2_post_compact.unwrap().as_str().equals("val1_v2"), "s2 must see val1_v2 after compact")
+
+    // 9. Verify oldest live snapshot tracking and advancing
+    assert(db#.oldest_live_snapshot_seq().unwrap().unwrap() == 3:u64, "oldest is 3")
+    {
+        auto s1_moved = cede s1
+    }
+    assert(db#.oldest_live_snapshot_seq().unwrap().unwrap() == 6:u64, "oldest advances to 6 after s1 drops")
+    {
+        auto s2_moved = cede s2
+    }
+    assert(db#.oldest_live_snapshot_seq().unwrap().is_none(), "oldest is None after all drop")
+
+    db#.close().unwrap()
+    tmp#.remove()
+
+    println("[TokaKV] snapshot_multiple_queries_and_compaction_v1 PASSED!")
+    return 0
+}

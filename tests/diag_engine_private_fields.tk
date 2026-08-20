@@ -1,0 +1,11 @@
+// tokakv/tests/diag_engine_private_fields.tk
+// Diagnostic test: Accessing private engine reader/writer mutex handles must fail compilation with E0418.
+
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto db = TokaKvEngine::open(string::from(".")).unwrap()
+    // Direct access to encapsulated reader field must fail with error[E0418]
+    auto r = db.reader
+    return 0
+}

@@ -1,0 +1,15 @@
+// tokakv/tests/diag_block_cache_private_fields.tk
+// Diagnostic test: accessing private fields of @Encap BlockLease must fail with E0418.
+
+import std/vec::{Vec}
+import official/tokakv/types::{Entry}
+import official/tokakv/cache/block_cache::{CachedBlock, BlockLease}
+
+fn main() -> i32 {
+    auto entries = Vec<Entry>::new()
+    auto ~blk = CachedBlock::new(1:u64, 0:u64, cede entries, 100:usize)
+    auto lease = BlockLease::new(~blk)
+    // Attempting to access private field block must trigger error[E0418]
+    auto ~b = lease.~block
+    return 0
+}

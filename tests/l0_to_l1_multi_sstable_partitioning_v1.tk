@@ -1,0 +1,95 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/l0_to_l1_multi_sstable_partitioning_v1.tk
+// Verification of multi-SSTable chunking on user-key boundaries and non-overlapping L1 bounds.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Write first batch of keys into L0 table 1
+    auto i# = 100:usize
+    loop i < 200:usize {
+        auto k# = string::from("key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("val_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+
+    // 2. Write second batch of keys into L0 table 2
+    auto j# = 150:usize
+    loop j < 250:usize {
+        auto k# = string::from("key_")
+        k#.push_str(string::from_int(j as i32).as_str())
+        auto v# = string::from("val_updated_")
+        v#.push_str(string::from_int(j as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        j = j + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+
+    auto v_before = db#.current_version()
+    assert(v_before.tables_count() == 2:usize, "must have 2 L0 tables before compaction")
+
+    // 3. Compact L0 tables to L1
+    db#.compact_l0().unwrap()
+
+    // 4. Verify version state and L1 non-overlapping invariants
+    auto v_after = db#.current_version()
+    assert(v_after.tables_count() >= 1:usize, "must have at least 1 L1 table")
+
+    auto prev_largest# = string::new()
+    auto has_prev# = false
+    auto t_idx# = 0:usize
+    loop t_idx < v_after.tables_count() {
+        auto tbl = v_after.get_table(t_idx)
+        assert(tbl.meta.level == 1:u32, "table must be in level 1")
+        assert(tbl.meta.smallest_key.as_str().cmp(tbl.meta.largest_key.as_str()) <= 0:i32, "smallest <= largest")
+        if has_prev {
+            assert(prev_largest.as_str().cmp(tbl.meta.smallest_key.as_str()) < 0:i32, "L1 tables must be strictly non-overlapping")
+        }
+        has_prev = true
+        prev_largest = tbl.meta.largest_key.clone()
+        t_idx = t_idx + 1:usize
+    }
+
+    // 5. Verify data correctness across all keys
+    auto c1# = 100:usize
+    loop c1 < 150:usize {
+        auto k# = string::from("key_")
+        k#.push_str(string::from_int(c1 as i32).as_str())
+        auto exp_v# = string::from("val_")
+        exp_v#.push_str(string::from_int(c1 as i32).as_str())
+        auto r = db#.get(cede k).unwrap()
+        assert(r.is_some(), "key must exist")
+        assert(r.unwrap().as_str().equals(exp_v.as_str()), "val mismatch for non-updated key")
+        c1 = c1 + 1:usize
+    }
+
+    auto c2# = 150:usize
+    loop c2 < 250:usize {
+        auto k# = string::from("key_")
+        k#.push_str(string::from_int(c2 as i32).as_str())
+        auto exp_v# = string::from("val_updated_")
+        exp_v#.push_str(string::from_int(c2 as i32).as_str())
+        auto r = db#.get(cede k).unwrap()
+        assert(r.is_some(), "key must exist")
+        assert(r.unwrap().as_str().equals(exp_v.as_str()), "val mismatch for updated key")
+        c2 = c2 + 1:usize
+    }
+
+    db#.close().unwrap()
+    tmp#.remove()
+
+    println("[TokaKV] l0_to_l1_multi_sstable_partitioning_v1 PASSED!")
+    return 0
+}

@@ -1,0 +1,68 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/snapshot_mvcc_memtable_v1.tk
+// Verification of MemTable MVCC multi-version history across snapshots.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Initial write
+    auto k1 = string::from("user_1001")
+    auto v1 = string::from("alice_initial")
+    db#.put(cede k1, cede v1).unwrap()
+    auto s1 = db#.acquire_snapshot().unwrap()
+    assert(s1.sequence() == 1:u64, "s1 seq must be 1")
+
+    // 2. Overwrite in active MemTable
+    auto k1_2 = string::from("user_1001")
+    auto v2 = string::from("alice_updated_v2")
+    db#.put(cede k1_2, cede v2).unwrap()
+    auto s2 = db#.acquire_snapshot().unwrap()
+    assert(s2.sequence() == 2:u64, "s2 seq must be 2")
+
+    // 3. Delete in active MemTable (tombstone)
+    auto k1_3 = string::from("user_1001")
+    db#.delete(cede k1_3).unwrap()
+    auto s3 = db#.acquire_snapshot().unwrap()
+    assert(s3.sequence() == 3:u64, "s3 seq must be 3")
+
+    // 4. Re-insert in active MemTable
+    auto k1_4 = string::from("user_1001")
+    auto v4 = string::from("alice_reborn_v4")
+    db#.put(cede k1_4, cede v4).unwrap()
+    auto s4 = db#.acquire_snapshot().unwrap()
+    assert(s4.sequence() == 4:u64, "s4 seq must be 4")
+
+    // Verify multi-version point-in-time lookups across all snapshots
+    auto r1 = db#.get_at_snapshot(string::from("user_1001"), s1).unwrap()
+    assert(r1.is_some(), "s1 must find user_1001")
+    assert(r1.unwrap().as_str().equals("alice_initial"), "s1 must see v1")
+
+    auto r2 = db#.get_at_snapshot(string::from("user_1001"), s2).unwrap()
+    assert(r2.is_some(), "s2 must find user_1001")
+    assert(r2.unwrap().as_str().equals("alice_updated_v2"), "s2 must see v2")
+
+    auto r3 = db#.get_at_snapshot(string::from("user_1001"), s3).unwrap()
+    assert(r3.is_none(), "s3 must see tombstone (None)")
+
+    auto r4 = db#.get_at_snapshot(string::from("user_1001"), s4).unwrap()
+    assert(r4.is_some(), "s4 must find user_1001")
+    assert(r4.unwrap().as_str().equals("alice_reborn_v4"), "s4 must see v4")
+
+    // Latest get() must see latest version
+    auto r_latest = db#.get(string::from("user_1001")).unwrap()
+    assert(r_latest.is_some(), "latest must find user_1001")
+    assert(r_latest.unwrap().as_str().equals("alice_reborn_v4"), "latest must see v4")
+
+    db#.close().unwrap()
+    tmp#.remove()
+    println("[TokaKV] snapshot_mvcc_memtable_v1 PASSED!")
+    return 0
+}

@@ -1,0 +1,331 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/manifest_corruption_v1.tk
+// Fail-closed verification under Manifest corruption, missing SSTables, and torn tail recovery.
+
+import std/io::{println, remove_file}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/data_file::{ReadDataFile, WalFile}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/manifest/version_set::{build_manifest_path, build_table_path}
+import official/tokakv/manifest/format::{put_u32_le, put_u64_le, frame_manifest_payload, TAG_VERSION_BATCH}
+
+fn test_corrupted_manifest_magic() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db1#.put(cede k1, cede v1).unwrap()
+    db1#.flush_active_memtable().unwrap()
+    db1#.close().unwrap()
+
+    // Read MANIFEST and corrupt byte 0
+    auto manifest_path = build_manifest_path(db_path.clone())
+
+    auto r = ReadDataFile::open(manifest_path.clone()).unwrap()
+    auto f_size = r.size().unwrap() as usize
+    auto buf# = Vec<u8>::with_capacity(f_size)
+    auto out = r.read_at(cede buf, 0:u64, f_size).unwrap().take_buffer()
+
+    auto corrupted_buf# = Vec<u8>::with_capacity(f_size)
+    corrupted_buf#.push(0x58:u8) // 'X' instead of 'T'
+    auto i# = 1:usize
+    loop i < f_size {
+        corrupted_buf#.push(out.get(i))
+        i = i + 1:usize
+    }
+
+    auto wal# = WalFile::open(manifest_path.clone()).unwrap()
+    wal#.write_all_at(cede corrupted_buf, 0:u64).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Reopen MUST FAIL with invalid_manifest_magic
+    auto bad_open = TokaKvEngine::open(db_path.clone())
+    assert(bad_open.is_err(), "Opening corrupted Manifest magic MUST FAIL")
+    assert(bad_open.unwrap_err().message.as_str().equals("invalid_manifest_magic"), "Must report invalid_manifest_magic")
+
+    tmp#.remove()
+}
+
+fn test_corrupted_manifest_record_crc() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db1#.put(cede k1, cede v1).unwrap()
+    db1#.flush_active_memtable().unwrap()
+
+    auto k2 = string::from("k2")
+    auto v2 = string::from("v2")
+    db1#.put(cede k2, cede v2).unwrap()
+    db1#.flush_active_memtable().unwrap()
+    db1#.close().unwrap()
+
+    auto manifest_path = build_manifest_path(db_path.clone())
+
+    auto r = ReadDataFile::open(manifest_path.clone()).unwrap()
+    auto f_size = r.size().unwrap() as usize
+    auto buf# = Vec<u8>::with_capacity(f_size)
+    auto out = r.read_at(cede buf, 0:u64, f_size).unwrap().take_buffer()
+
+    // Corrupt byte inside the first record payload (offset 16)
+    auto corrupted_buf# = Vec<u8>::with_capacity(f_size)
+    auto i# = 0:usize
+    loop i < f_size {
+        if i == 16:usize {
+            corrupted_buf#.push(out.get(i) ^ 0xFF:u8)
+        } else {
+            corrupted_buf#.push(out.get(i))
+        }
+        i = i + 1:usize
+    }
+
+    auto wal# = WalFile::open(manifest_path.clone()).unwrap()
+    wal#.write_all_at(cede corrupted_buf, 0:u64).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Reopen MUST FAIL with manifest_crc_mismatch
+    auto bad_open = TokaKvEngine::open(db_path.clone())
+    assert(bad_open.is_err(), "Opening corrupted Manifest CRC MUST FAIL")
+
+    tmp#.remove()
+}
+
+fn test_manifest_last_complete_frame_crc_corruption() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db1#.put(cede k1, cede v1).unwrap()
+    db1#.flush_active_memtable().unwrap()
+    db1#.close().unwrap()
+
+    auto manifest_path = build_manifest_path(db_path.clone())
+
+    auto r = ReadDataFile::open(manifest_path.clone()).unwrap()
+    auto f_size = r.size().unwrap() as usize
+    auto buf# = Vec<u8>::with_capacity(f_size)
+    auto out = r.read_at(cede buf, 0:u64, f_size).unwrap().take_buffer()
+
+    // Corrupt byte inside the LAST complete record payload (at f_size - 4)
+    auto corrupted_buf# = Vec<u8>::with_capacity(f_size)
+    auto i# = 0:usize
+    loop i < f_size {
+        if i == f_size - 4:usize {
+            corrupted_buf#.push(out.get(i) ^ 0xAA:u8)
+        } else {
+            corrupted_buf#.push(out.get(i))
+        }
+        i = i + 1:usize
+    }
+
+    auto wal# = WalFile::open(manifest_path.clone()).unwrap()
+    wal#.write_all_at(cede corrupted_buf, 0:u64).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Reopen MUST FAIL CLOSED with manifest_crc_mismatch, NEVER silently truncated!
+    auto bad_open = TokaKvEngine::open(db_path.clone())
+    assert(bad_open.is_err(), "Complete last frame with corrupted CRC MUST FAIL-CLOSED!")
+    auto err = bad_open.unwrap_err()
+    assert(err.kind.as_str().equals("corrupted"), "Error kind must be corrupted")
+    assert(err.message.as_str().equals("manifest_crc_mismatch"), "Must report manifest_crc_mismatch")
+
+    tmp#.remove()
+}
+
+fn test_missing_referenced_sstable() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db1#.put(cede k1, cede v1).unwrap()
+    db1#.flush_active_memtable().unwrap()
+    auto cur_v = db1#.current_version()
+    auto sst_fnum = cur_v.get_table(0:usize).meta.file_number
+    db1#.close().unwrap()
+
+    // Delete the referenced SSTable
+    auto sst_path = build_table_path(db_path.clone(), sst_fnum)
+    remove_file(sst_path)
+
+    // Reopen MUST FAIL because referenced SSTable is missing
+    auto bad_open = TokaKvEngine::open(db_path.clone())
+    assert(bad_open.is_err(), "Opening with missing referenced SSTable MUST FAIL")
+
+    tmp#.remove()
+}
+
+fn test_manifest_torn_tail_recovery() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db1#.put(cede k1, cede v1).unwrap()
+    db1#.flush_active_memtable().unwrap()
+    db1#.close().unwrap()
+
+    auto manifest_path = build_manifest_path(db_path.clone())
+
+    auto r = ReadDataFile::open(manifest_path.clone()).unwrap()
+    auto f_size = r.size().unwrap()
+
+    // Append 3 partial garbage bytes at EOF of MANIFEST to simulate torn write
+    auto wal# = WalFile::open(manifest_path.clone()).unwrap()
+    auto garbage# = Vec<u8>::new()
+    garbage#.push(0xDE:u8)
+    garbage#.push(0xAD:u8)
+    garbage#.push(0xBE:u8)
+    wal#.write_all_at(cede garbage, f_size).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Reopen MUST SUCCEED by safely truncating the torn tail
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto v_cur# = db2#.current_version()
+    assert(v_cur#.tables_count() == 1:usize, "Must recover 1 SSTable after torn tail truncation")
+    auto res = db2#.get(string::from("k1"))
+    assert(res.is_ok(), "Key k1 query must succeed")
+    auto opt = res.unwrap()
+    assert(opt.is_some(), "Key k1 must be queryable")
+    auto val = opt.unwrap()
+    assert(val.as_str().equals("v1"), "Value mismatch")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_engine_get_fail_closed_on_corrupted_data_block() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k1 = string::from("key_corrupt_test")
+    auto v1 = string::from("val_corrupt_test")
+    db#.put(cede k1, cede v1).unwrap()
+    db#.flush_active_memtable().unwrap()
+    auto cur_v = db#.current_version()
+    auto sst_fnum = cur_v.get_table(0:usize).meta.file_number
+
+    // SSTable is now in VersionSet
+    // Corrupt byte at offset 20 in SSTable (inside Data Block 0 payload)
+    auto sst_path = build_table_path(db_path.clone(), sst_fnum)
+    auto r = ReadDataFile::open(sst_path.clone()).unwrap()
+    auto f_size = r.size().unwrap() as usize
+    auto buf# = Vec<u8>::with_capacity(f_size)
+    auto out = r.read_at(cede buf, 0:u64, f_size).unwrap().take_buffer()
+
+    auto corrupted_sst# = Vec<u8>::with_capacity(f_size)
+    auto i# = 0:usize
+    loop i < f_size {
+        if i == 20:usize {
+            corrupted_sst#.push(out.get(i) ^ 0x77:u8)
+        } else {
+            corrupted_sst#.push(out.get(i))
+        }
+        i = i + 1:usize
+    }
+
+    auto wal# = WalFile::open(sst_path.clone()).unwrap()
+    wal#.write_all_at(cede corrupted_sst, 0:u64).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Engine get MUST FAIL CLOSED with Err(KvError), NEVER downgraded to None/miss!
+    auto get_res = db#.get(string::from("key_corrupt_test"))
+    assert(get_res.is_err(), "Engine get MUST return Err on corrupted data block, never miss/None!")
+    auto err = get_res.unwrap_err()
+    assert(err.kind.as_str().equals("corrupted"), "Error kind must be corrupted")
+    assert(err.message.as_str().equals("data_block_crc_mismatch"), "Must report data_block_crc_mismatch")
+
+    db#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_reject_level_above_l1_in_manifest() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_l2_reject")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    db#.put(string::from("k1"), string::from("v1")).unwrap()
+    db#.flush_active_memtable().unwrap()
+    auto next_manifest_seq = db#.current_version().id() + 1:u64
+    db#.close().unwrap()
+
+    // Build a valid CRC V3 frame with level = 2 for a table
+    auto payload# = Vec<u8>::with_capacity(256:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, next_manifest_seq)
+    put_u64_le(payload#, 10:u64) // next_file_number = 10
+    put_u64_le(payload#, 100:u64) // last_persisted_seq = 100
+    put_u64_le(payload#, 1:u64) // active_log = 1
+    put_u64_le(payload#, 1:u64) // active_log_first_seq = 1
+    put_u32_le(payload#, 0:u32) // sealed_logs_count = 0
+    put_u32_le(payload#, 1:u32) // add_tables_count = 1
+
+    // Table with level = 2!
+    put_u32_le(payload#, 2:u32) // level = 2!
+    put_u64_le(payload#, 1:u64) // file_number = 1
+    put_u64_le(payload#, 512:u64) // file_size = 512
+    put_u64_le(payload#, 1:u64) // min_seq = 1
+    put_u64_le(payload#, 1:u64) // max_seq = 1
+    put_u32_le(payload#, 2:u32) // sk_len = 2 ("k1")
+    payload#.push(0x6B:u8) // 'k'
+    payload#.push(0x31:u8) // '1'
+    put_u32_le(payload#, 2:u32) // lk_len = 2 ("k1")
+    payload#.push(0x6B:u8) // 'k'
+    payload#.push(0x31:u8) // '1'
+    put_u32_le(payload#, 0:u32) // del_count = 0
+
+    // Frame with valid CRC
+    auto frame# = frame_manifest_payload(cede payload).unwrap()
+
+    // Append frame to MANIFEST
+    auto manifest_path = build_manifest_path(db_path.clone())
+    auto r_file = ReadDataFile::open(manifest_path.clone()).unwrap()
+    auto cur_size = r_file.size().unwrap()
+    auto wal# = WalFile::open(manifest_path.clone()).unwrap()
+    wal#.write_all_at(cede frame, cur_size).unwrap()
+    wal#.sync_all().unwrap()
+    wal#.close().unwrap()
+
+    // Reopen MUST FAIL CLOSED with invalid_table_level_above_l1
+    auto bad_open = TokaKvEngine::open(db_path.clone())
+    assert(bad_open.is_err(), "Reopening manifest with level > 1 MUST fail closed")
+    auto err = bad_open.unwrap_err()
+    assert(err.kind.as_str().equals("corrupted"), "Error kind must be corrupted")
+    assert(err.message.as_str().equals("invalid_table_level_above_l1"), "Must report invalid_table_level_above_l1")
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_corrupted_manifest_magic()
+    test_corrupted_manifest_record_crc()
+    test_manifest_last_complete_frame_crc_corruption()
+    test_missing_referenced_sstable()
+    test_manifest_torn_tail_recovery()
+    test_engine_get_fail_closed_on_corrupted_data_block()
+    test_reject_level_above_l1_in_manifest()
+    println("[PASS] Manifest Corruption v1 Qualified Successfully!")
+    return 0
+}

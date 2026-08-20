@@ -1,0 +1,11 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_snapshot_lease_cannot_forge.tk
+// Compile-fail diagnostic test: external callers cannot forge SnapshotLease.
+
+import official/tokakv::{SnapshotLease}
+
+fn main() -> i32 {
+    // Attempt to directly construct SnapshotLease with private fields
+    auto forged = SnapshotLease(id = 1:u64, sequence = 100:u64, engine_id = 1:u64)
+    return 0
+}

@@ -1,0 +1,23 @@
+// tokakv/tests/diag_engine_writer_state_private_fields.tk
+// Diagnostic test: Accessing private WriterState internals directly must fail compilation with E0418.
+
+import official/tokakv::{WriterState}
+import official/tokakv/wal::{WalWriter}
+import official/tokakv/manifest/version_set::{VersionSet}
+
+fn main() -> i32 {
+    auto w = WalWriter::open(string::from("wal.log"), 0:u64, 0:u64).unwrap()
+    auto vs = VersionSet::open_or_create(string::from(".")).unwrap()
+    auto ws = WriterState(
+        wal_writer = cede w,
+        version_set = cede vs,
+        next_seq = 1:u64,
+        next_flush_id = 1:u64,
+        opened = true,
+        poisoned = false,
+        db_dir = string::from(".")
+    )
+    // Direct access to encapsulated wal_writer field must fail with error[E0418]
+    auto writer = ws.wal_writer
+    return 0
+}

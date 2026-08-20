@@ -1,0 +1,133 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/concurrent_snapshot_leveled_compaction_v1.tk
+// Multi-threaded stress test for concurrent leveled compaction and snapshot reads under TSan.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/thread::{thread_spawn, yield_now}
+import official/tokakv::{TokaKvEngine}
+
+fn make_key(prefix: string, idx: i32) -> string {
+    auto k# = prefix.clone()
+    k#.push_str("_")
+    k#.push_str(string::from_int(idx).as_str())
+    return cede k
+}
+
+fn make_val(prefix: string, idx: i32) -> string {
+    auto v# = string::from("val_")
+    v#.push_str(prefix.as_str())
+    v#.push_str("_")
+    v#.push_str(string::from_int(idx).as_str())
+    return cede v
+}
+
+fn test_concurrent_snapshot_leveled_compaction() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 65536:usize).unwrap()
+
+    // 1. Seed initial data
+    auto t# = 0
+    loop t < 3 {
+        auto i# = 0
+        loop i < 15 {
+            auto k = make_key(string::from("seed"), i)
+            auto v = make_val(string::from("seed"), i + t * 100)
+            db.put(cede k, cede v).unwrap()
+            i = i + 1
+        }
+        db.flush_active_memtable().unwrap()
+        t = t + 1
+    }
+
+    auto snap_db = db.clone()
+    auto reader_db = db.clone()
+    auto writer_db = db.clone()
+
+    // Thread 1: Snapshot reader
+    auto snap_fn# = { [cede snap_db] =>
+        auto round# = 0
+        loop round < 25 {
+            auto lease_res = snap_db.acquire_snapshot()
+            assert(lease_res.is_ok(), "acquire_snapshot must succeed")
+            auto lease = lease_res.unwrap()
+
+            auto idx# = 0
+            loop idx < 15 {
+                auto k = make_key(string::from("seed"), idx)
+                auto r_res = snap_db.get_at_snapshot(cede k, lease)
+                assert(r_res.is_ok(), "get_at_snapshot must succeed")
+                assert(r_res.unwrap().is_some(), "seed key must be visible in snapshot")
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Thread 2: Point reader
+    auto reader_fn# = { [cede reader_db] =>
+        auto round# = 0
+        loop round < 30 {
+            auto idx# = 0
+            loop idx < 15 {
+                auto k = make_key(string::from("seed"), idx)
+                auto r_res = reader_db.get(cede k)
+                assert(r_res.is_ok(), "get must succeed")
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Thread 3: Writer & compactor
+    auto writer_fn# = { [cede writer_db] =>
+        auto round# = 0
+        loop round < 5 {
+            auto idx# = 0
+            loop idx < 10 {
+                auto k = make_key(string::from("dyn"), idx + round * 10)
+                auto v = make_val(string::from("dyn"), idx + round * 10)
+                writer_db.put(cede k, cede v).unwrap()
+                idx = idx + 1
+            }
+            writer_db.flush_active_memtable().unwrap()
+            writer_db.compact_l0().unwrap()
+            yield_now()
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto h_snap# = thread_spawn<i32>(cede snap_fn)
+    auto h_read# = thread_spawn<i32>(cede reader_fn)
+    auto h_write# = thread_spawn<i32>(cede writer_fn)
+
+    assert(h_snap#.join().unwrap() == 0, "Snapshot thread failed")
+    assert(h_read#.join().unwrap() == 0, "Reader thread failed")
+    assert(h_write#.join().unwrap() == 0, "Writer thread failed")
+
+    // Final compaction and invariant checks
+    db.compact_l0().unwrap()
+    auto v_final = db.current_version()
+    v_final.validate_invariants().unwrap()
+
+    db.close().unwrap()
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_concurrent_snapshot_leveled_compaction()
+    println("[TokaKV] concurrent_snapshot_leveled_compaction_v1 PASSED!")
+    return 0
+}

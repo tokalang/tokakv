@@ -1,0 +1,177 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/concurrent_compaction_read_write_v1.tk
+// Multi-threaded stress test for concurrent Level-0 compaction with active readers and writers under TSan.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/thread::{thread_spawn, yield_now}
+import official/tokakv::{TokaKvEngine}
+
+fn make_key(prefix: string, idx: i32) -> string {
+    auto k# = prefix.clone()
+    k#.push_str("_")
+    k#.push_str(string::from_int(idx).as_str())
+    return cede k
+}
+
+fn make_val(prefix: string, idx: i32) -> string {
+    auto v# = string::from("val_")
+    v#.push_str(prefix.as_str())
+    v#.push_str("_")
+    v#.push_str(string::from_int(idx).as_str())
+    return cede v
+}
+
+fn test_concurrent_compaction_read_write() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // Open engine with 64KB block cache
+    auto db = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 65536:usize).unwrap()
+
+    // 1. Seed initial 3 SSTables
+    auto t# = 0
+    loop t < 3 {
+        auto i# = 0
+        loop i < 20 {
+            auto k = make_key(string::from("seed"), i)
+            auto v = make_val(string::from("seed"), i + t * 100)
+            db.put(cede k, cede v).unwrap()
+            i = i + 1
+        }
+        db.flush_active_memtable().unwrap()
+        t = t + 1
+    }
+
+    assert(db.current_version().tables_count() == 3:usize, "Must have 3 L0 SSTables initially")
+
+    // 2. Prepare handles for concurrent workers
+    auto r1_db = db.clone()
+    auto r2_db = db.clone()
+    auto r3_db = db.clone()
+    auto w1_db = db.clone()
+
+    // Reader 1: Constantly reads seed keys during compaction
+    auto r1_fn# = { [cede r1_db] =>
+        auto round# = 0
+        loop round < 50 {
+            auto idx# = 0
+            loop idx < 20 {
+                auto k = make_key(string::from("seed"), idx)
+                auto g_res = r1_db.get(cede k)
+                assert(g_res.is_ok(), "Reader 1 get failed")
+                auto opt = g_res.unwrap()
+                assert(opt.is_some(), "Seed key must exist")
+                auto val = opt.unwrap()
+                assert(val.as_str().starts_with("val_seed_"), "Seed value prefix mismatch")
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Reader 2: Reads writer keys
+    auto r2_fn# = { [cede r2_db] =>
+        auto round# = 0
+        loop round < 40 {
+            auto idx# = 0
+            loop idx < 30 {
+                auto k = make_key(string::from("dyn"), idx)
+                auto g_res = r2_db.get(cede k)
+                assert(g_res.is_ok(), "Reader 2 get failed")
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Reader 3: Reads during version replacement
+    auto r3_fn# = { [cede r3_db] =>
+        auto round# = 0
+        loop round < 60 {
+            auto k = make_key(string::from("seed"), 5)
+            auto g_res = r3_db.get(cede k)
+            assert(g_res.is_ok(), "Reader 3 get failed")
+            auto opt = g_res.unwrap()
+            assert(opt.is_some(), "Seed key 5 must exist")
+            yield_now()
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Writer 1: Inserts new dynamic keys concurrently
+    auto w1_fn# = { [cede w1_db] =>
+        auto idx# = 0
+        loop idx < 30 {
+            auto k = make_key(string::from("dyn"), idx)
+            auto v = make_val(string::from("dyn"), idx)
+            auto p_res = w1_db.put(cede k, cede v)
+            assert(p_res.is_ok(), "Writer put failed")
+            yield_now()
+            idx = idx + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // 3. Spawn workers
+    auto h_r1# = thread_spawn<i32>(cede r1_fn)
+    auto h_r2# = thread_spawn<i32>(cede r2_fn)
+    auto h_r3# = thread_spawn<i32>(cede r3_fn)
+    auto h_w1# = thread_spawn<i32>(cede w1_fn)
+
+    // 4. Trigger synchronous Level-0 compaction while workers are running!
+    db.compact_l0().unwrap()
+
+    // 5. Join all workers
+    assert(h_r1#.join().unwrap() == 0, "Reader 1 failed")
+    assert(h_r2#.join().unwrap() == 0, "Reader 2 failed")
+    assert(h_r3#.join().unwrap() == 0, "Reader 3 failed")
+    assert(h_w1#.join().unwrap() == 0, "Writer 1 failed")
+
+    // Verify post-compaction state
+    auto ver = db.current_version()
+    assert(ver.tables_count() == 1:usize, "Compacted version must have 1 SSTable")
+
+    // Check all seed keys after compaction
+    auto s_idx# = 0
+    loop s_idx < 20 {
+        auto k = make_key(string::from("seed"), s_idx)
+        auto g_res = db.get(cede k).unwrap()
+        assert(g_res.is_some(), "Seed key must exist post-compaction")
+        s_idx = s_idx + 1
+    }
+
+    db.close().unwrap()
+
+    // 6. Reopen and verify durable integrity
+    auto db2 = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 65536:usize).unwrap()
+    assert(db2.current_version().tables_count() == 1:usize, "Reopened DB must have 1 SSTable")
+
+    auto r_idx# = 0
+    loop r_idx < 20 {
+        auto k = make_key(string::from("seed"), r_idx)
+        auto g_res = db2.get(cede k).unwrap()
+        assert(g_res.is_some(), "Seed key must exist in reopened DB")
+        r_idx = r_idx + 1
+    }
+
+    db2.close().unwrap()
+    println("[PASS] test_concurrent_compaction_read_write passed")
+}
+
+fn main() -> i32 {
+    println("=== Running concurrent_compaction_read_write_v1 tests ===")
+    test_concurrent_compaction_read_write()
+    println("=== ALL concurrent_compaction_read_write_v1 TESTS PASSED ===")
+    return 0
+}

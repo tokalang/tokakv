@@ -1,0 +1,212 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/wal_rotation_multi_gen_v1.tk
+// Multi-generation WAL rotation without flush, sequence continuity across generations,
+// and atomic Manifest sealed log pruning & safe physical recycling after flush.
+
+import std/io::{println, remove_file}
+import std/fs::{create_temp_file_system, metadata}
+import std/data_file::{WalFile}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/manifest/version_set::{build_wal_path}
+
+fn make_key(i: usize) -> string {
+    auto s# = string::from("key_")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn make_val(i: usize) -> string {
+    auto s# = string::from("val_")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn test_multi_generation_rotation_and_recovery() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // 1. Open engine and write in generation 1
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+
+    // 2. Rotate to generation 2
+    auto log2_num = db#.rotate_wal().unwrap()
+    assert(log2_num == 2:u64, "First rotation must yield log 2")
+
+    loop i <= 20:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+
+    // 3. Rotate to generation 3
+    auto log3_num = db#.rotate_wal().unwrap()
+    assert(log3_num == 3:u64, "Second rotation must yield log 3")
+
+    loop i <= 30:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+
+    // 4. Rotate to generation 4
+    auto log4_num = db#.rotate_wal().unwrap()
+    assert(log4_num == 4:u64, "Third rotation must yield log 4")
+
+    loop i <= 40:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+
+    // 5. Verify all 40 keys are readable before close
+    auto q# = 1:usize
+    loop q <= 40:usize {
+        auto res = db#.get(make_key(q)).unwrap()
+        assert(res.is_some(), "Key must exist before close")
+        assert(res.unwrap().as_str().equals(make_val(q).as_str()), "Value mismatch before close")
+        q = q + 1:usize
+    }
+
+    db#.close().unwrap()
+
+    // 6. Reopen engine: must replay across logs 1, 2, 3, 4 with sequence continuity
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db2#.current_seq() == 40:u64, "Current seq after 4 generations must be 40")
+
+    q = 1:usize
+    loop q <= 40:usize {
+        auto res = db2#.get(make_key(q)).unwrap()
+        assert(res.is_some(), "Key must exist after reopen")
+        assert(res.unwrap().as_str().equals(make_val(q).as_str()), "Value mismatch after reopen")
+        q = q + 1:usize
+    }
+
+    // Write key 41 to ensure active writer on log 4 continues cleanly
+    db2#.put(make_key(41), make_val(41)).unwrap()
+    assert(db2#.current_seq() == 41:u64, "Current seq must advance to 41")
+
+    // 7. Flush active memtable to SSTable (covers seq 1..41)
+    db2#.flush_active_memtable().unwrap()
+
+    // 8. Flush rotates to a fresh active WAL before publishing the SSTable.
+    // All covered generations, including the former active log 4, can then
+    // be recycled while the new empty log 5 remains active.
+    auto wal1_p = build_wal_path(db_path.clone(), 1:u64)
+    auto wal2_p = build_wal_path(db_path.clone(), 2:u64)
+    auto wal3_p = build_wal_path(db_path.clone(), 3:u64)
+    auto wal4_p = build_wal_path(db_path.clone(), 4:u64)
+    auto wal5_p = build_wal_path(db_path.clone(), 5:u64)
+
+    assert(metadata(wal1_p).is_err(), "Sealed log 1 must be unlinked after full flush")
+    assert(metadata(wal2_p).is_err(), "Sealed log 2 must be unlinked after full flush")
+    assert(metadata(wal3_p).is_err(), "Sealed log 3 must be unlinked after full flush")
+    assert(metadata(wal4_p).is_err(), "Covered log 4 must be unlinked after WAL rotation and flush")
+    assert(metadata(wal5_p).is_ok(), "Fresh active log 5 must remain present")
+
+    db2#.close().unwrap()
+
+    // 9. Reopen again from durable SSTable + empty active log
+    auto db3# = TokaKvEngine::open(db_path.clone()).unwrap()
+    q = 1:usize
+    loop q <= 41:usize {
+        auto res = db3#.get(make_key(q)).unwrap()
+        assert(res.is_some(), "Key must exist after flush reopen")
+        assert(res.unwrap().as_str().equals(make_val(q).as_str()), "Value mismatch after flush reopen")
+        q = q + 1:usize
+    }
+    db3#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn test_sealed_log_missing_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_missing")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    db#.rotate_wal().unwrap() // Seals log 1
+    db#.close().unwrap()
+
+    // Delete sealed log 1
+    auto wal1_p = build_wal_path(db_path.clone(), 1:u64)
+    remove_file(wal1_p)
+
+    // Reopen MUST fail closed
+    auto reopen_res = TokaKvEngine::open(db_path.clone())
+    assert(reopen_res.is_err(), "Reopen with missing sealed log MUST fail closed")
+
+    tmp#.remove()
+}
+
+fn test_sealed_log_truncated_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_truncated")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    db#.rotate_wal().unwrap() // Seals log 1
+    db#.close().unwrap()
+
+    // Truncate sealed log 1 by 5 bytes
+    auto wal1_p = build_wal_path(db_path.clone(), 1:u64)
+    auto m = metadata(wal1_p.clone()).unwrap()
+    auto orig_sz = m.len()
+    auto wal_f# = WalFile::open(wal1_p).unwrap()
+    wal_f#.truncate(orig_sz - 5:u64).unwrap()
+    wal_f#.close().unwrap()
+
+    // Reopen MUST fail closed on truncated sealed log
+    auto reopen_res = TokaKvEngine::open(db_path.clone())
+    assert(reopen_res.is_err(), "Reopen with truncated sealed log MUST fail closed")
+
+    tmp#.remove()
+}
+
+fn test_active_log_missing_on_existing_db_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_act_missing")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+    db#.close().unwrap()
+
+    // Flush rotated the original log 1 into a fresh active log 2.
+    auto active_wal = build_wal_path(db_path.clone(), 2:u64)
+    remove_file(active_wal)
+
+    // Reopen MUST fail closed on missing active log for initialized database
+    auto reopen_res = TokaKvEngine::open(db_path.clone())
+    assert(reopen_res.is_err(), "Reopen with missing active log on initialized DB MUST fail closed")
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_multi_generation_rotation_and_recovery()
+    test_sealed_log_missing_fail_closed()
+    test_sealed_log_truncated_fail_closed()
+    test_active_log_missing_on_existing_db_fail_closed()
+    println("[PASS] Multi-Generation WAL Rotation & Safe Recycling Qualified Successfully!")
+    return 0
+}

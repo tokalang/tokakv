@@ -1,0 +1,1450 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/manifest/version_set.tk
+// VersionSet coordinator, durable Manifest log replayer, TOKAMNF1->TOKAMNF2 migration, and atomic version transitions.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import std/io::{remove_file}
+import std/fs::{sync_directory, metadata}
+import std/error::{IoError}
+import std/data_file::{ReadDataFile, WalFile}
+import official/tokakv/types::{KvError, LookupResult}
+import official/tokakv/sstable/reader::{SSTableReader}
+import official/tokakv/manifest/format::{
+    put_u32_le, put_u64_le, get_u32_le, get_u64_le,
+    encode_manifest_header, validate_manifest_header, frame_manifest_payload,
+    MANIFEST_HEADER_SIZE, MAX_MANIFEST_RECORD_SIZE,
+    TAG_ALLOC_NUM, TAG_VERSION_BATCH
+}
+import official/tokakv/manifest/version::{
+    ActiveLogMetadata, SealedLogMetadata, TableMetadata, TableHandle, Version, VersionEdit
+}
+import official/tokakv/cache/block_cache::{BlockCache}
+import official/tokakv/crc32::{crc32_ieee}
+import sys/libc::{toka_atomic_write_durable, toka_test_check_failpoint}
+
+fn check_test_failpoint(name: str) {
+    auto name_s# = string::from(name)
+    auto *c_str# = name_s.c_str()
+    unsafe {
+        toka_test_check_failpoint(*c_str)
+    }
+}
+
+pub fn format_table_filename(file_number: u64) -> string {
+    auto s# = string::new()
+    if file_number < 10:u64 {
+        s#.push_str("00000")
+    } else if file_number < 100:u64 {
+        s#.push_str("0000")
+    } else if file_number < 1000:u64 {
+        s#.push_str("000")
+    } else if file_number < 10000:u64 {
+        s#.push_str("00")
+    } else if file_number < 100000:u64 {
+        s#.push_str("0")
+    }
+    auto num_str = string::from_i64(file_number as i64)
+    s#.push_str(num_str.as_str())
+    s#.push_str(".sst")
+    return cede s
+}
+
+pub fn format_wal_filename(log_number: u64) -> string {
+    auto s# = string::new()
+    if log_number < 10:u64 {
+        s#.push_str("00000")
+    } else if log_number < 100:u64 {
+        s#.push_str("0000")
+    } else if log_number < 1000:u64 {
+        s#.push_str("000")
+    } else if log_number < 10000:u64 {
+        s#.push_str("00")
+    } else if log_number < 100000:u64 {
+        s#.push_str("0")
+    }
+    auto num_str = string::from_i64(log_number as i64)
+    s#.push_str(num_str.as_str())
+    s#.push_str(".log")
+    return cede s
+}
+
+pub fn build_manifest_path(db_dir: string) -> string {
+    auto p# = db_dir.clone()
+    if p#.ends_with("/") {
+        p#.push_str("MANIFEST")
+    } else {
+        p#.push_str("/MANIFEST")
+    }
+    return cede p
+}
+
+pub fn build_table_path(db_dir: string, file_number: u64) -> string {
+    auto p# = db_dir.clone()
+    if !p#.ends_with("/") {
+        p#.push_str("/")
+    }
+    auto fname = format_table_filename(file_number)
+    p#.push_str(fname.as_str())
+    return cede p
+}
+
+pub fn build_wal_path(db_dir: string, log_number: u64) -> string {
+    auto p# = db_dir.clone()
+    if !p#.ends_with("/") {
+        p#.push_str("/")
+    }
+    auto fname = format_wal_filename(log_number)
+    p#.push_str(fname.as_str())
+    return cede p
+}
+
+pub fn resolve_legacy_wal_path(db_dir: string) -> string {
+    auto p# = db_dir.clone()
+    if p#.ends_with("/") {
+        p#.push_str("wal.log")
+    } else {
+        p#.push_str("/wal.log")
+    }
+    return cede p
+}
+
+fn durable_atomic_write_file(path: string, buf: Vec<u8>) -> Result<(), KvError> {
+    auto len = buf.len()
+    auto path_cstr# = path.clone()
+    auto *path_ptr# = path_cstr.c_str()
+    auto os_err# = 0:i32
+    if len == 0:usize {
+        auto dummy# = 0:u8
+        auto *dummy_ptr# = &dummy as *u8
+        auto res = unsafe toka_atomic_write_durable(*path_ptr, *dummy_ptr, 0:usize, &os_err as *i32)
+        if res != 0:i32 {
+            return Result<(), KvError>::Err(KvError::io(IoError::new("atomic_write_durable", os_err, "failed to write file")))
+        }
+    } else {
+        unsafe {
+            auto *data_ptr# = buf.unsafe_get(0)
+            auto res = toka_atomic_write_durable(*path_ptr, *data_ptr, len, &os_err as *i32)
+            if res != 0:i32 {
+                return Result<(), KvError>::Err(KvError::io(IoError::new("atomic_write_durable", os_err, "failed to write file")))
+            }
+        }
+    }
+    return Result<(), KvError>::Ok(())
+}
+
+fn encode_alloc_num_payload(version_seq: u64, next_file_number: u64) -> Vec<u8> {
+    auto p# = Vec<u8>::with_capacity(17:usize)
+    p#.push(TAG_ALLOC_NUM)
+    put_u64_le(p#, version_seq)
+    put_u64_le(p#, next_file_number)
+    return cede p
+}
+
+fn migrate_v1_to_v2(
+    db_dir: string,
+    active_tables: Vec<TableMetadata>,
+    last_persisted_seq: u64,
+    next_file_number: u64,
+    manifest_seq: u64
+) -> Result<VersionSet, KvError> {
+    auto wal_legacy_path = resolve_legacy_wal_path(db_dir.clone())
+    auto target_wal_1 = build_wal_path(db_dir.clone(), 1:u64)
+    auto active_log_num# = 1:u64
+    auto active_log_first_seq# = 1:u64
+    if last_persisted_seq > 0:u64 {
+        active_log_first_seq = last_persisted_seq + 1:u64
+    }
+
+    auto target_meta = metadata(target_wal_1.clone())
+    if target_meta.is_ok() {
+        if target_meta.unwrap().is_dir() {
+            return Result<VersionSet, KvError>::Err(
+                KvError::io(IoError::new("migrate_v1_to_v2", 21:i32, "target 000001.log exists but is a directory"))
+            )
+        }
+    }
+
+    auto wal_legacy_present# = false
+    auto r_res = ReadDataFile::open(wal_legacy_path.clone())
+    if r_res.is_ok() {
+        wal_legacy_present = true
+        auto r_file = r_res.unwrap()
+        auto sz_res = r_file.size()
+        if sz_res.is_err() {
+            return Result<VersionSet, KvError>::Err(KvError::io(sz_res.unwrap_err()))
+        }
+        auto r_sz = sz_res.unwrap()
+        auto wal_bytes# = Vec<u8>::with_capacity(r_sz as usize)
+        if r_sz > 0:u64 {
+            auto rd_res = r_file.read_at(cede wal_bytes, 0:u64, r_sz as usize)
+            if rd_res.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(rd_res.unwrap_err().error))
+            }
+            wal_bytes = rd_res.unwrap().take_buffer()
+        }
+        auto w_res = durable_atomic_write_file(target_wal_1.clone(), wal_bytes)
+        if w_res.is_err() {
+            return Result<VersionSet, KvError>::Err(w_res.unwrap_err())
+        }
+        auto s_res = sync_directory(db_dir.clone())
+        if s_res.is_err() {
+            return Result<VersionSet, KvError>::Err(KvError::io(s_res.unwrap_err()))
+        }
+    } else {
+        auto err = r_res.unwrap_err()
+        // Strictly only ENOENT (2) allows entering the "missing WAL" branch
+        if err.code() == 2:i32 {
+            // Under V1 Manifest, if wal.log is missing on an initialized database, fail-closed immediately.
+            if manifest_seq > 0:u64 || active_tables.len() > 0:usize || last_persisted_seq > 0:u64 {
+                return Result<VersionSet, KvError>::Err(KvError::corrupted("legacy_wal_missing"))
+            }
+        } else {
+            // Any other I/O error (EACCES, EISDIR, EIO, etc.) must fail-closed immediately
+            return Result<VersionSet, KvError>::Err(KvError::io(err))
+        }
+    }
+
+    // Failpoint 1: after 000001.log is published, before V2 manifest replace
+    check_test_failpoint("after_migration_log_copy")
+
+    auto out_next_file# = next_file_number
+    if out_next_file <= 1:u64 {
+        out_next_file = 2:u64
+    }
+
+    // Build TOKAMNF2 Manifest payload
+    auto payload# = Vec<u8>::with_capacity(256:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64) // version_seq = 1
+    put_u64_le(payload#, out_next_file)
+    put_u64_le(payload#, last_persisted_seq)
+
+    // Active log:
+    put_u64_le(payload#, active_log_num)
+    put_u64_le(payload#, active_log_first_seq)
+
+    // Sealed logs count: 0
+    put_u32_le(payload#, 0:u32)
+
+    // Add tables
+    put_u32_le(payload#, active_tables.len() as u32)
+    auto t_i# = 0:usize
+    loop t_i < active_tables.len() {
+        unsafe {
+            auto *t = active_tables.unsafe_get(t_i)
+            put_u32_le(payload#, t.level)
+            put_u64_le(payload#, t.file_number)
+            put_u64_le(payload#, t.file_size)
+            put_u64_le(payload#, t.min_seq)
+            put_u64_le(payload#, t.max_seq)
+
+            auto sk_len = t.smallest_key.len()
+            put_u32_le(payload#, sk_len as u32)
+            if sk_len > 0:usize {
+                auto *sk_bytes = (t.smallest_key.c_str() as usize) as *[u8]
+                auto sk_idx# = 0:usize
+                loop sk_idx < sk_len {
+                    payload#.push(sk_bytes[sk_idx])
+                    sk_idx = sk_idx + 1:usize
+                }
+            }
+
+            auto lk_len = t.largest_key.len()
+            put_u32_le(payload#, lk_len as u32)
+            if lk_len > 0:usize {
+                auto *lk_bytes = (t.largest_key.c_str() as usize) as *[u8]
+                auto lk_idx# = 0:usize
+                loop lk_idx < lk_len {
+                    payload#.push(lk_bytes[lk_idx])
+                    lk_idx = lk_idx + 1:usize
+                }
+            }
+        }
+        t_i = t_i + 1:usize
+    }
+
+    // Deleted tables count: 0
+    put_u32_le(payload#, 0:u32)
+
+    auto frame_res = frame_manifest_payload(payload)
+    if frame_res.is_err() {
+        return Result<VersionSet, KvError>::Err(frame_res.unwrap_err())
+    }
+    auto frame = frame_res.unwrap()
+
+    // Combine magic header + frame
+    auto full_manifest# = Vec<u8>::with_capacity(8:usize + frame.len())
+    auto hdr# = encode_manifest_header()
+    auto h_i# = 0:usize
+    loop h_i < hdr.len() {
+        full_manifest#.push(hdr.get(h_i))
+        h_i = h_i + 1:usize
+    }
+    auto f_i# = 0:usize
+    loop f_i < frame.len() {
+        full_manifest#.push(frame.get(f_i))
+        f_i = f_i + 1:usize
+    }
+
+    auto manifest_path = build_manifest_path(db_dir.clone())
+    auto w_man = durable_atomic_write_file(manifest_path.clone(), full_manifest.clone())
+    if w_man.is_err() {
+        return Result<VersionSet, KvError>::Err(w_man.unwrap_err())
+    }
+    auto d_sync = sync_directory(db_dir.clone())
+    if d_sync.is_err() {
+        return Result<VersionSet, KvError>::Err(KvError::io(d_sync.unwrap_err()))
+    }
+
+    // Failpoint 2: after V3 manifest replace, before legacy wal.log unlink
+    check_test_failpoint("after_migration_manifest_replace")
+
+    // Once v3 Manifest is durable, remove legacy wal.log and sync directory
+    if wal_legacy_present {
+        remove_file(wal_legacy_path)
+        sync_directory(db_dir.clone())
+    }
+
+    // Failpoint 3: after legacy wal.log unlink
+    check_test_failpoint("after_migration_legacy_wal_unlink")
+
+    // Open readers for tables to construct Version
+    auto handles# = Vec<TableHandle>::new()
+    auto tbl_i# = 0:usize
+    loop tbl_i < active_tables.len() {
+        unsafe {
+            auto *t_meta_ptr = active_tables.unsafe_get(tbl_i)
+            auto t_path = build_table_path(db_dir.clone(), t_meta_ptr.file_number)
+            auto r_res = SSTableReader::open(t_path)
+            if r_res.is_err() {
+                return Result<VersionSet, KvError>::Err(r_res.unwrap_err())
+            }
+            auto reader# = r_res.unwrap()
+            reader#.set_file_number(t_meta_ptr.file_number)
+            auto sk = t_meta_ptr.smallest_key.clone()
+            auto lk = t_meta_ptr.largest_key.clone()
+            auto meta = TableMetadata::new(
+                t_meta_ptr.file_number, t_meta_ptr.file_size, t_meta_ptr.min_seq, t_meta_ptr.max_seq,
+                cede sk, cede lk, t_meta_ptr.level
+            )
+            auto handle = TableHandle::new(cede meta, cede reader)
+            handles#.push(cede handle)
+        }
+        tbl_i = tbl_i + 1:usize
+    }
+
+    auto wal_man_res = WalFile::open(manifest_path.clone())
+    if wal_man_res.is_err() {
+        return Result<VersionSet, KvError>::Err(KvError::io(wal_man_res.unwrap_err()))
+    }
+    auto wal_man = wal_man_res.unwrap()
+
+    return Result<VersionSet, KvError>::Ok(VersionSet(
+        db_dir = db_dir.clone(),
+        manifest_file = cede wal_man,
+        current_version = Version::new(cede handles, 1:u64),
+        active_log = ActiveLogMetadata::new(active_log_num, active_log_first_seq),
+        sealed_logs = Vec<SealedLogMetadata>::new(),
+        next_file_number = out_next_file,
+        manifest_seq = 1:u64,
+        last_persisted_seq = last_persisted_seq,
+        manifest_end_offset = full_manifest.len() as u64
+    ))
+}
+
+/// Migrates TOKAMNF2 Manifest into TOKAMNF3 format (persisting level = 0 for existing tables).
+pub fn migrate_v2_to_v3(
+    db_dir: string,
+    active_tables: Vec<TableMetadata>,
+    last_persisted_seq: u64,
+    next_file_number: u64,
+    manifest_seq: u64,
+    active_log: ActiveLogMetadata,
+    cede sealed_logs: Vec<SealedLogMetadata>
+) -> Result<VersionSet, KvError> {
+    auto next_version_seq = 1:u64
+    auto payload# = Vec<u8>::with_capacity(256:usize)
+    payload#.push(TAG_VERSION_BATCH)
+    put_u64_le(payload#, 1:u64)
+    put_u64_le(payload#, next_file_number)
+    put_u64_le(payload#, last_persisted_seq)
+
+    // Active log:
+    put_u64_le(payload#, active_log.log_number)
+    put_u64_le(payload#, active_log.first_seq)
+
+    // Sealed logs count:
+    put_u32_le(payload#, sealed_logs.len() as u32)
+    auto s_i# = 0:usize
+    loop s_i < sealed_logs.len() {
+        auto sl = sealed_logs.get(s_i)
+        put_u64_le(payload#, sl.log_number)
+        put_u64_le(payload#, sl.first_seq)
+        put_u64_le(payload#, sl.last_seq)
+        s_i = s_i + 1:usize
+    }
+
+    // Add tables with level = 0
+    put_u32_le(payload#, active_tables.len() as u32)
+    auto t_i# = 0:usize
+    loop t_i < active_tables.len() {
+        unsafe {
+            auto *t = active_tables.unsafe_get(t_i)
+            put_u32_le(payload#, t.level)
+            put_u64_le(payload#, t.file_number)
+            put_u64_le(payload#, t.file_size)
+            put_u64_le(payload#, t.min_seq)
+            put_u64_le(payload#, t.max_seq)
+
+            auto sk_len = t.smallest_key.len()
+            put_u32_le(payload#, sk_len as u32)
+            if sk_len > 0:usize {
+                auto *sk_bytes = (t.smallest_key.c_str() as usize) as *[u8]
+                auto sk_idx# = 0:usize
+                loop sk_idx < sk_len {
+                    payload#.push(sk_bytes[sk_idx])
+                    sk_idx = sk_idx + 1:usize
+                }
+            }
+
+            auto lk_len = t.largest_key.len()
+            put_u32_le(payload#, lk_len as u32)
+            if lk_len > 0:usize {
+                auto *lk_bytes = (t.largest_key.c_str() as usize) as *[u8]
+                auto lk_idx# = 0:usize
+                loop lk_idx < lk_len {
+                    payload#.push(lk_bytes[lk_idx])
+                    lk_idx = lk_idx + 1:usize
+                }
+            }
+        }
+        t_i = t_i + 1:usize
+    }
+
+    // Deleted tables count: 0
+    put_u32_le(payload#, 0:u32)
+
+    auto frame_res = frame_manifest_payload(payload)
+    if frame_res.is_err() {
+        return Result<VersionSet, KvError>::Err(frame_res.unwrap_err())
+    }
+    auto frame = frame_res.unwrap()
+
+    // Combine magic header + frame
+    auto full_manifest# = Vec<u8>::with_capacity(8:usize + frame.len())
+    auto hdr# = encode_manifest_header()
+    auto h_i# = 0:usize
+    loop h_i < hdr.len() {
+        full_manifest#.push(hdr.get(h_i))
+        h_i = h_i + 1:usize
+    }
+    auto f_i# = 0:usize
+    loop f_i < frame.len() {
+        full_manifest#.push(frame.get(f_i))
+        f_i = f_i + 1:usize
+    }
+
+    auto manifest_path = build_manifest_path(db_dir.clone())
+    auto w_man = durable_atomic_write_file(manifest_path.clone(), full_manifest.clone())
+    if w_man.is_err() {
+        return Result<VersionSet, KvError>::Err(w_man.unwrap_err())
+    }
+    auto d_sync = sync_directory(db_dir.clone())
+    if d_sync.is_err() {
+        return Result<VersionSet, KvError>::Err(KvError::io(d_sync.unwrap_err()))
+    }
+
+    // Failpoint: after V3 manifest replace
+    check_test_failpoint("after_v2_to_v3_migration_manifest_replace")
+
+    // Open readers for tables to construct Version
+    auto handles# = Vec<TableHandle>::new()
+    auto tbl_i# = 0:usize
+    loop tbl_i < active_tables.len() {
+        unsafe {
+            auto *t_meta_ptr = active_tables.unsafe_get(tbl_i)
+            auto t_path = build_table_path(db_dir.clone(), t_meta_ptr.file_number)
+            auto r_res = SSTableReader::open(t_path)
+            if r_res.is_err() {
+                return Result<VersionSet, KvError>::Err(r_res.unwrap_err())
+            }
+            auto reader# = r_res.unwrap()
+            reader#.set_file_number(t_meta_ptr.file_number)
+            auto sk = t_meta_ptr.smallest_key.clone()
+            auto lk = t_meta_ptr.largest_key.clone()
+            auto meta = TableMetadata::new(
+                t_meta_ptr.file_number, t_meta_ptr.file_size, t_meta_ptr.min_seq, t_meta_ptr.max_seq,
+                cede sk, cede lk, t_meta_ptr.level
+            )
+            auto handle = TableHandle::new(cede meta, cede reader)
+            handles#.push(cede handle)
+        }
+        tbl_i = tbl_i + 1:usize
+    }
+
+    auto wal_man_res = WalFile::open(manifest_path.clone())
+    if wal_man_res.is_err() {
+        return Result<VersionSet, KvError>::Err(KvError::io(wal_man_res.unwrap_err()))
+    }
+    auto wal_man = wal_man_res.unwrap()
+
+    return Result<VersionSet, KvError>::Ok(VersionSet(
+        db_dir = db_dir.clone(),
+        manifest_file = cede wal_man,
+        current_version = Version::new(cede handles, next_version_seq),
+        active_log = active_log,
+        sealed_logs = cede sealed_logs,
+        next_file_number = next_file_number,
+        manifest_seq = next_version_seq,
+        last_persisted_seq = last_persisted_seq,
+        manifest_end_offset = full_manifest.len() as u64
+    ))
+}
+
+pub shape VersionSet (
+    db_dir: string,
+    manifest_file#: WalFile,
+    current_version#: Version,
+    active_log#: ActiveLogMetadata,
+    sealed_logs#: Vec<SealedLogMetadata>,
+    next_file_number#: u64,
+    manifest_seq#: u64,
+    last_persisted_seq#: u64,
+    manifest_end_offset#: u64
+)
+
+impl VersionSet {
+    pub fn get(self#, key: string) -> Result<LookupResult, KvError> {
+        return self#.get_with_cache(key, Option<BlockCache>::None)
+    }
+
+    pub fn get_with_cache(self#, key: string, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+        return self.current_version#.get_with_cache(key, cache_opt)
+    }
+
+    pub fn current(self#) -> Version {
+        return self.current_version.clone()
+    }
+
+    pub fn active_log(self#) -> ActiveLogMetadata {
+        return self.active_log.clone()
+    }
+
+    pub fn sealed_logs(self#) -> Vec<SealedLogMetadata> {
+        auto out# = Vec<SealedLogMetadata>::with_capacity(self.sealed_logs.len())
+        auto i# = 0:usize
+        loop i < self.sealed_logs.len() {
+            auto item = self.sealed_logs.get(i)
+            out#.push(item.clone())
+            i = i + 1:usize
+        }
+        return cede out
+    }
+
+    pub fn sealed_logs_count(self#) -> usize {
+        return self.sealed_logs.len()
+    }
+
+    pub fn get_sealed_log(self#, index: usize) -> SealedLogMetadata {
+        return self.sealed_logs.get(index).clone()
+    }
+
+    pub fn next_file_number(self#) -> u64 {
+        return self.next_file_number
+    }
+
+    pub fn manifest_seq(self#) -> u64 {
+        return self.manifest_seq
+    }
+
+    pub fn last_persisted_seq(self#) -> u64 {
+        return self.last_persisted_seq
+    }
+
+    /// Opens existing Manifest or initializes a new one.
+    pub fn open_or_create(db_dir: string) -> Result<VersionSet, KvError> {
+        auto manifest_path = build_manifest_path(db_dir.clone())
+        auto reader_res = ReadDataFile::open(manifest_path.clone())
+
+        if reader_res.is_err() {
+            auto err = reader_res.unwrap_err()
+            if err.code() == 2:i32 { // ENOENT
+                // Create fresh Manifest with 8-byte magic header (TOKAMNF2)
+                auto wal_res = WalFile::open(manifest_path.clone())
+                if wal_res.is_err() {
+                    return Result<VersionSet, KvError>::Err(KvError::io(wal_res.unwrap_err()))
+                }
+                auto wal# = wal_res.unwrap()
+                auto hdr# = encode_manifest_header()
+                auto w_res = wal#.write_all_at(cede hdr, 0:u64)
+                if w_res.is_err() {
+                    auto w_err = w_res.unwrap_err()
+                    return Result<VersionSet, KvError>::Err(KvError::io(w_err.error))
+                }
+                auto s_res = wal#.sync_all()
+                if s_res.is_err() {
+                    return Result<VersionSet, KvError>::Err(KvError::io(s_res.unwrap_err()))
+                }
+                auto d_sync = sync_directory(db_dir.clone())
+                if d_sync.is_err() {
+                    return Result<VersionSet, KvError>::Err(KvError::io(d_sync.unwrap_err()))
+                }
+
+                return Result<VersionSet, KvError>::Ok(VersionSet(
+                    db_dir = db_dir.clone(),
+                    manifest_file = cede wal,
+                    current_version = Version::empty(),
+                    active_log = ActiveLogMetadata::new(1:u64, 1:u64),
+                    sealed_logs = Vec<SealedLogMetadata>::new(),
+                    next_file_number = 2:u64,
+                    manifest_seq = 0:u64,
+                    last_persisted_seq = 0:u64,
+                    manifest_end_offset = 8:u64
+                ))
+            }
+            return Result<VersionSet, KvError>::Err(KvError::io(err))
+        }
+
+        auto reader = reader_res.unwrap()
+        auto size_res = reader.size()
+        if size_res.is_err() {
+            return Result<VersionSet, KvError>::Err(KvError::io(size_res.unwrap_err()))
+        }
+        auto f_size = size_res.unwrap()
+
+        if f_size < 8:u64 {
+            // Incomplete header -> truncate and reinitialize
+            auto wal_res = WalFile::open(manifest_path.clone())
+            if wal_res.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(wal_res.unwrap_err()))
+            }
+            auto wal# = wal_res.unwrap()
+            auto t_res = wal#.truncate(0:u64)
+            if t_res.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(t_res.unwrap_err()))
+            }
+            auto hdr# = encode_manifest_header()
+            auto w_res = wal#.write_all_at(cede hdr, 0:u64)
+            if w_res.is_err() {
+                auto w_err = w_res.unwrap_err()
+                return Result<VersionSet, KvError>::Err(KvError::io(w_err.error))
+            }
+            auto s_res = wal#.sync_all()
+            if s_res.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(s_res.unwrap_err()))
+            }
+
+            return Result<VersionSet, KvError>::Ok(VersionSet(
+                db_dir = db_dir.clone(),
+                manifest_file = cede wal,
+                current_version = Version::empty(),
+                active_log = ActiveLogMetadata::new(1:u64, 1:u64),
+                sealed_logs = Vec<SealedLogMetadata>::new(),
+                next_file_number = 2:u64,
+                manifest_seq = 0:u64,
+                last_persisted_seq = 0:u64,
+                manifest_end_offset = 8:u64
+            ))
+        }
+
+        // Validate 8-byte magic header
+        auto hdr_buf# = Vec<u8>::with_capacity(8:usize)
+        auto hdr_read = reader.read_at(cede hdr_buf, 0:u64, 8:usize)
+        if hdr_read.is_err() {
+            return Result<VersionSet, KvError>::Err(KvError::io(hdr_read.unwrap_err().error))
+        }
+        auto hdr_bytes = hdr_read.unwrap().take_buffer()
+        auto v_res = validate_manifest_header(hdr_bytes)
+        if v_res.is_err() {
+            return Result<VersionSet, KvError>::Err(v_res.unwrap_err())
+        }
+        auto manifest_version = v_res.unwrap()
+
+        // Replay Manifest records starting at offset 8
+        auto offset# = 8:u64
+        auto active_tables# = Vec<TableMetadata>::new()
+        auto active_next_file_number# = 1:u64
+        auto active_manifest_seq# = 0:u64
+        auto active_last_persisted_seq# = 0:u64
+        auto active_active_log# = ActiveLogMetadata::new(1:u64, 1:u64)
+        auto active_sealed_logs# = Vec<SealedLogMetadata>::new()
+        auto had_torn_tail# = false
+
+        loop offset < f_size {
+            auto remaining = f_size - offset
+            if remaining < 8:u64 {
+                // Incomplete frame header at EOF -> safe torn tail
+                had_torn_tail = true
+                break
+            }
+
+            auto frame_hdr_buf# = Vec<u8>::with_capacity(8:usize)
+            auto f_read = reader.read_at(cede frame_hdr_buf, offset, 8:usize)
+            if f_read.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(f_read.unwrap_err().error))
+            }
+            auto f_hdr = f_read.unwrap().take_buffer()
+            auto expected_crc = get_u32_le(f_hdr, 0:usize)
+            auto payload_len = get_u32_le(f_hdr, 4:usize) as usize
+
+            if payload_len > MAX_MANIFEST_RECORD_SIZE {
+                if offset + 8:u64 + (payload_len as u64) > f_size {
+                    had_torn_tail = true
+                    break
+                }
+                return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_payload_len_corrupted"))
+            }
+
+            if remaining < 8:u64 + (payload_len as u64) {
+                // Incomplete payload at EOF -> safe torn tail
+                had_torn_tail = true
+                break
+            }
+
+            auto payload_buf# = Vec<u8>::with_capacity(payload_len)
+            auto p_read = reader.read_at(cede payload_buf, offset + 8:u64, payload_len)
+            if p_read.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(p_read.unwrap_err().error))
+            }
+            auto payload = p_read.unwrap().take_buffer()
+            auto actual_crc = crc32_ieee(payload, 0:usize, payload_len)
+            if actual_crc != expected_crc {
+                // Complete frame present on disk, but CRC does not match -> ALWAYS FAIL-CLOSED!
+                return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_crc_mismatch"))
+            }
+
+            // Decode payload
+            if payload_len == 0:usize {
+                return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_empty_record"))
+            }
+            auto tag = payload.get(0:usize)
+
+            if tag == TAG_ALLOC_NUM {
+                if payload_len < 17:usize {
+                    return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_alloc_num_short"))
+                }
+                auto v_seq = get_u64_le(payload, 1:usize)
+                auto next_num = get_u64_le(payload, 9:usize)
+
+                if v_seq != active_manifest_seq + 1:u64 {
+                    return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_version_sequence"))
+                }
+                active_manifest_seq = v_seq
+                if next_num > active_next_file_number {
+                    active_next_file_number = next_num
+                }
+            } else if tag == TAG_VERSION_BATCH {
+                if manifest_version == 1:u32 {
+                    // Legacy TOKAMNF1 format
+                    if payload_len < 29:usize {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_version_batch_short"))
+                    }
+                    auto v_seq = get_u64_le(payload, 1:usize)
+                    auto next_num = get_u64_le(payload, 9:usize)
+                    auto last_p_seq = get_u64_le(payload, 17:usize)
+
+                    if v_seq != active_manifest_seq + 1:u64 {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_version_sequence"))
+                    }
+                    if last_p_seq < active_last_persisted_seq {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_last_persisted_seq"))
+                    }
+                    active_manifest_seq = v_seq
+                    if next_num > active_next_file_number {
+                        active_next_file_number = next_num
+                    }
+                    active_last_persisted_seq = last_p_seq
+
+                    auto add_count = get_u32_le(payload, 25:usize) as usize
+                    auto cursor# = 29:usize
+
+                    auto a# = 0:usize
+                    loop a < add_count {
+                        if cursor + 32:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_table_hdr"))
+                        }
+                        auto f_num = get_u64_le(payload, cursor)
+                        auto f_size_meta = get_u64_le(payload, cursor + 8:usize)
+                        auto min_s = get_u64_le(payload, cursor + 16:usize)
+                        auto max_s = get_u64_le(payload, cursor + 24:usize)
+                        cursor = cursor + 32:usize
+
+                        if cursor + 4:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sk_len"))
+                        }
+                        auto sk_len = get_u32_le(payload, cursor) as usize
+                        cursor = cursor + 4:usize
+                        if cursor + sk_len > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sk_bytes"))
+                        }
+                        auto *sk_ptr = payload.unsafe_get(cursor)
+                        auto sk = string::from_raw(*sk_ptr, sk_len)
+                        cursor = cursor + sk_len
+
+                        if cursor + 4:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_lk_len"))
+                        }
+                        auto lk_len = get_u32_le(payload, cursor) as usize
+                        cursor = cursor + 4:usize
+                        if cursor + lk_len > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_lk_bytes"))
+                        }
+                        auto *lk_ptr = payload.unsafe_get(cursor)
+                        auto lk = string::from_raw(*lk_ptr, lk_len)
+                        cursor = cursor + lk_len
+
+                        if min_s == 0:u64 || min_s > max_s || max_s > active_last_persisted_seq {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("invalid_table_sequence_bounds"))
+                        }
+
+                        auto t_meta = TableMetadata::new_l0(
+                            f_num, f_size_meta, min_s, max_s, cede sk, cede lk
+                        )
+                        active_tables#.push(cede t_meta)
+                        a = a + 1:usize
+                    }
+
+                    if cursor + 4:usize > payload_len {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_del_count"))
+                    }
+                    auto del_count = get_u32_le(payload, cursor) as usize
+                    cursor = cursor + 4:usize
+
+                    auto d# = 0:usize
+                    loop d < del_count {
+                        if cursor + 8:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_del_num"))
+                        }
+                        auto del_fnum = get_u64_le(payload, cursor)
+                        cursor = cursor + 8:usize
+
+                        auto filtered# = Vec<TableMetadata>::new()
+                        auto t_idx# = 0:usize
+                        loop t_idx < active_tables.len() {
+                            unsafe {
+                                auto *cur_t = active_tables.unsafe_get(t_idx)
+                                if cur_t.file_number != del_fnum {
+                                    auto sk = cur_t.smallest_key.clone()
+                                    auto lk = cur_t.largest_key.clone()
+                                    auto cur_clone = TableMetadata::new(
+                                        cur_t.file_number, cur_t.file_size, cur_t.min_seq, cur_t.max_seq,
+                                        cede sk, cede lk, cur_t.level
+                                    )
+                                    filtered#.push(cede cur_clone)
+                                }
+                            }
+                            t_idx = t_idx + 1:usize
+                        }
+                        active_tables = cede filtered
+                        d = d + 1:usize
+                    }
+                } else if manifest_version == 2:u32 {
+                    // TOKAMNF2 format: includes active_log and sealed_logs, tables without level
+                    if payload_len < 45:usize {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_version_batch_short"))
+                    }
+                    auto v_seq = get_u64_le(payload, 1:usize)
+                    auto next_num = get_u64_le(payload, 9:usize)
+                    auto last_p_seq = get_u64_le(payload, 17:usize)
+                    auto act_num = get_u64_le(payload, 25:usize)
+                    auto act_first_seq = get_u64_le(payload, 33:usize)
+                    auto sealed_count = get_u32_le(payload, 41:usize) as usize
+                    auto cursor# = 45:usize
+
+                    if v_seq != active_manifest_seq + 1:u64 {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_version_sequence"))
+                    }
+                    if last_p_seq < active_last_persisted_seq {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_last_persisted_seq"))
+                    }
+                    active_manifest_seq = v_seq
+                    if next_num > active_next_file_number {
+                        active_next_file_number = next_num
+                    }
+                    active_last_persisted_seq = last_p_seq
+                    active_active_log = ActiveLogMetadata::new(act_num, act_first_seq)
+
+                    active_sealed_logs#.clear()
+                    auto s# = 0:usize
+                    loop s < sealed_count {
+                        if cursor + 24:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sealed_log"))
+                        }
+                        auto s_num = get_u64_le(payload, cursor)
+                        auto s_first = get_u64_le(payload, cursor + 8:usize)
+                        auto s_last = get_u64_le(payload, cursor + 16:usize)
+                        cursor = cursor + 24:usize
+                        active_sealed_logs#.push(SealedLogMetadata::new(s_num, s_first, s_last))
+                        s = s + 1:usize
+                    }
+
+                    if cursor + 4:usize > payload_len {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_add_count"))
+                    }
+                    auto add_count = get_u32_le(payload, cursor) as usize
+                    cursor = cursor + 4:usize
+
+                    auto a# = 0:usize
+                    loop a < add_count {
+                        if cursor + 32:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_table_hdr"))
+                        }
+                        auto f_num = get_u64_le(payload, cursor)
+                        auto f_size_meta = get_u64_le(payload, cursor + 8:usize)
+                        auto min_s = get_u64_le(payload, cursor + 16:usize)
+                        auto max_s = get_u64_le(payload, cursor + 24:usize)
+                        cursor = cursor + 32:usize
+
+                        if cursor + 4:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sk_len"))
+                        }
+                        auto sk_len = get_u32_le(payload, cursor) as usize
+                        cursor = cursor + 4:usize
+                        if cursor + sk_len > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sk_bytes"))
+                        }
+                        auto *sk_ptr = payload.unsafe_get(cursor)
+                        auto sk = string::from_raw(*sk_ptr, sk_len)
+                        cursor = cursor + sk_len
+
+                        if cursor + 4:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_lk_len"))
+                        }
+                        auto lk_len = get_u32_le(payload, cursor) as usize
+                        cursor = cursor + 4:usize
+                        if cursor + lk_len > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_lk_bytes"))
+                        }
+                        auto *lk_ptr = payload.unsafe_get(cursor)
+                        auto lk = string::from_raw(*lk_ptr, lk_len)
+                        cursor = cursor + lk_len
+
+                        if min_s == 0:u64 || min_s > max_s || max_s > active_last_persisted_seq {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("invalid_table_sequence_bounds"))
+                        }
+
+                        auto t_meta = TableMetadata::new_l0(
+                            f_num, f_size_meta, min_s, max_s, cede sk, cede lk
+                        )
+                        active_tables#.push(cede t_meta)
+                        a = a + 1:usize
+                    }
+
+                    if cursor + 4:usize > payload_len {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_del_count"))
+                    }
+                    auto del_count = get_u32_le(payload, cursor) as usize
+                    cursor = cursor + 4:usize
+
+                    auto d# = 0:usize
+                    loop d < del_count {
+                        if cursor + 8:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_del_num"))
+                        }
+                        auto del_fnum = get_u64_le(payload, cursor)
+                        cursor = cursor + 8:usize
+
+                        auto filtered# = Vec<TableMetadata>::new()
+                        auto t_idx# = 0:usize
+                        loop t_idx < active_tables.len() {
+                            unsafe {
+                                auto *cur_t = active_tables.unsafe_get(t_idx)
+                                if cur_t.file_number != del_fnum {
+                                    auto sk = cur_t.smallest_key.clone()
+                                    auto lk = cur_t.largest_key.clone()
+                                    auto cur_clone = TableMetadata::new(
+                                        cur_t.file_number, cur_t.file_size, cur_t.min_seq, cur_t.max_seq,
+                                        cede sk, cede lk, cur_t.level
+                                    )
+                                    filtered#.push(cede cur_clone)
+                                }
+                            }
+                            t_idx = t_idx + 1:usize
+                        }
+                        active_tables = cede filtered
+                        d = d + 1:usize
+                    }
+                } else {
+                    // TOKAMNF3 format: includes active_log, sealed_logs, and table level
+                    if payload_len < 45:usize {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_version_batch_short"))
+                    }
+                    auto v_seq = get_u64_le(payload, 1:usize)
+                    auto next_num = get_u64_le(payload, 9:usize)
+                    auto last_p_seq = get_u64_le(payload, 17:usize)
+                    auto act_num = get_u64_le(payload, 25:usize)
+                    auto act_first_seq = get_u64_le(payload, 33:usize)
+                    auto sealed_count = get_u32_le(payload, 41:usize) as usize
+                    auto cursor# = 45:usize
+
+                    if v_seq != active_manifest_seq + 1:u64 {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_version_sequence"))
+                    }
+                    if last_p_seq < active_last_persisted_seq {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("non_monotonic_last_persisted_seq"))
+                    }
+                    active_manifest_seq = v_seq
+                    if next_num > active_next_file_number {
+                        active_next_file_number = next_num
+                    }
+                    active_last_persisted_seq = last_p_seq
+                    active_active_log = ActiveLogMetadata::new(act_num, act_first_seq)
+
+                    active_sealed_logs#.clear()
+                    auto s# = 0:usize
+                    loop s < sealed_count {
+                        if cursor + 24:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sealed_log"))
+                        }
+                        auto s_num = get_u64_le(payload, cursor)
+                        auto s_first = get_u64_le(payload, cursor + 8:usize)
+                        auto s_last = get_u64_le(payload, cursor + 16:usize)
+                        cursor = cursor + 24:usize
+                        active_sealed_logs#.push(SealedLogMetadata::new(s_num, s_first, s_last))
+                        s = s + 1:usize
+                    }
+
+                    if cursor + 4:usize > payload_len {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_add_count"))
+                    }
+                    auto add_count = get_u32_le(payload, cursor) as usize
+                    cursor = cursor + 4:usize
+
+                    auto a# = 0:usize
+                    loop a < add_count {
+                        if cursor + 36:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_table_hdr"))
+                        }
+                        auto t_level = get_u32_le(payload, cursor)
+                        if t_level > 1:u32 {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
+                        }
+                        auto f_num = get_u64_le(payload, cursor + 4:usize)
+                        auto f_size_meta = get_u64_le(payload, cursor + 12:usize)
+                        auto min_s = get_u64_le(payload, cursor + 20:usize)
+                        auto max_s = get_u64_le(payload, cursor + 28:usize)
+                        cursor = cursor + 36:usize
+
+                        if cursor + 4:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sk_len"))
+                        }
+                        auto sk_len = get_u32_le(payload, cursor) as usize
+                        cursor = cursor + 4:usize
+                        if cursor + sk_len > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_sk_bytes"))
+                        }
+                        auto *sk_ptr = payload.unsafe_get(cursor)
+                        auto sk = string::from_raw(*sk_ptr, sk_len)
+                        cursor = cursor + sk_len
+
+                        if cursor + 4:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_lk_len"))
+                        }
+                        auto lk_len = get_u32_le(payload, cursor) as usize
+                        cursor = cursor + 4:usize
+                        if cursor + lk_len > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_lk_bytes"))
+                        }
+                        auto *lk_ptr = payload.unsafe_get(cursor)
+                        auto lk = string::from_raw(*lk_ptr, lk_len)
+                        cursor = cursor + lk_len
+
+                        if min_s == 0:u64 || min_s > max_s || max_s > active_last_persisted_seq {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("invalid_table_sequence_bounds"))
+                        }
+
+                        auto t_meta = TableMetadata::new(
+                            f_num, f_size_meta, min_s, max_s, cede sk, cede lk, t_level
+                        )
+                        active_tables#.push(cede t_meta)
+                        a = a + 1:usize
+                    }
+
+                    if cursor + 4:usize > payload_len {
+                        return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_del_count"))
+                    }
+                    auto del_count = get_u32_le(payload, cursor) as usize
+                    cursor = cursor + 4:usize
+
+                    auto d# = 0:usize
+                    loop d < del_count {
+                        if cursor + 8:usize > payload_len {
+                            return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_batch_truncated_del_num"))
+                        }
+                        auto del_fnum = get_u64_le(payload, cursor)
+                        cursor = cursor + 8:usize
+
+                        auto filtered# = Vec<TableMetadata>::new()
+                        auto t_idx# = 0:usize
+                        loop t_idx < active_tables.len() {
+                            unsafe {
+                                auto *cur_t = active_tables.unsafe_get(t_idx)
+                                if cur_t.file_number != del_fnum {
+                                    auto sk = cur_t.smallest_key.clone()
+                                    auto lk = cur_t.largest_key.clone()
+                                    auto cur_clone = TableMetadata::new(
+                                        cur_t.file_number, cur_t.file_size, cur_t.min_seq, cur_t.max_seq,
+                                        cede sk, cede lk, cur_t.level
+                                    )
+                                    filtered#.push(cede cur_clone)
+                                }
+                            }
+                            t_idx = t_idx + 1:usize
+                        }
+                        active_tables = cede filtered
+                        d = d + 1:usize
+                    }
+                }
+            } else {
+                return Result<VersionSet, KvError>::Err(KvError::corrupted("manifest_unknown_tag"))
+            }
+
+            offset = offset + 8:u64 + (payload_len as u64)
+        }
+
+        if manifest_version == 1:u32 {
+            // Migrate legacy TOKAMNF1 to TOKAMNF3
+            return migrate_v1_to_v2(
+                db_dir.clone(),
+                active_tables,
+                active_last_persisted_seq,
+                active_next_file_number,
+                active_manifest_seq
+            )
+        }
+        if manifest_version == 2:u32 {
+            // Migrate TOKAMNF2 to TOKAMNF3
+            return migrate_v2_to_v3(
+                db_dir.clone(),
+                active_tables,
+                active_last_persisted_seq,
+                active_next_file_number,
+                active_manifest_seq,
+                active_active_log,
+                active_sealed_logs
+            )
+        }
+
+        // Open TableHandles for recovered Version
+        auto handles# = Vec<TableHandle>::new()
+        auto t_i# = 0:usize
+        loop t_i < active_tables.len() {
+            unsafe {
+                auto *t_meta_ptr = active_tables.unsafe_get(t_i)
+                auto t_path = build_table_path(db_dir.clone(), t_meta_ptr.file_number)
+                auto r_res = SSTableReader::open(t_path)
+                if r_res.is_err() {
+                    return Result<VersionSet, KvError>::Err(r_res.unwrap_err())
+                }
+                auto r_reader# = r_res.unwrap()
+                r_reader#.set_file_number(t_meta_ptr.file_number)
+                auto sk = t_meta_ptr.smallest_key.clone()
+                auto lk = t_meta_ptr.largest_key.clone()
+                auto meta = TableMetadata::new(
+                    t_meta_ptr.file_number, t_meta_ptr.file_size, t_meta_ptr.min_seq, t_meta_ptr.max_seq,
+                    cede sk, cede lk, t_meta_ptr.level
+                )
+                auto handle = TableHandle::new(cede meta, cede r_reader)
+                handles#.push(cede handle)
+            }
+            t_i = t_i + 1:usize
+        }
+
+        auto rec_version = Version::new(cede handles, active_manifest_seq)
+        auto v_inv = rec_version.validate_invariants()
+        if v_inv.is_err() {
+            return Result<VersionSet, KvError>::Err(v_inv.unwrap_err())
+        }
+
+        auto wal_res = WalFile::open(manifest_path.clone())
+        if wal_res.is_err() {
+            return Result<VersionSet, KvError>::Err(KvError::io(wal_res.unwrap_err()))
+        }
+        auto wal# = wal_res.unwrap()
+
+        if had_torn_tail {
+            auto trunc_res = wal#.truncate(offset)
+            if trunc_res.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(trunc_res.unwrap_err()))
+            }
+            auto sync_res = wal#.sync_all()
+            if sync_res.is_err() {
+                return Result<VersionSet, KvError>::Err(KvError::io(sync_res.unwrap_err()))
+            }
+        }
+
+        return Result<VersionSet, KvError>::Ok(VersionSet(
+            db_dir = db_dir.clone(),
+            manifest_file = cede wal,
+            current_version = cede rec_version,
+            active_log = active_active_log,
+            sealed_logs = cede active_sealed_logs,
+            next_file_number = active_next_file_number,
+            manifest_seq = active_manifest_seq,
+            last_persisted_seq = active_last_persisted_seq,
+            manifest_end_offset = offset
+        ))
+    }
+
+    /// Durably commits a file number allocation to the Manifest.
+    pub fn durable_allocate_file_number(self#) -> Result<u64, KvError> {
+        auto allocated_number = self.next_file_number
+        auto next_version_seq = self.manifest_seq + 1:u64
+        auto updated_next_file_number = allocated_number + 1:u64
+
+        auto payload# = encode_alloc_num_payload(next_version_seq, updated_next_file_number)
+        auto frame_res = frame_manifest_payload(payload)
+        if frame_res.is_err() {
+            return Result<u64, KvError>::Err(frame_res.unwrap_err())
+        }
+        auto frame# = frame_res.unwrap()
+        auto frame_len = frame.len() as u64
+
+        auto w_res = self.manifest_file#.write_all_at(cede frame, self.manifest_end_offset)
+        if w_res.is_err() {
+            auto w_err = w_res.unwrap_err()
+            return Result<u64, KvError>::Err(KvError::io(w_err.error))
+        }
+
+        auto s_res = self.manifest_file#.sync_all()
+        if s_res.is_err() {
+            return Result<u64, KvError>::Err(KvError::io(s_res.unwrap_err()))
+        }
+
+        self.manifest_end_offset = self.manifest_end_offset + frame_len
+        self.manifest_seq = next_version_seq
+        self.next_file_number = updated_next_file_number
+
+        return Result<u64, KvError>::Ok(allocated_number)
+    }
+
+    /// Durably logs and applies an atomic VersionEdit batch to the Manifest and in-memory Version.
+    pub fn log_and_apply(self#, edit: cede VersionEdit) -> Result<(), KvError> {
+        auto next_version_seq = self.manifest_seq + 1:u64
+        auto edit_with_seq# = cede edit
+        auto last_p_seq = edit_with_seq.last_persisted_seq
+
+        if last_p_seq < self.last_persisted_seq {
+            return Result<(), KvError>::Err(KvError::corrupted("non_monotonic_last_persisted_seq"))
+        }
+
+        // Validate table sequence ranges
+        auto v_idx# = 0:usize
+        loop v_idx < edit_with_seq.add_tables.len() {
+            unsafe {
+                auto *meta_ptr = edit_with_seq.add_tables.unsafe_get(v_idx)
+                if meta_ptr.min_seq == 0:u64 || meta_ptr.min_seq > meta_ptr.max_seq || meta_ptr.max_seq > last_p_seq {
+                    return Result<(), KvError>::Err(KvError::corrupted("invalid_table_sequence_bounds"))
+                }
+            }
+            v_idx = v_idx + 1:usize
+        }
+
+        edit_with_seq.version_seq = next_version_seq
+        edit_with_seq.next_file_number = self.next_file_number
+
+        // Active log resolution:
+        auto act_num# = self.active_log.log_number
+        auto act_first# = self.active_log.first_seq
+        if edit_with_seq.has_active_log {
+            act_num = edit_with_seq.active_log_num
+            act_first = edit_with_seq.active_log_first_seq
+        }
+
+        // Sealed logs resolution:
+        auto out_sealed# = Vec<SealedLogMetadata>::new()
+        if edit_with_seq.has_custom_sealed_logs {
+            auto s_i# = 0:usize
+            loop s_i < edit_with_seq.sealed_logs.len() {
+                auto item = edit_with_seq.sealed_logs.get(s_i)
+                out_sealed#.push(item.clone())
+                s_i = s_i + 1:usize
+            }
+        } else {
+            auto s_i# = 0:usize
+            loop s_i < self.sealed_logs.len() {
+                auto item = self.sealed_logs.get(s_i)
+                out_sealed#.push(item.clone())
+                s_i = s_i + 1:usize
+            }
+        }
+
+        // Encode payload (TOKAMNF2 format)
+        auto payload# = Vec<u8>::with_capacity(256:usize)
+        payload#.push(TAG_VERSION_BATCH)
+        put_u64_le(payload#, edit_with_seq.version_seq)
+        put_u64_le(payload#, edit_with_seq.next_file_number)
+        put_u64_le(payload#, edit_with_seq.last_persisted_seq)
+
+        // Active log metadata:
+        put_u64_le(payload#, act_num)
+        put_u64_le(payload#, act_first)
+
+        // Sealed logs:
+        put_u32_le(payload#, out_sealed.len() as u32)
+        auto s_idx# = 0:usize
+        loop s_idx < out_sealed.len() {
+            auto item = out_sealed.get(s_idx)
+            put_u64_le(payload#, item.log_number)
+            put_u64_le(payload#, item.first_seq)
+            put_u64_le(payload#, item.last_seq)
+            s_idx = s_idx + 1:usize
+        }
+
+        put_u32_le(payload#, edit_with_seq.add_tables.len() as u32)
+        auto i# = 0:usize
+        loop i < edit_with_seq.add_tables.len() {
+            unsafe {
+                auto *t = edit_with_seq.add_tables.unsafe_get(i)
+                put_u32_le(payload#, t.level)
+                put_u64_le(payload#, t.file_number)
+                put_u64_le(payload#, t.file_size)
+                put_u64_le(payload#, t.min_seq)
+                put_u64_le(payload#, t.max_seq)
+
+                // Smallest key
+                auto sk_len = t.smallest_key.len()
+                put_u32_le(payload#, sk_len as u32)
+                if sk_len > 0:usize {
+                    auto *sk_bytes = (t.smallest_key.c_str() as usize) as *[u8]
+                    auto sk_idx# = 0:usize
+                    loop sk_idx < sk_len {
+                        payload#.push(sk_bytes[sk_idx])
+                        sk_idx = sk_idx + 1:usize
+                    }
+                }
+
+                // Largest key
+                auto lk_len = t.largest_key.len()
+                put_u32_le(payload#, lk_len as u32)
+                if lk_len > 0:usize {
+                    auto *lk_bytes = (t.largest_key.c_str() as usize) as *[u8]
+                    auto lk_idx# = 0:usize
+                    loop lk_idx < lk_len {
+                        payload#.push(lk_bytes[lk_idx])
+                        lk_idx = lk_idx + 1:usize
+                    }
+                }
+            }
+            i = i + 1:usize
+        }
+
+        put_u32_le(payload#, edit_with_seq.deleted_tables.len() as u32)
+        auto d# = 0:usize
+        loop d < edit_with_seq.deleted_tables.len() {
+            put_u64_le(payload#, edit_with_seq.deleted_tables.get(d))
+            d = d + 1:usize
+        }
+
+        auto frame_res = frame_manifest_payload(payload)
+        if frame_res.is_err() {
+            return Result<(), KvError>::Err(frame_res.unwrap_err())
+        }
+        auto frame# = frame_res.unwrap()
+        auto frame_len = frame.len() as u64
+
+        // 1. Durably append to Manifest log
+        auto w_res = self.manifest_file#.write_all_at(cede frame, self.manifest_end_offset)
+        if w_res.is_err() {
+            auto w_err = w_res.unwrap_err()
+            return Result<(), KvError>::Err(KvError::io(w_err.error))
+        }
+
+        auto s_res = self.manifest_file#.sync_all()
+        if s_res.is_err() {
+            return Result<(), KvError>::Err(KvError::io(s_res.unwrap_err()))
+        }
+
+        self.manifest_end_offset = self.manifest_end_offset + frame_len
+        self.manifest_seq = next_version_seq
+        self.last_persisted_seq = last_p_seq
+        self.active_log = ActiveLogMetadata::new(act_num, act_first)
+        self.sealed_logs = cede out_sealed
+
+        // 2. Open readers for newly added tables and build new Version
+        auto new_handles# = Vec<TableHandle>::new()
+        auto cur_count = self.current_version.tables_count()
+        auto c_i# = 0:usize
+        loop c_i < cur_count {
+            auto h = self.current_version.get_table(c_i)
+            // Check if deleted
+            auto is_deleted# = false
+            auto del_i# = 0:usize
+            loop del_i < edit_with_seq.deleted_tables.len() {
+                if edit_with_seq.deleted_tables.get(del_i) == h.meta.file_number {
+                    is_deleted = true
+                    break
+                }
+                del_i = del_i + 1:usize
+            }
+            if !is_deleted {
+                new_handles#.push(cede h)
+            }
+            c_i = c_i + 1:usize
+        }
+
+        auto a# = 0:usize
+        loop a < edit_with_seq.add_tables.len() {
+            unsafe {
+                auto *add_ptr = edit_with_seq.add_tables.unsafe_get(a)
+                auto t_path = build_table_path(self.db_dir.clone(), add_ptr.file_number)
+                auto r_res = SSTableReader::open(t_path)
+                if r_res.is_err() {
+                    return Result<(), KvError>::Err(r_res.unwrap_err())
+                }
+                auto r_reader# = r_res.unwrap()
+                r_reader#.set_file_number(add_ptr.file_number)
+                auto sk = add_ptr.smallest_key.clone()
+                auto lk = add_ptr.largest_key.clone()
+                auto meta = TableMetadata::new(
+                    add_ptr.file_number, add_ptr.file_size, add_ptr.min_seq, add_ptr.max_seq,
+                    cede sk, cede lk, add_ptr.level
+                )
+                auto handle = TableHandle::new(cede meta, cede r_reader)
+                new_handles#.push(cede handle)
+            }
+            a = a + 1:usize
+        }
+
+        auto next_ver = Version::new(cede new_handles, next_version_seq)
+        auto v_inv = next_ver.validate_invariants()
+        if v_inv.is_err() {
+            return Result<(), KvError>::Err(v_inv.unwrap_err())
+        }
+
+        self.current_version = cede next_ver
+        return Result<(), KvError>::Ok(())
+    }
+
+    pub fn current(self) -> Version {
+        return self.current_version.clone()
+    }
+
+    pub fn last_persisted_seq(self) -> u64 {
+        return self.last_persisted_seq
+    }
+
+    pub fn next_file_number(self) -> u64 {
+        return self.next_file_number
+    }
+
+    pub fn manifest_seq(self) -> u64 {
+        return self.manifest_seq
+    }
+
+    pub fn get_with_cache(self, key: string, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+        return self.current_version.get_with_cache(key, cache_opt)
+    }
+
+    pub fn close(self#) -> Result<(), KvError> {
+        auto res = self.manifest_file#.close()
+        if res.is_err() {
+            return Result<(), KvError>::Err(KvError::io(res.unwrap_err()))
+        }
+        return Result<(), KvError>::Ok(())
+    }
+}

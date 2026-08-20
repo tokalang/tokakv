@@ -1,0 +1,132 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/l0_to_l1_overlap_and_untouched_l1_v1.tk
+// Verification of L0/L1 overlap selection and preserving untouched adjacent L1 tables.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Create L1 table left (keys a0..a9)
+    auto i# = 0:usize
+    loop i < 10:usize {
+        auto k# = string::from("a_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("val_a_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+    db#.compact_l0().unwrap()
+
+    // 2. Create L1 table right (keys z0..z9)
+    auto j# = 0:usize
+    loop j < 10:usize {
+        auto k# = string::from("z_")
+        k#.push_str(string::from_int(j as i32).as_str())
+        auto v# = string::from("val_z_")
+        v#.push_str(string::from_int(j as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        j = j + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+    db#.compact_l0().unwrap()
+
+    // 3. Create L1 table mid (keys m0..m9)
+    auto k_idx# = 0:usize
+    loop k_idx < 10:usize {
+        auto k# = string::from("m_")
+        k#.push_str(string::from_int(k_idx as i32).as_str())
+        auto v# = string::from("val_m_")
+        v#.push_str(string::from_int(k_idx as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        k_idx = k_idx + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+    db#.compact_l0().unwrap()
+
+    // Verify we have 3 L1 tables (a_, m_, z_)
+    auto v3 = db#.current_version()
+    assert(v3.tables_count() == 3:usize, "must have 3 L1 tables initially")
+
+    // 4. Write new L0 table spanning m5..m9 and n0..n4 (overlapping only mid L1 table)
+    auto o# = 5:usize
+    loop o < 10:usize {
+        auto k# = string::from("m_")
+        k#.push_str(string::from_int(o as i32).as_str())
+        auto v# = string::from("val_m_updated_")
+        v#.push_str(string::from_int(o as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        o = o + 1:usize
+    }
+    auto n# = 0:usize
+    loop n < 5:usize {
+        auto k# = string::from("n_")
+        k#.push_str(string::from_int(n as i32).as_str())
+        auto v# = string::from("val_n_")
+        v#.push_str(string::from_int(n as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+        n = n + 1:usize
+    }
+    db#.flush_active_memtable().unwrap()
+
+    // 5. Trigger compaction: must merge L0 with m_ table, leaving a_ and z_ untouched!
+    db#.compact_l0().unwrap()
+
+    // 6. Verify version state and global L1 ordering
+    auto v_final = db#.current_version()
+    assert(v_final.tables_count() >= 3:usize, "must have at least 3 L1 tables after compaction")
+
+    auto prev_lk# = string::new()
+    auto has_p# = false
+    auto t_i# = 0:usize
+    loop t_i < v_final.tables_count() {
+        auto tbl = v_final.get_table(t_i)
+        assert(tbl.meta.level == 1:u32, "all tables must be in level 1")
+        if has_p {
+            assert(prev_lk.as_str().cmp(tbl.meta.smallest_key.as_str()) < 0:i32, "L1 tables must be strictly sorted and disjoint")
+        }
+        has_p = true
+        prev_lk = tbl.meta.largest_key.clone()
+        t_i = t_i + 1:usize
+    }
+
+    // 7. Verify all reads
+    // Left untouched table (a_)
+    auto r_a = db#.get(string::from("a_0")).unwrap()
+    assert(r_a.is_some(), "a_0 must exist")
+    assert(r_a.unwrap().as_str().equals("val_a_0"), "val_a_0 correct")
+
+    // Merged table (m_ non-updated)
+    auto r_m0 = db#.get(string::from("m_0")).unwrap()
+    assert(r_m0.is_some(), "m_0 must exist")
+    assert(r_m0.unwrap().as_str().equals("val_m_0"), "val_m_0 correct")
+
+    // Merged table (m_ updated)
+    auto r_m5 = db#.get(string::from("m_5")).unwrap()
+    assert(r_m5.is_some(), "m_5 must exist")
+    assert(r_m5.unwrap().as_str().equals("val_m_updated_5"), "val_m_updated_5 correct")
+
+    // Merged table (new n_)
+    auto r_n0 = db#.get(string::from("n_0")).unwrap()
+    assert(r_n0.is_some(), "n_0 must exist")
+    assert(r_n0.unwrap().as_str().equals("val_n_0"), "val_n_0 correct")
+
+    // Right untouched table (z_)
+    auto r_z9 = db#.get(string::from("z_9")).unwrap()
+    assert(r_z9.is_some(), "z_9 must exist")
+    assert(r_z9.unwrap().as_str().equals("val_z_9"), "val_z_9 correct")
+
+    db#.close().unwrap()
+    tmp#.remove()
+
+    println("[TokaKV] l0_to_l1_overlap_and_untouched_l1_v1 PASSED!")
+    return 0
+}

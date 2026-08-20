@@ -1,0 +1,12 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_snapshot_registry_cannot_acquire_lease.tk
+// Compile-fail diagnostic test: external callers cannot invoke acquire_lease on SnapshotRegistry.
+
+import official/tokakv::{SnapshotRegistry}
+
+fn main() -> i32 {
+    auto reg# = SnapshotRegistry::new(1:u64)
+    // Direct attempt to invoke non-existent / private acquire_lease must fail compilation with E04551
+    auto lease = reg#.acquire_lease(1:u64, 1:u64)
+    return 0
+}

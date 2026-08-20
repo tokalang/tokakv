@@ -1,0 +1,83 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/snapshot_lease_raii_v1.tk
+// Verification of RAII SnapshotLease auto-deregistration, oldest snapshot tracking,
+// and cross-engine lease isolation.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp1# = create_temp_file_system().unwrap()
+    auto db1_path# = tmp1.path().clone()
+    db1_path#.push_str("_db1")
+
+    auto tmp2# = create_temp_file_system().unwrap()
+    auto db2_path# = tmp2.path().clone()
+    db2_path#.push_str("_db2")
+
+    auto db1# = TokaKvEngine::open(db1_path.clone()).unwrap()
+    auto db2# = TokaKvEngine::open(db2_path.clone()).unwrap()
+
+    // Before any snapshot: oldest_live_snapshot_seq must be None
+    assert(db1#.oldest_live_snapshot_seq().unwrap().is_none(), "oldest snapshot seq must be None initially")
+
+    // 1. Write initial data to DB1
+    db1#.put(string::from("k1"), string::from("v1_seq1")).unwrap()
+    db1#.put(string::from("k1"), string::from("v1_seq2")).unwrap()
+    db1#.put(string::from("k1"), string::from("v1_seq3")).unwrap()
+
+    // Write initial data to DB2
+    db2#.put(string::from("k1"), string::from("v2_seq1")).unwrap()
+
+    // Acquire snapshot on DB2
+    auto s_db2 = db2#.acquire_snapshot().unwrap()
+
+    // 2. Cross-engine lease verification: querying DB1 with DB2's lease MUST fail closed!
+    auto cross_res = db1#.get_at_snapshot(string::from("k1"), s_db2)
+    assert(cross_res.is_err(), "Cross-engine snapshot lookup MUST fail")
+
+    // 3. Oldest live snapshot tracking in DB1
+    auto s1# = db1#.acquire_snapshot().unwrap()
+    assert(s1.sequence() == 3:u64, "s1 seq must be 3")
+    assert(db1#.oldest_live_snapshot_seq().unwrap().unwrap() == 3:u64, "oldest snapshot seq must be 3")
+
+    // More writes in DB1
+    db1#.put(string::from("k1"), string::from("v1_seq4")).unwrap()
+    db1#.put(string::from("k1"), string::from("v1_seq5")).unwrap()
+
+    auto s2# = db1#.acquire_snapshot().unwrap()
+    assert(s2.sequence() == 5:u64, "s2 seq must be 5")
+    assert(db1#.oldest_live_snapshot_seq().unwrap().unwrap() == 3:u64, "oldest snapshot seq must still be pinned by s1 at 3")
+
+    // 4. Test RAII drop of s1: when s1 drops, oldest snapshot advances to s2 (5)
+    {
+        auto s1_moved = cede s1
+        // s1_moved drops here
+    }
+
+    assert(db1#.oldest_live_snapshot_seq().unwrap().unwrap() == 5:u64, "oldest snapshot seq must advance to 5 after s1 dropped")
+
+    // Multiple queries on the same s2 lease to verify non-destructive borrowing semantics
+    auto q_i# = 0:usize
+    loop q_i < 5:usize {
+        auto r_s2 = db1#.get_at_snapshot(string::from("k1"), s2).unwrap()
+        assert(r_s2.is_some(), "s2 lookup must succeed repeatedly")
+        assert(r_s2.unwrap().as_str().equals("v1_seq5"), "s2 must see seq5 value")
+        q_i = q_i + 1:usize
+    }
+
+    // Drop s2
+    {
+        auto s2_moved = cede s2
+    }
+    assert(db1#.oldest_live_snapshot_seq().unwrap().is_none(), "oldest snapshot seq must be None after all leases drop")
+
+    db1#.close().unwrap()
+    db2#.close().unwrap()
+    tmp1#.remove()
+    tmp2#.remove()
+
+    println("[TokaKV] snapshot_lease_raii_v1 PASSED!")
+    return 0
+}

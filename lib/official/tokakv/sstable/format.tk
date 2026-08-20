@@ -1,0 +1,194 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/sstable/format.tk
+// Binary format constants, IndexEntry, and Footer codec for SSTable v1.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import std/vec::{Vec}
+import official/tokakv/crc32::{crc32_ieee}
+import official/tokakv/types::{KvError}
+
+pub const FOOTER_SIZE: usize = 48:usize
+pub const DEFAULT_BLOCK_SIZE: usize = 4096:usize
+pub const MAX_BLOCK_SIZE: usize = 65536:usize
+
+pub shape IndexEntry (
+    last_key: string,
+    offset: u64,
+    length: u64
+)
+
+impl IndexEntry {
+    pub fn new(cede last_key: string, offset: u64, length: u64) -> IndexEntry {
+        return IndexEntry(
+            last_key = cede last_key,
+            offset = offset,
+            length = length
+        )
+    }
+
+    pub fn clone(self) -> IndexEntry {
+        auto k = self.last_key.clone()
+        return IndexEntry(
+            last_key = cede k,
+            offset = self.offset,
+            length = self.length
+        )
+    }
+}
+
+impl IndexEntry@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}
+
+pub shape Footer (
+    index_offset: u64,
+    index_length: u64,
+    min_seq: u64,
+    max_seq: u64
+)
+
+impl Footer {
+    pub fn new(index_offset: u64, index_length: u64, min_seq: u64, max_seq: u64) -> Footer {
+        return Footer(
+            index_offset = index_offset,
+            index_length = index_length,
+            min_seq = min_seq,
+            max_seq = max_seq
+        )
+    }
+}
+
+pub fn put_u32_le(buf#: Vec<u8>, val: u32) {
+    buf#.push((val & 0xFF:u32) as u8)
+    buf#.push(((val >> 8:u32) & 0xFF:u32) as u8)
+    buf#.push(((val >> 16:u32) & 0xFF:u32) as u8)
+    buf#.push(((val >> 24:u32) & 0xFF:u32) as u8)
+}
+
+pub fn put_u64_le(buf#: Vec<u8>, val: u64) {
+    buf#.push((val & 0xFF:u64) as u8)
+    buf#.push(((val >> 8:u64) & 0xFF:u64) as u8)
+    buf#.push(((val >> 16:u64) & 0xFF:u64) as u8)
+    buf#.push(((val >> 24:u64) & 0xFF:u64) as u8)
+    buf#.push(((val >> 32:u64) & 0xFF:u64) as u8)
+    buf#.push(((val >> 40:u64) & 0xFF:u64) as u8)
+    buf#.push(((val >> 48:u64) & 0xFF:u64) as u8)
+    buf#.push(((val >> 56:u64) & 0xFF:u64) as u8)
+}
+
+pub fn get_u32_le(buf: Vec<u8>, offset: usize) -> u32 {
+    auto b0 = buf.get(offset) as u32
+    auto b1 = buf.get(offset + 1:usize) as u32
+    auto b2 = buf.get(offset + 2:usize) as u32
+    auto b3 = buf.get(offset + 3:usize) as u32
+    return b0 | (b1 << 8:u32) | (b2 << 16:u32) | (b3 << 24:u32)
+}
+
+pub fn get_u64_le(buf: Vec<u8>, offset: usize) -> u64 {
+    auto b0 = buf.get(offset) as u64
+    auto b1 = buf.get(offset + 1:usize) as u64
+    auto b2 = buf.get(offset + 2:usize) as u64
+    auto b3 = buf.get(offset + 3:usize) as u64
+    auto b4 = buf.get(offset + 4:usize) as u64
+    auto b5 = buf.get(offset + 5:usize) as u64
+    auto b6 = buf.get(offset + 6:usize) as u64
+    auto b7 = buf.get(offset + 7:usize) as u64
+    return b0 | (b1 << 8:u64) | (b2 << 16:u64) | (b3 << 24:u64) |
+           (b4 << 32:u64) | (b5 << 40:u64) | (b6 << 48:u64) | (b7 << 56:u64)
+}
+
+/// Encodes Footer into exact 48 bytes with raw ASCII "TOKASST1" magic and CRC32.
+pub fn encode_footer(footer: Footer) -> Vec<u8> {
+    auto buf# = Vec<u8>::with_capacity(48:usize)
+    // Bytes 0..7: IndexBlockOffset
+    put_u64_le(buf#, footer.index_offset)
+    // Bytes 8..15: IndexBlockLength
+    put_u64_le(buf#, footer.index_length)
+    // Bytes 16..23: MinSeq
+    put_u64_le(buf#, footer.min_seq)
+    // Bytes 24..31: MaxSeq
+    put_u64_le(buf#, footer.max_seq)
+    // Bytes 32..39: Magic raw ASCII "TOKASST1"
+    buf#.push(0x54:u8) // 'T'
+    buf#.push(0x4F:u8) // 'O'
+    buf#.push(0x4B:u8) // 'K'
+    buf#.push(0x41:u8) // 'A'
+    buf#.push(0x53:u8) // 'S'
+    buf#.push(0x53:u8) // 'S'
+    buf#.push(0x54:u8) // 'T'
+    buf#.push(0x31:u8) // '1'
+
+    // Bytes 40..43: CRC32 covering bytes 0..39
+    auto crc = crc32_ieee(buf, 0:usize, 40:usize)
+    put_u32_le(buf#, crc)
+
+    // Bytes 44..47: Reserved (strictly 0)
+    put_u32_le(buf#, 0:u32)
+
+    return cede buf
+}
+
+/// Validates and decodes 48-byte Footer buffer with checked arithmetic and range gates.
+pub fn decode_and_validate_footer(buf: Vec<u8>, file_size: u64) -> Result<Footer, KvError> {
+    if buf.len() != 48:usize {
+        return Result<Footer, KvError>::Err(KvError::corrupted("invalid_footer_buffer_size"))
+    }
+    if file_size < 48:u64 {
+        return Result<Footer, KvError>::Err(KvError::corrupted("file_size_smaller_than_footer"))
+    }
+
+    // 1. Validate Footer CRC32
+    auto expected_crc = crc32_ieee(buf, 0:usize, 40:usize)
+    auto recorded_crc = get_u32_le(buf, 40:usize)
+    if expected_crc != recorded_crc {
+        return Result<Footer, KvError>::Err(KvError::corrupted("footer_crc_mismatch"))
+    }
+
+    // 2. Validate Magic raw ASCII bytes: 'T','O','K','A','S','S','T','1'
+    if buf.get(32:usize) != 0x54:u8 || buf.get(33:usize) != 0x4F:u8 ||
+       buf.get(34:usize) != 0x4B:u8 || buf.get(35:usize) != 0x41:u8 ||
+       buf.get(36:usize) != 0x53:u8 || buf.get(37:usize) != 0x53:u8 ||
+       buf.get(38:usize) != 0x54:u8 || buf.get(39:usize) != 0x31:u8 {
+        return Result<Footer, KvError>::Err(KvError::corrupted("footer_magic_mismatch"))
+    }
+
+    // 3. Validate Reserved field (strictly 0)
+    auto reserved = get_u32_le(buf, 44:usize)
+    if reserved != 0:u32 {
+        return Result<Footer, KvError>::Err(KvError::corrupted("footer_reserved_not_zero"))
+    }
+
+    // 4. Extract fields
+    auto index_offset = get_u64_le(buf, 0:usize)
+    auto index_length = get_u64_le(buf, 8:usize)
+    auto min_seq = get_u64_le(buf, 16:usize)
+    auto max_seq = get_u64_le(buf, 24:usize)
+
+    // 5. Sequence monotonicity validation
+    if min_seq == 0:u64 || min_seq > max_seq {
+        return Result<Footer, KvError>::Err(KvError::corrupted("invalid_footer_sequences"))
+    }
+
+    // 6. Range bounds with checked arithmetic
+    if index_length > (MAX_BLOCK_SIZE as u64) {
+        return Result<Footer, KvError>::Err(KvError::corrupted("index_block_length_exceeds_max_limit"))
+    }
+    if index_length > file_size - 48:u64 {
+        return Result<Footer, KvError>::Err(KvError::corrupted("index_block_length_exceeds_file_bounds"))
+    }
+    // Index end must strictly abut Footer start
+    if index_offset != file_size - 48:u64 - index_length {
+        return Result<Footer, KvError>::Err(KvError::corrupted("index_block_does_not_abut_footer"))
+    }
+
+    return Result<Footer, KvError>::Ok(Footer(
+        index_offset = index_offset,
+        index_length = index_length,
+        min_seq = min_seq,
+        max_seq = max_seq
+    ))
+}

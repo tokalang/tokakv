@@ -1,0 +1,104 @@
+import std/io::{println}
+import official/tokakv/types::{Entry, LookupResult}
+import official/tokakv/memtable::{MemTable, FrozenMemTable}
+
+fn main() -> i32 {
+    auto mem# = MemTable::new()
+
+    // 1. Put operations
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    mem#.put(1:u64, cede k1, cede v1)
+
+    auto k2 = string::from("k2")
+    auto v2 = string::from("v2")
+    mem#.put(2:u64, cede k2, cede v2)
+
+    auto k0 = string::from("k0")
+    auto v0 = string::from("v0")
+    mem#.put(3:u64, cede k0, cede v0)
+
+    assert(mem#.len() == 3:usize, "len must be 3")
+    assert(mem#.min_seq() == 1:u64, "min_seq must be 1")
+    assert(mem#.max_seq() == 3:u64, "max_seq must be 3")
+    // Each entry: 2B key + 2B val + 16B overhead = 20B. Total 3 entries = 60B.
+    assert(mem#.size_bytes() == 60:usize, "size_bytes must be 60")
+
+    // 2. Query Get
+    match mem#.get(string::from("k0")) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v0"), "k0 val mismatch")
+        _ => assert(false, "k0 must exist")
+    }
+
+    match mem#.get(string::from("k1")) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v1"), "k1 val mismatch")
+        _ => assert(false, "k1 must exist")
+    }
+
+    match mem#.get(string::from("k2")) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v2"), "k2 val mismatch")
+        _ => assert(false, "k2 must exist")
+    }
+
+    // 3. Multi-version write (MVCC): k1 with updated value (seq=4)
+    auto k1_up = string::from("k1")
+    auto v1_up = string::from("v1_updated")
+    mem#.put(4:u64, cede k1_up, cede v1_up)
+    assert(mem#.len() == 4:usize, "len should become 4 in MVCC MemTable")
+    assert(mem#.size_bytes() == 88:usize, "size_bytes must accurately account for multi-version entry (60 + 28 = 88)")
+    match mem#.get(string::from("k1")) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v1_updated"), "k1 latest val mismatch")
+        _ => assert(false, "k1 latest must exist")
+    }
+    match mem#.get_at_seq(string::from("k1"), 1:u64) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v1"), "k1 at seq 1 must return original v1")
+        _ => assert(false, "k1 at seq 1 must exist")
+    }
+
+    // 4. Multi-version delete (tombstone): k2 becomes tombstone at seq=5
+    auto k2_del = string::from("k2")
+    mem#.delete(5:u64, cede k2_del)
+    assert(mem#.len() == 5:usize, "len should become 5 in MVCC MemTable")
+    assert(mem#.size_bytes() == 106:usize, "size_bytes must accurately account for tombstone entry (88 + 18 = 106)")
+    match mem#.get(string::from("k2")) {
+        auto LookupResult::Deleted => {}
+        _ => assert(false, "k2 latest must be tombstone")
+    }
+    match mem#.get_at_seq(string::from("k2"), 2:u64) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v2"), "k2 at seq 2 must return original v2")
+        _ => assert(false, "k2 at seq 2 must exist")
+    }
+
+    // 5. Freeze into immutable snapshot (consumes mem)
+    auto frozen# = mem.freeze()
+    assert(frozen#.len() == 5:usize, "frozen len must be 5")
+    assert(frozen#.min_seq() == 1:u64, "frozen min_seq must be 1")
+    assert(frozen#.max_seq() == 5:u64, "frozen max_seq must be 5")
+    assert(frozen#.size_bytes() == 106:usize, "frozen size_bytes must be 106")
+
+    match frozen#.get(string::from("k0")) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v0"), "frozen k0 mismatch")
+        _ => assert(false, "frozen k0 must exist")
+    }
+
+    match frozen#.get(string::from("k1")) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v1_updated"), "frozen k1 mismatch")
+        _ => assert(false, "frozen k1 must exist")
+    }
+    match frozen#.get_at_seq(string::from("k1"), 1:u64) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v1"), "frozen k1 at seq 1 must be v1")
+        _ => assert(false, "frozen k1 at seq 1 must exist")
+    }
+
+    match frozen#.get(string::from("k2")) {
+        auto LookupResult::Deleted => {}
+        _ => assert(false, "frozen k2 must be tombstone")
+    }
+    match frozen#.get_at_seq(string::from("k2"), 2:u64) {
+        auto LookupResult::Hit(&val) => assert(val.as_str().equals("v2"), "frozen k2 at seq 2 must be v2")
+        _ => assert(false, "frozen k2 at seq 2 must exist")
+    }
+
+    println("[TokaKV] MemTable & FrozenMemTable Test PASSED!")
+    return 0
+}

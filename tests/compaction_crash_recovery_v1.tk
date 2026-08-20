@@ -1,0 +1,197 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/compaction_crash_recovery_v1.tk
+// Verification of crash failpoints and orphan tolerance during Level-0 compaction.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/env::{args_count, get_arg, set_var}
+import std/process::{Command}
+import std/data_file::{WalFile}
+import official/tokakv::{TokaKvEngine}
+
+fn seed_two_tables(db: TokaKvEngine) {
+    // Flush 1: k1="v1", k2="v2_old"
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db.put(cede k1, cede v1).unwrap()
+
+    auto k2_1 = string::from("k2")
+    auto v2_1 = string::from("v2_old")
+    db.put(cede k2_1, cede v2_1).unwrap()
+
+    db.flush_active_memtable().unwrap()
+
+    // Flush 2: k2="v2_new", k3="v3"
+    auto k2_2 = string::from("k2")
+    auto v2_2 = string::from("v2_new")
+    db.put(cede k2_2, cede v2_2).unwrap()
+
+    auto k3 = string::from("k3")
+    auto v3 = string::from("v3")
+    db.put(cede k3, cede v3).unwrap()
+
+    db.flush_active_memtable().unwrap()
+}
+
+fn run_worker_crash(db_path: string, fp_name: string) {
+    auto db = TokaKvEngine::open(db_path).unwrap()
+    seed_two_tables(db.clone())
+    set_var(string::from("TOKA_FAILPOINT"), fp_name)
+    db.compact_l0().unwrap()
+}
+
+fn test_crash_point_1_pre_manifest(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db1")
+
+    // Run worker process that crashes after SSTable write, before Manifest commit
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-fp1"))
+    cmd#.arg(db_path.clone())
+    auto out_res = cmd#.output()
+    assert(out_res.is_ok(), "Command execution must complete")
+    auto out = out_res.unwrap()
+    assert(!out.status.success(), "Child process must crash / exit with non-zero")
+
+    // Reopen in parent: Manifest was NOT updated, so active Version retains 2 old SSTables.
+    // The newly created 000003.sst is an unreferenced orphan file.
+    auto db = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db.current_version().tables_count() == 2:usize, "Active Version must retain 2 old SSTables")
+
+    auto q_k1 = db.get(string::from("k1")).unwrap()
+    assert(q_k1.is_some(), "k1 must exist")
+    assert(q_k1.unwrap().as_str().cmp("v1") == 0:i32, "k1 must be v1")
+
+    auto q_k2 = db.get(string::from("k2")).unwrap()
+    assert(q_k2.is_some(), "k2 must exist")
+    assert(q_k2.unwrap().as_str().cmp("v2_new") == 0:i32, "k2 must be v2_new")
+
+    auto q_k3 = db.get(string::from("k3")).unwrap()
+    assert(q_k3.is_some(), "k3 must exist")
+    assert(q_k3.unwrap().as_str().cmp("v3") == 0:i32, "k3 must be v3")
+
+    db.close().unwrap()
+    println("[PASS] Crash Point 1 (Pre-Manifest) Verified Cleanly")
+}
+
+fn test_crash_point_2_post_manifest_pre_install(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db2")
+
+    // Run worker process that crashes after Manifest commit, before Version installation
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-fp2"))
+    cmd#.arg(db_path.clone())
+    auto out_res = cmd#.output()
+    assert(out_res.is_ok(), "Command execution must complete")
+    auto out = out_res.unwrap()
+    assert(!out.status.success(), "Child process must crash / exit with non-zero")
+
+    // Reopen in parent: Manifest WAS committed, so recovery loads new consolidated SSTable.
+    // The old SSTables (000001.sst, 000002.sst) remain as orphaned files on disk.
+    auto db = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db.current_version().tables_count() == 1:usize, "Active Version must have 1 consolidated SSTable")
+
+    auto q_k1 = db.get(string::from("k1")).unwrap()
+    assert(q_k1.is_some(), "k1 must exist")
+    assert(q_k1.unwrap().as_str().cmp("v1") == 0:i32, "k1 must be v1")
+
+    auto q_k2 = db.get(string::from("k2")).unwrap()
+    assert(q_k2.is_some(), "k2 must exist")
+    assert(q_k2.unwrap().as_str().cmp("v2_new") == 0:i32, "k2 must be v2_new")
+
+    auto q_k3 = db.get(string::from("k3")).unwrap()
+    assert(q_k3.is_some(), "k3 must exist")
+    assert(q_k3.unwrap().as_str().cmp("v3") == 0:i32, "k3 must be v3")
+
+    db.close().unwrap()
+    println("[PASS] Crash Point 2 (Post-Manifest, Pre-Install) Verified Cleanly")
+}
+
+fn test_crash_point_3_post_install_pre_unlink(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db3")
+
+    // Run worker process that crashes after Version installation, before unlinking old files
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-fp3"))
+    cmd#.arg(db_path.clone())
+    auto out_res = cmd#.output()
+    assert(out_res.is_ok(), "Command execution must complete")
+    auto out = out_res.unwrap()
+    assert(!out.status.success(), "Child process must crash / exit with non-zero")
+
+    // Reopen in parent: Valid new Version is loaded from Manifest
+    auto db = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db.current_version().tables_count() == 1:usize, "Active Version must have 1 consolidated SSTable")
+
+    auto q_k1 = db.get(string::from("k1")).unwrap()
+    assert(q_k1.is_some(), "k1 must exist")
+    assert(q_k1.unwrap().as_str().cmp("v1") == 0:i32, "k1 must be v1")
+
+    auto q_k2 = db.get(string::from("k2")).unwrap()
+    assert(q_k2.is_some(), "k2 must exist")
+    assert(q_k2.unwrap().as_str().cmp("v2_new") == 0:i32, "k2 must be v2_new")
+
+    auto q_k3 = db.get(string::from("k3")).unwrap()
+    assert(q_k3.is_some(), "k3 must exist")
+    assert(q_k3.unwrap().as_str().cmp("v3") == 0:i32, "k3 must be v3")
+
+    // Also inject a spurious garbage orphan file into DB dir to verify complete orphan immunity
+    auto orphan_path# = db_path.clone()
+    orphan_path#.push_str("/999999.sst")
+    auto orphan_wal = WalFile::open(orphan_path.clone()).unwrap()
+    auto dummy_buf# = Vec<u8>::new()
+    dummy_buf#.push(1:u8)
+    dummy_buf#.push(2:u8)
+    dummy_buf#.push(3:u8)
+    orphan_wal#.write_all_at(cede dummy_buf, 0:u64).unwrap()
+    orphan_wal#.close().unwrap()
+
+    db.close().unwrap()
+
+    // Reopen with orphan file present
+    auto db2 = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db2.current_version().tables_count() == 1:usize, "Reopen must ignore orphan file")
+    auto r_k2 = db2.get(string::from("k2")).unwrap()
+    assert(r_k2.is_some(), "k2 must exist")
+    assert(r_k2.unwrap().as_str().cmp("v2_new") == 0:i32, "k2 must be v2_new")
+    db2.close().unwrap()
+
+    println("[PASS] Crash Point 3 (Post-Install, Pre-Unlink & Orphan File Immunity) Verified Cleanly")
+}
+
+fn main() -> i32 {
+    auto argc = args_count()
+    if argc >= 3 {
+        auto flag = get_arg(1)
+        auto target_db = get_arg(2)
+        if flag.as_str().cmp("--worker-fp1") == 0:i32 {
+            run_worker_crash(target_db, string::from("after_compaction_sstable_commit"))
+            return 0
+        }
+        if flag.as_str().cmp("--worker-fp2") == 0:i32 {
+            run_worker_crash(target_db, string::from("after_compaction_manifest_commit"))
+            return 0
+        }
+        if flag.as_str().cmp("--worker-fp3") == 0:i32 {
+            run_worker_crash(target_db, string::from("before_compaction_old_file_unlink"))
+            return 0
+        }
+    }
+
+    auto self_exe = get_arg(0)
+    println("=== Running compaction_crash_recovery_v1 tests ===")
+    test_crash_point_1_pre_manifest(self_exe.clone())
+    test_crash_point_2_post_manifest_pre_install(self_exe.clone())
+    test_crash_point_3_post_install_pre_unlink(self_exe.clone())
+    println("=== ALL compaction_crash_recovery_v1 TESTS PASSED ===")
+    return 0
+}

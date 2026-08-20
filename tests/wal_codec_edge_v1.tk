@@ -1,0 +1,67 @@
+import std/io::{println}
+import std/vec::{Vec}
+import official/tokakv/types::{OP_PUT, OP_DELETE}
+import official/tokakv/crc32::{crc32_ieee}
+import official/tokakv/record::{encode_record, decode_record}
+
+fn main() -> i32 {
+    // 1. IEEE 802.3 CRC32 Standard Vector Check: "123456789" -> 0xCBF43926
+    auto vec_buf# = Vec<u8>::new()
+    auto test_str = string::from("123456789")
+    auto i# = 0:usize
+    loop i < test_str.len() {
+        vec_buf#.push(test_str.at(i).unwrap() as u8)
+        i = i + 1:usize
+    }
+    auto crc_res = crc32_ieee(vec_buf, 0:usize, vec_buf.len())
+    assert(crc_res == 0xCBF43926:u32, "CRC32 standard vector mismatch; expected 0xCBF43926")
+
+    // 2. encode_record: Invalid op_type (99) -> Err("invalid_op_type")
+    auto enc_buf# = Vec<u8>::new()
+    auto k = string::from("key1")
+    auto v = string::from("val1")
+    auto bad_op_res = encode_record(enc_buf#, 99:u8, 1:u64, k.clone(), v.clone())
+    assert(bad_op_res.is_err(), "Invalid op must fail")
+    assert(bad_op_res.unwrap_err().message.as_str().equals("invalid_op_type"), "Error message mismatch")
+
+    // 3. encode_record: OP_DELETE with non-empty value -> Err("delete_record_contains_value")
+    auto bad_del_res = encode_record(enc_buf#, OP_DELETE, 2:u64, k.clone(), v.clone())
+    assert(bad_del_res.is_err(), "Delete with value must fail")
+    assert(bad_del_res.unwrap_err().message.as_str().equals("delete_record_contains_value"), "Error message mismatch")
+
+    // 4. decode_record: buffer boundary and overflow checks
+    auto valid_buf# = Vec<u8>::new()
+    auto enc_ok = encode_record(valid_buf#, OP_PUT, 10:u64, k.clone(), v.clone())
+    assert(enc_ok.is_ok(), "Valid encode failed")
+    auto valid_len = enc_ok.unwrap()
+
+    // offset out of bounds
+    auto dec_oob = decode_record(valid_buf, valid_len + 1:usize, 8:usize)
+    assert(dec_oob.is_err(), "Out of bounds offset must error")
+    assert(dec_oob.unwrap_err().message.as_str().equals("buffer_out_of_bounds"), "Must report buffer_out_of_bounds")
+
+    // available_len exceeding remaining buffer
+    auto dec_over = decode_record(valid_buf, 0:usize, valid_len + 10:usize)
+    assert(dec_over.is_err(), "Excess available_len must error")
+    assert(dec_over.unwrap_err().message.as_str().equals("buffer_out_of_bounds"), "Must report buffer_out_of_bounds")
+
+    // 5. decode_record: Delete frame with non-zero ValLen -> Err("delete_record_contains_value")
+    // Craft a delete frame manually that has ValLen = 4
+    auto fake_del_buf# = valid_buf.clone()
+    // Byte 8 is OpType -> change to OP_DELETE
+    fake_del_buf#.set(8:usize, OP_DELETE)
+    // Recompute CRC covering bytes 8..end
+    auto p_len = valid_len - 8:usize
+    auto new_crc = crc32_ieee(fake_del_buf, 8:usize, p_len)
+    fake_del_buf#.set(0:usize, (new_crc & 0xFF:u32) as u8)
+    fake_del_buf#.set(1:usize, ((new_crc >> 8:u32) & 0xFF:u32) as u8)
+    fake_del_buf#.set(2:usize, ((new_crc >> 16:u32) & 0xFF:u32) as u8)
+    fake_del_buf#.set(3:usize, ((new_crc >> 24:u32) & 0xFF:u32) as u8)
+
+    auto dec_del_with_val = decode_record(fake_del_buf, 0:usize, valid_len)
+    assert(dec_del_with_val.is_err(), "Delete with non-zero ValLen must error")
+    assert(dec_del_with_val.unwrap_err().message.as_str().equals("delete_record_contains_value"), "Must report delete_record_contains_value")
+
+    println("[TokaKV] WAL Codec Edge & CRC32 Standard Vector Test PASSED!")
+    return 0
+}

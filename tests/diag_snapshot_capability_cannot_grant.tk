@@ -1,0 +1,11 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_snapshot_capability_cannot_grant.tk
+// Compile-fail diagnostic test: external callers cannot invoke internal_grant on EngineSnapshotCapability.
+
+import official/tokakv::{EngineSnapshotCapability}
+
+fn main() -> i32 {
+    // Direct attempt to invoke non-existent internal_grant must fail compilation with E04551
+    auto cap = EngineSnapshotCapability::internal_grant()
+    return 0
+}

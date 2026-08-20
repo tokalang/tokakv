@@ -1,0 +1,114 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/manifest/format.tk
+// Binary format, codecs, and CRC32 framing for Manifest log files.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import official/tokakv/crc32::{crc32_ieee}
+import official/tokakv/types::{KvError}
+
+pub const MANIFEST_HEADER_SIZE: usize = 8:usize
+pub const MAX_MANIFEST_RECORD_SIZE: usize = 1048576:usize // 1 MB
+pub const TAG_ALLOC_NUM: u8 = 1:u8
+pub const TAG_VERSION_BATCH: u8 = 2:u8
+
+pub fn put_u32_le(buf#: Vec<u8>, val: u32) {
+    buf#.push((val & 0xFF:u32) as u8)
+    buf#.push(((val >> 8:u32) & 0xFF:u32) as u8)
+    buf#.push(((val >> 16:u32) & 0xFF:u32) as u8)
+    buf#.push(((val >> 24:u32) & 0xFF:u32) as u8)
+}
+
+pub fn put_u64_le(buf#: Vec<u8>, val: u64) {
+    auto v# = val
+    auto i# = 0:usize
+    loop i < 8:usize {
+        buf#.push((v & 0xFF:u64) as u8)
+        v = v >> 8:u64
+        i = i + 1:usize
+    }
+}
+
+pub fn get_u32_le(buf: Vec<u8>, offset: usize) -> u32 {
+    auto b0 = buf.get(offset) as u32
+    auto b1 = buf.get(offset + 1:usize) as u32
+    auto b2 = buf.get(offset + 2:usize) as u32
+    auto b3 = buf.get(offset + 3:usize) as u32
+    return b0 | (b1 << 8:u32) | (b2 << 16:u32) | (b3 << 24:u32)
+}
+
+pub fn get_u64_le(buf: Vec<u8>, offset: usize) -> u64 {
+    auto res# = 0:u64
+    auto i# = 0:usize
+    loop i < 8:usize {
+        auto b = buf.get(offset + i) as u64
+        res = res | (b << ((i * 8:usize) as u64))
+        i = i + 1:usize
+    }
+    return res
+}
+
+/// Generates the raw 8-byte ASCII Manifest Magic header ("TOKAMNF3").
+pub fn encode_manifest_header() -> Vec<u8> {
+    auto buf# = Vec<u8>::with_capacity(8:usize)
+    buf#.push(0x54:u8) // 'T'
+    buf#.push(0x4F:u8) // 'O'
+    buf#.push(0x4B:u8) // 'K'
+    buf#.push(0x41:u8) // 'A'
+    buf#.push(0x4D:u8) // 'M'
+    buf#.push(0x4E:u8) // 'N'
+    buf#.push(0x46:u8) // 'F'
+    buf#.push(0x33:u8) // '3'
+    return cede buf
+}
+
+/// Validates raw 8-byte Manifest header against "TOKAMNF1", "TOKAMNF2", or "TOKAMNF3", returning version number (1, 2, or 3).
+pub fn validate_manifest_header(buf: Vec<u8>) -> Result<u32, KvError> {
+    if buf.len() < 8:usize {
+        return Result<u32, KvError>::Err(KvError::corrupted("manifest_header_truncated"))
+    }
+    if buf.get(0:usize) != 0x54:u8 ||
+       buf.get(1:usize) != 0x4F:u8 ||
+       buf.get(2:usize) != 0x4B:u8 ||
+       buf.get(3:usize) != 0x41:u8 ||
+       buf.get(4:usize) != 0x4D:u8 ||
+       buf.get(5:usize) != 0x4E:u8 ||
+       buf.get(6:usize) != 0x46:u8 {
+        return Result<u32, KvError>::Err(KvError::corrupted("invalid_manifest_magic"))
+    }
+    auto b7 = buf.get(7:usize)
+    if b7 == 0x31:u8 {
+        return Result<u32, KvError>::Ok(1:u32) // Legacy TOKAMNF1
+    }
+    if b7 == 0x32:u8 {
+        return Result<u32, KvError>::Ok(2:u32) // TOKAMNF2
+    }
+    if b7 == 0x33:u8 {
+        return Result<u32, KvError>::Ok(3:u32) // TOKAMNF3
+    }
+    return Result<u32, KvError>::Err(KvError::corrupted("invalid_manifest_version"))
+}
+
+/// Serializes payload with [CRC32: 4B LE][PayloadLen: 4B LE][Payload...]
+pub fn frame_manifest_payload(payload: Vec<u8>) -> Result<Vec<u8>, KvError> {
+    auto payload_len = payload.len()
+    if payload_len > MAX_MANIFEST_RECORD_SIZE {
+        return Result<Vec<u8>, KvError>::Err(KvError::record_too_large(payload_len, MAX_MANIFEST_RECORD_SIZE))
+    }
+
+    auto frame# = Vec<u8>::with_capacity(8:usize + payload_len)
+    auto crc = crc32_ieee(payload, 0:usize, payload_len)
+    put_u32_le(frame#, crc)
+    put_u32_le(frame#, payload_len as u32)
+
+    auto p# = 0:usize
+    loop p < payload_len {
+        frame#.push(payload.get(p))
+        p = p + 1:usize
+    }
+
+    return Result<Vec<u8>, KvError>::Ok(cede frame)
+}

@@ -1,0 +1,215 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/concurrent_engine_read_write_v1.tk
+// Multi-threaded stress test for TokaKvEngine concurrent readers and writers under TSan.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/thread::{thread_spawn, yield_now}
+import official/tokakv::{TokaKvEngine}
+
+fn make_key(prefix: string, idx: i32) -> string {
+    auto k# = prefix.clone()
+    k#.push_str("_")
+    k#.push_str(string::from_int(idx).as_str())
+    return cede k
+}
+
+fn make_val(prefix: string, idx: i32) -> string {
+    auto v# = string::from("val_")
+    v#.push_str(prefix.as_str())
+    v#.push_str("_")
+    v#.push_str(string::from_int(idx).as_str())
+    return cede v
+}
+
+fn test_concurrent_readers_and_writers() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // Open engine with 64KB cache
+    auto db = TokaKvEngine::open_with_cache_capacity(db_path.clone(), 65536:usize).unwrap()
+
+    // 1. Initial seed data
+    auto i# = 0
+    loop i < 30 {
+        auto k = make_key(string::from("seed"), i)
+        auto v = make_val(string::from("seed"), i)
+        db.put(cede k, cede v).unwrap()
+        i = i + 1
+    }
+    // Flush initial seed into SSTable
+    db.flush_active_memtable().unwrap()
+
+    // 2. Prepare cloned handles for worker threads
+    auto r1_db = db.clone()
+    auto r2_db = db.clone()
+    auto r3_db = db.clone()
+    auto r4_db = db.clone()
+
+    auto w1_db = db.clone()
+    auto w2_db = db.clone()
+
+    // Reader 1: Queries seed keys
+    auto r1_fn# = { [cede r1_db] =>
+        auto round# = 0
+        loop round < 40 {
+            auto idx# = 0
+            loop idx < 30 {
+                auto k = make_key(string::from("seed"), idx)
+                auto g_res = r1_db.get(cede k)
+                if g_res.is_err() {
+                    assert(false, "Reader 1 get returned error")
+                }
+                auto opt = g_res.unwrap()
+                assert(opt.is_some(), "Seed key must exist")
+                auto val = opt.unwrap()
+                assert(val.as_str().starts_with("val_seed_"), "Seed value mismatch")
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Reader 2: Queries w1 keys
+    auto r2_fn# = { [cede r2_db] =>
+        auto round# = 0
+        loop round < 40 {
+            auto idx# = 0
+            loop idx < 40 {
+                auto k = make_key(string::from("w1"), idx)
+                auto g_res = r2_db.get(cede k)
+                if g_res.is_err() {
+                    assert(false, "Reader 2 get returned error")
+                }
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Reader 3: Queries w2 keys
+    auto r3_fn# = { [cede r3_db] =>
+        auto round# = 0
+        loop round < 40 {
+            auto idx# = 0
+            loop idx < 40 {
+                auto k = make_key(string::from("w2"), idx)
+                auto g_res = r3_db.get(cede k)
+                if g_res.is_err() {
+                    assert(false, "Reader 3 get returned error")
+                }
+                yield_now()
+                idx = idx + 1
+            }
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Reader 4: Continuous queries during flush transitions
+    auto r4_fn# = { [cede r4_db] =>
+        auto round# = 0
+        loop round < 50 {
+            auto k = make_key(string::from("seed"), 0)
+            auto g_res = r4_db.get(cede k)
+            if g_res.is_err() {
+                assert(false, "Reader 4 query error")
+            }
+            auto opt = g_res.unwrap()
+            assert(opt.is_some(), "Key must exist")
+            yield_now()
+            round = round + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Writer 1: Writes w1 keys
+    auto w1_fn# = { [cede w1_db] =>
+        auto idx# = 0
+        loop idx < 40 {
+            auto k = make_key(string::from("w1"), idx)
+            auto v = make_val(string::from("w1"), idx)
+            auto p_res = w1_db.put(cede k, cede v)
+            assert(p_res.is_ok(), "Writer 1 put failed")
+            yield_now()
+            idx = idx + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    // Writer 2: Writes w2 keys and triggers flush
+    auto w2_fn# = { [cede w2_db] =>
+        auto idx# = 0
+        loop idx < 40 {
+            auto k = make_key(string::from("w2"), idx)
+            auto v = make_val(string::from("w2"), idx)
+            auto p_res = w2_db.put(cede k, cede v)
+            assert(p_res.is_ok(), "Writer 2 put failed")
+            if idx == 20 {
+                auto f_res = w2_db.flush_active_memtable()
+                assert(f_res.is_ok(), "Writer 2 flush failed")
+            }
+            yield_now()
+            idx = idx + 1
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    println("Spawning threads...")
+    auto r1_th# = thread_spawn<i32>(cede r1_fn)
+    auto r2_th# = thread_spawn<i32>(cede r2_fn)
+    auto r3_th# = thread_spawn<i32>(cede r3_fn)
+    auto r4_th# = thread_spawn<i32>(cede r4_fn)
+    auto w1_th# = thread_spawn<i32>(cede w1_fn)
+    auto w2_th# = thread_spawn<i32>(cede w2_fn)
+
+    println("Joining r1...")
+    r1_th#.join().unwrap()
+    println("Joining r2...")
+    r2_th#.join().unwrap()
+    println("Joining r3...")
+    r3_th#.join().unwrap()
+    println("Joining r4...")
+    r4_th#.join().unwrap()
+    println("Joining w1...")
+    w1_th#.join().unwrap()
+    println("Joining w2...")
+    w2_th#.join().unwrap()
+    println("All threads joined successfully!")
+
+    // 3. Verify final state across all written keys
+    auto k_check# = 0
+    loop k_check < 40 {
+        auto k1 = make_key(string::from("w1"), k_check)
+        auto g1 = db.get(cede k1).unwrap()
+        assert(g1.is_some(), "w1 key must be present in final state")
+
+        auto k2 = make_key(string::from("w2"), k_check)
+        auto g2 = db.get(cede k2).unwrap()
+        assert(g2.is_some(), "w2 key must be present in final state")
+        k_check = k_check + 1
+    }
+
+    // 4. Test fail-closed close behavior
+    db.close().unwrap()
+    auto after_close = db.get(string::from("seed_0"))
+    assert(after_close.is_err(), "Query on closed engine must fail closed")
+
+    tmp#.remove()
+}
+
+pub fn main() -> i32 {
+    println("Running test_concurrent_readers_and_writers...")
+    test_concurrent_readers_and_writers()
+    println("[PASS] Concurrent Engine Read/Write Tests Qualified Successfully!")
+    return 0
+}

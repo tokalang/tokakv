@@ -1,0 +1,45 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/release_failpoint_immunity_v1.tk
+// Verifies that in release builds (without TOKA_TESTING), setting TOKA_FAILPOINT does not trigger crashes.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/env::{set_var}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_rel")
+
+    auto db = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // Flush 2 SSTables
+    auto k1 = string::from("k1")
+    auto v1 = string::from("v1")
+    db.put(cede k1, cede v1).unwrap()
+    db.flush_active_memtable().unwrap()
+
+    auto k2 = string::from("k2")
+    auto v2 = string::from("v2")
+    db.put(cede k2, cede v2).unwrap()
+    db.flush_active_memtable().unwrap()
+
+    assert(db.current_version().tables_count() == 2:usize, "2 SSTables before compaction")
+
+    // Set TOKA_FAILPOINT to a failpoint name
+    set_var(string::from("TOKA_FAILPOINT"), string::from("after_compaction_manifest_commit"))
+
+    // In a release build, this MUST NOT abort and must compact smoothly!
+    db.compact_l0().unwrap()
+
+    assert(db.current_version().tables_count() == 1:usize, "Compaction must succeed in release build")
+    db.close().unwrap()
+
+    println("[PASS] Release failpoint immunity verified cleanly (failpoint ignored in release profile)")
+    return 0
+}

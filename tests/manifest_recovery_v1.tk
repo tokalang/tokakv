@@ -1,0 +1,162 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/manifest_recovery_v1.tk
+// Verification of Manifest, VersionSet, durable file number allocation, and recovery integration.
+
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/data_file::{ReadDataFile, WalFile}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/memtable::{MemTable}
+import official/tokakv/sstable/writer::{SSTableWriter}
+import official/tokakv/manifest/version_set::{build_table_path}
+
+fn make_key(idx: usize) -> string {
+    auto k# = string::from("user_key_")
+    if idx < 10:usize {
+        k#.push_str("000")
+    } else if idx < 100:usize {
+        k#.push_str("00")
+    } else if idx < 1000:usize {
+        k#.push_str("0")
+    }
+    auto n_str = string::from_i64(idx as i64)
+    k#.push_str(n_str.as_str())
+    return cede k
+}
+
+fn make_val(idx: usize) -> string {
+    auto v# = string::from("payload_value_")
+    auto n_str = string::from_i64(idx as i64)
+    v#.push_str(n_str.as_str())
+    return cede v
+}
+
+fn test_manifest_flush_and_recovery_watermark() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // 1. First session: open DB, put 20 keys, flush to 000001.sst
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 20:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db1#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db1#.flush_active_memtable().unwrap()
+    auto v1# = db1#.current_version()
+    assert(v1#.tables_count() == 1:usize, "VersionSet must hold 1 SSTable")
+
+    // Put 20 more keys (21..40), flush to 000002.sst
+    loop i <= 40:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db1#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db1#.flush_active_memtable().unwrap()
+    auto v2# = db1#.current_version()
+    assert(v2#.tables_count() == 2:usize, "VersionSet must hold 2 SSTables")
+
+    // Put 10 more keys (41..50) into active MemTable/WAL (do NOT flush)
+    loop i <= 50:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db1#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    assert(db1#.current_seq() == 50:u64, "current_seq must be 50")
+    db1#.close().unwrap()
+
+    // 2. Second session: reopen DB from directory
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // Check VersionSet has 2 SSTables recovered from Manifest
+    auto rv2# = db2#.current_version()
+    assert(rv2#.tables_count() == 2:usize, "Reopened VersionSet must hold 2 SSTables")
+
+    // Check all 50 keys are queryable
+    auto q# = 1:usize
+    loop q <= 50:usize {
+        auto q_k = make_key(q)
+        auto res = db2#.get(q_k)
+        assert(res.is_ok(), "Key query must succeed")
+        auto opt = res.unwrap()
+        assert(opt.is_some(), "Key must be present after recovery")
+        auto expected_v = make_val(q)
+        auto val = opt.unwrap()
+        assert(val.as_str().equals(expected_v.as_str()), "Recovered value payload mismatch")
+        q = q + 1:usize
+    }
+
+    // Check non-existent key returns None
+    assert(db2#.get(string::from("non_existent_user_key")).unwrap().is_none(), "Miss must return None")
+
+    // 3. Put additional keys in session 2 (seq 51..60) and verify monotonicity
+    loop i <= 60:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db2#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    assert(db2#.current_seq() == 60:u64, "current_seq must advance to 60")
+    db2#.flush_active_memtable().unwrap()
+    auto rv3# = db2#.current_version()
+    assert(rv3#.tables_count() == 3:usize, "VersionSet must now hold 3 SSTables")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_orphan_sstable_exclusion() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    // Open DB, put 10 keys, flush to 000001.sst
+    auto db1# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db1#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db1#.flush_active_memtable().unwrap()
+    db1#.close().unwrap()
+
+    // Manually create an orphan uncommitted SSTable 000099.sst in the db directory
+    auto orphan_path = build_table_path(db_path.clone(), 99:u64)
+
+    auto orphan_mem# = MemTable::new()
+    auto ok = string::from("orphan_key_999")
+    auto ov = string::from("orphan_val_999")
+    orphan_mem#.put(999:u64, cede ok, cede ov)
+    auto orphan_frozen = orphan_mem.freeze()
+    SSTableWriter::write(orphan_path.clone(), cede orphan_frozen).unwrap()
+
+    // Reopen DB
+    auto db2# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // VersionSet must only hold 1 table (000001.sst), NOT the uncommitted orphan 000099.sst
+    auto v2# = db2#.current_version()
+    assert(v2#.tables_count() == 1:usize, "Orphan SSTable must not be loaded into VersionSet")
+    assert(db2#.get(string::from("orphan_key_999")).unwrap().is_none(), "Orphan SSTable key must not be queryable")
+
+    // The legitimate keys must still be queryable
+    assert(db2#.get(make_key(1)).unwrap().is_some(), "Legitimate key 1 must be queryable")
+    assert(db2#.get(make_key(10)).unwrap().is_some(), "Legitimate key 10 must be queryable")
+
+    db2#.close().unwrap()
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_manifest_flush_and_recovery_watermark()
+    test_orphan_sstable_exclusion()
+    println("[PASS] Manifest Recovery v1 Qualified Successfully!")
+    return 0
+}

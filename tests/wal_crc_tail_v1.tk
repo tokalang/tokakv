@@ -1,0 +1,140 @@
+import std/io::{println}
+import std/vec::{Vec}
+import std/data_file::{WalFile, ReadDataFile}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/manifest/version_set::{build_wal_path}
+import official/tokakv/types::{OP_PUT, OP_DELETE, Entry}
+import official/tokakv/record::{RECORD_HEADER_SIZE, encode_record}
+
+fn main() -> i32 {
+    auto tmp_res = create_temp_file_system()
+    assert(tmp_res.is_ok(), "create_temp_file_system failed")
+    auto tmp# = tmp_res.unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto wal_path = build_wal_path(db_path.clone(), 1:u64)
+
+    // -------------------------------------------------------------
+    // Test Case 1: Torn Header at EOF -> Truncate & Recover cleanly
+    // -------------------------------------------------------------
+    auto db1_res = TokaKvEngine::open(db_path.clone())
+    assert(db1_res.is_ok(), "db1 open failed")
+    auto db1# = db1_res.unwrap()
+
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k# = string::from("k_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("v_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        assert(db1#.put(cede k, cede v).is_ok(), "db1 put failed")
+        i = i + 1:usize
+    }
+    assert(db1#.close().is_ok(), "db1 close failed")
+
+    // Append 3 garbage bytes to simulate process killed while writing 8B header
+    auto wal1_res = WalFile::open(wal_path.clone())
+    assert(wal1_res.is_ok(), "wal1 open failed")
+    auto wal1# = wal1_res.unwrap()
+
+    // Read current clean size
+    auto r1_res = ReadDataFile::open(wal_path.clone())
+    assert(r1_res.is_ok(), "r1 open failed")
+    auto r1 = r1_res.unwrap()
+    auto test_buf# = Vec<u8>::with_capacity(4096:usize)
+    auto r1_out = r1.read_at(cede test_buf, 0:u64, 4096:usize).unwrap()
+    auto clean_len1 = r1_out.bytes_read
+
+    auto junk_buf# = Vec<u8>::with_capacity(3:usize)
+    junk_buf#.push(0xDE:u8)
+    junk_buf#.push(0xAD:u8)
+    junk_buf#.push(0xBE:u8)
+    assert(wal1#.write_all_at(cede junk_buf, clean_len1 as u64).is_ok(), "write junk failed")
+    wal1#.sync_all()
+    wal1#.close()
+
+    // Reopen DB: must recover all 10 records and physically truncate the 3 garbage bytes
+    auto rec1_res = TokaKvEngine::open(db_path.clone())
+    assert(rec1_res.is_ok(), "rec1 open must succeed despite torn header")
+    auto rec1# = rec1_res.unwrap()
+    assert(rec1#.current_seq() == 10:u64, "Recovered seq must be 10")
+    auto k10 = string::from("k_10")
+    assert(rec1#.get(k10).unwrap().unwrap().as_str().equals("v_10"), "k_10 val mismatch")
+    rec1#.close()
+
+    // Verify physical file size was truncated back to clean_len1
+    auto r1_after_res = ReadDataFile::open(wal_path.clone())
+    auto r1_after = r1_after_res.unwrap()
+    auto check_buf# = Vec<u8>::with_capacity(4096:usize)
+    auto r1_after_out = r1_after.read_at(cede check_buf, clean_len1 as u64, 16:usize).unwrap()
+    assert(r1_after_out.bytes_read == 0:usize, "Torn header must be physically truncated (EOF at clean_len1)")
+    assert(r1_after_out.eof, "Must be EOF")
+
+    // -------------------------------------------------------------
+    // Test Case 2: Torn Payload at EOF -> Truncate & Recover cleanly
+    // -------------------------------------------------------------
+    auto wal2_res = WalFile::open(wal_path.clone())
+    auto wal2# = wal2_res.unwrap()
+
+    // Inject a header that claims payload is 32 bytes, but only write 5 bytes
+    auto torn_p_buf# = Vec<u8>::with_capacity(13:usize)
+    // CRC placeholder
+    torn_p_buf#.push(0x12:u8)
+    torn_p_buf#.push(0x34:u8)
+    torn_p_buf#.push(0x56:u8)
+    torn_p_buf#.push(0x78:u8)
+    // PayloadLen = 32:u32 LE
+    torn_p_buf#.push(32:u8)
+    torn_p_buf#.push(0:u8)
+    torn_p_buf#.push(0:u8)
+    torn_p_buf#.push(0:u8)
+    // Only 5 bytes of payload written
+    torn_p_buf#.push(OP_PUT)
+    torn_p_buf#.push(0xAA:u8)
+    torn_p_buf#.push(0xBB:u8)
+    torn_p_buf#.push(0xCC:u8)
+    torn_p_buf#.push(0xDD:u8)
+
+    assert(wal2#.write_all_at(cede torn_p_buf, clean_len1 as u64).is_ok(), "write torn payload failed")
+    wal2#.sync_all()
+    wal2#.close()
+
+    // Reopen DB: must recover all 10 records and physically truncate the torn payload frame
+    auto rec2_res = TokaKvEngine::open(db_path.clone())
+    assert(rec2_res.is_ok(), "rec2 open must succeed despite torn payload")
+    auto rec2# = rec2_res.unwrap()
+    assert(rec2#.current_seq() == 10:u64, "Recovered seq must still be 10")
+    rec2#.close()
+
+    // -------------------------------------------------------------
+    // Test Case 3: Complete Frame with Bad CRC -> FAIL-CLOSED!
+    // -------------------------------------------------------------
+    // Write a complete valid record 11 into a fresh buffer, flip 1 bit in payload, write to WAL
+    auto wal3_res = WalFile::open(wal_path.clone())
+    auto wal3# = wal3_res.unwrap()
+
+    auto bad_frame# = Vec<u8>::new()
+    auto k11 = string::from("k_11")
+    auto v11 = string::from("v_11")
+    encode_record(bad_frame#, OP_PUT, 11:u64, k11, v11)
+    // Flip a bit in the payload (byte 12)
+    auto orig_byte = bad_frame.get(12:usize)
+    bad_frame#.set(12:usize, (orig_byte ^ 1:u8))
+
+    assert(wal3#.write_all_at(cede bad_frame, clean_len1 as u64).is_ok(), "write bad frame failed")
+    wal3#.sync_all()
+    wal3#.close()
+
+    // Reopen DB: MUST FAIL CLOSED! Refuse startup with corrupted error
+    auto rec3_res = TokaKvEngine::open(db_path.clone())
+    assert(rec3_res.is_err(), "Engine MUST REFUSE to start when a complete frame has invalid CRC!")
+    auto err3 = rec3_res.unwrap_err()
+    assert(err3.kind.as_str().equals("corrupted"), "Error kind must be corrupted")
+    assert(err3.message.as_str().equals("crc_mismatch"), "Error message must be crc_mismatch")
+
+    tmp#.remove()
+    println("[TokaKV] Fail-Closed WAL Crash Recovery & Torn Tail Truncation Test PASSED!")
+    return 0
+}

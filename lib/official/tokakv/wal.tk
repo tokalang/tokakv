@@ -1,0 +1,312 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/wal.tk
+// WAL writer and fail-closed crash replayer with physical torn-tail truncation & sequence gating.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import std/data_file::{ReadDataFile, WalFile}
+import official/tokakv/types::{
+    OP_PUT, OP_DELETE, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_RECORD_BYTES,
+    Entry, KvError
+}
+import official/tokakv/record::{RECORD_HEADER_SIZE, encode_record, decode_record}
+
+/// Replay recovery output containing replayed entries and physical valid offset.
+pub shape ReplayResult (
+    entries: Vec<Entry>,
+    last_seq: u64,
+    valid_end_offset: u64,
+    truncated_torn_tail: bool
+)
+
+impl ReplayResult {
+    pub fn entries(self) -> Vec<Entry> {
+        return self.entries.clone()
+    }
+
+    pub fn last_seq(self) -> u64 {
+        return self.last_seq
+    }
+
+    pub fn valid_end_offset(self) -> u64 {
+        return self.valid_end_offset
+    }
+
+    pub fn truncated_torn_tail(self) -> bool {
+        return self.truncated_torn_tail
+    }
+}
+
+/// WAL synchronous writer.
+pub shape WalWriter (
+    wal_file#: WalFile,
+    current_offset#: u64,
+    last_seq#: u64,
+    write_buf#: Vec<u8>,
+    poisoned#: bool
+)
+
+impl WalWriter {
+    /// Opens WAL writer positioned at specified physical offset and last sequence.
+    pub fn open(path: string, start_offset: u64, last_seq: u64) -> Result<WalWriter, KvError> {
+        auto wal_res = WalFile::open(path)
+        if wal_res.is_err() {
+            return Result<WalWriter, KvError>::Err(KvError::io(wal_res.unwrap_err()))
+        }
+        auto wal = wal_res.unwrap()
+        return Result<WalWriter, KvError>::Ok(WalWriter(
+            wal_file = cede wal,
+            current_offset = start_offset,
+            last_seq = last_seq,
+            write_buf = Vec<u8>::with_capacity(4096:usize),
+            poisoned = false
+        ))
+    }
+
+    pub fn current_offset(self) -> u64 {
+        return self.current_offset
+    }
+
+    pub fn last_seq(self) -> u64 {
+        return self.last_seq
+    }
+
+    pub fn is_poisoned(self) -> bool {
+        return self.poisoned
+    }
+
+    /// Encodes and synchronously appends a single record (enforces sequence monotonicity, write_all_at + sync_data).
+    pub fn append(self#, op: u8, seq: u64, key: string, value: string) -> Result<(), KvError> {
+        if self.poisoned {
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+
+        // Sequence validation: forbid zero sequence and require strictly monotonic increment
+        if seq == 0:u64 {
+            return Result<(), KvError>::Err(KvError::corrupted("invalid_zero_sequence"))
+        }
+        if self.last_seq > 0:u64 && seq != (self.last_seq + 1:u64) {
+            return Result<(), KvError>::Err(KvError::corrupted("non_monotonic_sequence"))
+        }
+
+        self.write_buf#.clear()
+        auto enc_res = encode_record(self.write_buf#, op, seq, key, value)
+        if enc_res.is_err() {
+            return Result<(), KvError>::Err(enc_res.unwrap_err())
+        }
+
+        auto frame_len = enc_res.unwrap()
+        auto write_res = self.wal_file#.write_all_at(cede self.write_buf, self.current_offset)
+        if write_res.is_err() {
+            self.poisoned = true
+            auto write_err = write_res.unwrap_err()
+            auto err_obj = write_err.error
+            self.write_buf = write_err.take_buffer()
+            return Result<(), KvError>::Err(KvError::io(err_obj))
+        }
+
+        auto out = write_res.unwrap()
+        self.current_offset = self.current_offset + (out.bytes_written as u64)
+        self.write_buf = out.take_buffer()
+
+        auto sync_res = self.wal_file#.sync_data()
+        if sync_res.is_err() {
+            self.poisoned = true
+            return Result<(), KvError>::Err(KvError::io(sync_res.unwrap_err()))
+        }
+
+        self.last_seq = seq
+        return Result<(), KvError>::Ok(())
+    }
+
+    /// Physically truncates WAL file (used to roll back torn tails).
+    pub fn truncate(self#, length: u64) -> Result<(), KvError> {
+        if self.poisoned {
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+
+        auto res = self.wal_file#.truncate(length)
+        if res.is_err() {
+            self.poisoned = true
+            return Result<(), KvError>::Err(KvError::io(res.unwrap_err()))
+        }
+        self.current_offset = length
+        return Result<(), KvError>::Ok(())
+    }
+
+    /// Flushes all metadata and closes WAL file.
+    pub fn close(self#) -> Result<(), KvError> {
+        if self.poisoned {
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+
+        auto sync_res = self.wal_file#.sync_all()
+        if sync_res.is_err() {
+            self.poisoned = true
+            return Result<(), KvError>::Err(KvError::io(sync_res.unwrap_err()))
+        }
+        auto close_res = self.wal_file#.close()
+        if close_res.is_err() {
+            self.poisoned = true
+            return Result<(), KvError>::Err(KvError::io(close_res.unwrap_err()))
+        }
+        return Result<(), KvError>::Ok(())
+    }
+}
+
+/// Executes fail-closed WAL crash replay and physical torn tail truncation.
+pub fn replay_and_recover(path: string) -> Result<ReplayResult, KvError> {
+    auto reader_res = ReadDataFile::open(path.clone())
+    if reader_res.is_err() {
+        auto err = reader_res.unwrap_err()
+        // Strictly return empty state only for explicit ENOENT (2); fail closed for all other errors.
+        if err.code() == 2:i32 {
+            return Result<ReplayResult, KvError>::Ok(ReplayResult(
+                entries = Vec<Entry>::new(),
+                last_seq = 0:u64,
+                valid_end_offset = 0:u64,
+                truncated_torn_tail = false
+            ))
+        }
+        return Result<ReplayResult, KvError>::Err(KvError::io(err))
+    }
+
+    auto reader = reader_res.unwrap()
+    auto recovered_entries# = Vec<Entry>::new()
+    auto last_replayed_seq# = 0:u64
+    auto curr_offset# = 0:u64
+    auto torn_tail# = false
+
+    auto header_buf# = Vec<u8>::with_capacity(RECORD_HEADER_SIZE)
+    auto payload_buf# = Vec<u8>::with_capacity(4096:usize)
+    auto frame_buf# = Vec<u8>::with_capacity(4096:usize)
+
+    loop true {
+        // 1. Read 8-byte Header
+        header_buf#.clear()
+        auto h_res = reader.read_at(cede header_buf, curr_offset, RECORD_HEADER_SIZE)
+        if h_res.is_err() {
+            auto h_err = h_res.unwrap_err()
+            return Result<ReplayResult, KvError>::Err(KvError::io(h_err.error))
+        }
+
+        auto h_out = h_res.unwrap()
+        auto h_read = h_out.bytes_read
+        header_buf = h_out.take_buffer()
+
+        if h_read == 0:usize {
+            // Clean EOF located on record boundary
+            break
+        }
+
+        if h_read < RECORD_HEADER_SIZE {
+            // Incomplete Header at EOF -> torn header at EOF
+            torn_tail = true
+            break
+        }
+
+        // 2. Parse PayloadLen from Header (Bytes 4..7 LE)
+        auto l0 = header_buf.get(4:usize) as u32
+        auto l1 = header_buf.get(5:usize) as u32
+        auto l2 = header_buf.get(6:usize) as u32
+        auto l3 = header_buf.get(7:usize) as u32
+        auto payload_len_u32 = l0 | (l1 << 8:u32) | (l2 << 16:u32) | (l3 << 24:u32)
+        auto payload_len = payload_len_u32 as usize
+
+        if payload_len > MAX_RECORD_BYTES || payload_len < 17:usize {
+            // Invalid oversize or undersize payload -> fail-closed rejection
+            return Result<ReplayResult, KvError>::Err(
+                KvError::corrupted("invalid_payload_length_in_wal_header")
+            )
+        }
+
+        // 3. Read Payload bytes
+        payload_buf#.clear()
+        if payload_buf.cap() < payload_len {
+            payload_buf = Vec<u8>::with_capacity(payload_len)
+        }
+
+        auto p_res = reader.read_at(cede payload_buf, curr_offset + (RECORD_HEADER_SIZE as u64), payload_len)
+        if p_res.is_err() {
+            auto p_err = p_res.unwrap_err()
+            return Result<ReplayResult, KvError>::Err(KvError::io(p_err.error))
+        }
+
+        auto p_out = p_res.unwrap()
+        auto p_read = p_out.bytes_read
+        payload_buf = p_out.take_buffer()
+
+        if p_read < payload_len {
+            // Incomplete payload at EOF -> torn payload at EOF
+            torn_tail = true
+            break
+        }
+
+        // 4. Assemble full frame Header (8B) + Payload (payload_len B)
+        frame_buf#.clear()
+        auto f_h_i# = 0:usize
+        loop f_h_i < RECORD_HEADER_SIZE {
+            frame_buf#.push(header_buf.get(f_h_i))
+            f_h_i = f_h_i + 1:usize
+        }
+        auto f_p_i# = 0:usize
+        loop f_p_i < payload_len {
+            frame_buf#.push(payload_buf.get(f_p_i))
+            f_p_i = f_p_i + 1:usize
+        }
+
+        // 5. Decode and validate CRC32
+        auto dec_res = decode_record(frame_buf, 0:usize, frame_buf.len())
+        if dec_res.is_err() {
+            // Full frame read with CRC mismatch -> fail closed (never truncate corrupt mid-file frame)
+            return Result<ReplayResult, KvError>::Err(dec_res.unwrap_err())
+        }
+
+        auto dec = dec_res.unwrap()
+        auto frame_bytes = dec.frame_bytes()
+        auto entry = dec.take_entry()
+        auto seq = entry.seq
+
+        // Validate sequence monotonicity: first >= 1, subsequent strictly sequential
+        if seq == 0:u64 {
+            return Result<ReplayResult, KvError>::Err(KvError::corrupted("invalid_zero_sequence"))
+        }
+        if last_replayed_seq > 0:u64 && seq != (last_replayed_seq + 1:u64) {
+            return Result<ReplayResult, KvError>::Err(KvError::corrupted("non_monotonic_sequence"))
+        }
+
+        last_replayed_seq = seq
+        recovered_entries#.push(cede entry)
+        curr_offset = curr_offset + (frame_bytes as u64)
+    }
+
+    // 6. Truncate torn tail if present
+    if torn_tail {
+        auto wal_res = WalFile::open(path)
+        if wal_res.is_err() {
+            return Result<ReplayResult, KvError>::Err(KvError::io(wal_res.unwrap_err()))
+        }
+        auto wal# = wal_res.unwrap()
+        auto trunc_res = wal#.truncate(curr_offset)
+        if trunc_res.is_err() {
+            return Result<ReplayResult, KvError>::Err(KvError::io(trunc_res.unwrap_err()))
+        }
+        auto sync_res = wal#.sync_all()
+        if sync_res.is_err() {
+            return Result<ReplayResult, KvError>::Err(KvError::io(sync_res.unwrap_err()))
+        }
+        auto close_res = wal#.close()
+        if close_res.is_err() {
+            return Result<ReplayResult, KvError>::Err(KvError::io(close_res.unwrap_err()))
+        }
+    }
+
+    return Result<ReplayResult, KvError>::Ok(ReplayResult(
+        entries = cede recovered_entries,
+        last_seq = last_replayed_seq,
+        valid_end_offset = curr_offset,
+        truncated_torn_tail = torn_tail
+    ))
+}

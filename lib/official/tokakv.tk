@@ -1,0 +1,1806 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv.tk
+// Top-level engine facade for TokaKV with decoupled ReadState / WriterState architecture.
+
+import core/types::{usize}
+import core/traits::{@Dup, @Encap}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import std/io::{remove_file}
+import std/fs::{metadata, create_dir, sync_directory}
+import std/error::{IoError}
+import std/data_file::{ReadDataFile}
+import std/sync::{Mutex, RwMutex}
+import std/thread::{JoinHandle, sleep_ms, yield_now}
+import official/tokakv/types::{
+    OP_PUT, OP_DELETE, Entry, KvError, LookupResult
+}
+import official/tokakv/wal::{WalWriter, replay_and_recover}
+import official/tokakv/memtable::{MemTable, FrozenMemTable}
+import official/tokakv/sstable/writer::{SSTableWriter}
+import official/tokakv/sstable/reader::{SSTableReader}
+import official/tokakv/sstable/compactor::{Compactor, CompactionPlan}
+import official/tokakv/manifest/version::{
+    ActiveLogMetadata, SealedLogMetadata, TableMetadata, TableHandle, Version, VersionEdit, validate_l1_disjoint
+}
+import official/tokakv/manifest/version_set::{VersionSet, build_table_path, build_wal_path}
+import official/tokakv/cache/block_cache::{BlockCache, CacheStats}
+import sys/sync::{sys_atomic_init_i32, sys_atomic_load_i32, sys_atomic_store_i32, sys_atomic_destroy_i32}
+import sys/libc::{toka_test_check_failpoint}
+
+extern fn toka_kv_next_engine_id() -> u64
+
+pub const HEALTH_READY: u8 = 0:u8
+pub const HEALTH_POISONED: u8 = 1:u8
+pub const HEALTH_CLOSED: u8 = 2:u8
+
+pub shape SharedHealth (
+    ptr#: Addr
+)
+
+impl SharedHealth@Encap {
+    fn drop(self#) {
+        if self.ptr != 0:Addr {
+            sys_atomic_destroy_i32(self.ptr)
+            self.ptr = 0:Addr
+        }
+    }
+}
+
+impl SharedHealth@Send {}
+impl SharedHealth@Sync {}
+
+impl SharedHealth {
+    pub fn get(self) -> i32 {
+        if self.ptr == 0:Addr {
+            return HEALTH_POISONED as i32
+        }
+        return sys_atomic_load_i32(self.ptr)
+    }
+    pub fn set(self, val: i32) {
+        if self.ptr != 0:Addr {
+            sys_atomic_store_i32(self.ptr, val)
+        }
+    }
+}
+
+fn resolve_table_path(db_dir: string, file_number: u64) -> string {
+    return build_table_path(db_dir, file_number)
+}
+
+fn extract_parent_dir(path: string) -> string {
+    auto len = path.len()
+    if len == 0:usize {
+        return string::from(".")
+    }
+    auto effective_len# = len
+    if path.ends_with("/") && effective_len > 1:usize {
+        effective_len = effective_len - 1:usize
+    }
+
+    auto last_slash# = -1:i64
+    auto i# = 0:usize
+    loop i < effective_len {
+        auto opt = path.at(i)
+        if opt.is_some() {
+            if opt.unwrap() == 47:u32 { // '/'
+                last_slash = i as i64
+            }
+        }
+        i = i + 1:usize
+    }
+
+    if last_slash < 0:i64 {
+        return string::from(".")
+    }
+    if last_slash == 0:i64 {
+        return string::from("/")
+    }
+
+    auto res# = string::new()
+    auto j# = 0:usize
+    loop j < (last_slash as usize) {
+        auto opt_c = path.at(j)
+        if opt_c.is_some() {
+            res#.push_byte_raw(opt_c.unwrap() as u8)
+        }
+        j = j + 1:usize
+    }
+    return cede res
+}
+
+fn check_test_failpoint(name: str) {
+    auto s# = string::from(name)
+    auto *ptr# = s.c_str()
+    unsafe {
+        toka_test_check_failpoint(*ptr)
+    }
+}
+
+/// ReadState: In-memory snapshot structures guarded by RwMutex.
+pub shape ReadState (
+    active_mem#: MemTable,
+    frozen_mems#: Vec<FrozenMemTable>,
+    current_version#: Version,
+    health#: u8
+)
+
+impl ReadState@Encap {}
+impl ReadState@Send {}
+impl ReadState@Sync {}
+
+impl ReadState {
+    pub fn new(active_mem: cede MemTable, frozen_mems: cede Vec<FrozenMemTable>, current_version: cede Version) -> ReadState {
+        return ReadState(
+            active_mem = cede active_mem,
+            frozen_mems = cede frozen_mems,
+            current_version = cede current_version,
+            health = HEALTH_READY
+        )
+    }
+
+    pub fn rotate_active(self#, flush_id: u64) -> FrozenMemTable {
+        auto old_mem = self.active_mem
+        self.active_mem = MemTable::new()
+        return old_mem.freeze_with_id(flush_id)
+    }
+
+    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<BlockCache>) -> Result<Option<string>, KvError> {
+        if self.health == HEALTH_POISONED {
+            return Result<Option<string>, KvError>::Err(KvError::poisoned())
+        }
+        if self.health == HEALTH_CLOSED {
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+
+        // 1. Check active MemTable
+        auto act_res = self.active_mem.get_at_seq(key.clone(), target_seq)
+        match act_res {
+            auto LookupResult::Hit(&val) => return Result<Option<string>, KvError>::Ok(Option<string>::Some(val.clone()))
+            auto LookupResult::Deleted => return Result<Option<string>, KvError>::Ok(Option<string>::None)
+            _ => {}
+        }
+
+        // 2. Check frozen MemTables (newest to oldest)
+        auto f_count = self.frozen_mems.len()
+        if f_count > 0:usize {
+            auto idx# = f_count
+            loop idx > 0:usize {
+                idx = idx - 1:usize
+                unsafe {
+                    auto *frozen = self.frozen_mems.unsafe_get(idx)
+                    auto f_res = frozen.get_at_seq(key.clone(), target_seq)
+                    match f_res {
+                        auto LookupResult::Hit(&val) => return Result<Option<string>, KvError>::Ok(Option<string>::Some(val.clone()))
+                        auto LookupResult::Deleted => return Result<Option<string>, KvError>::Ok(Option<string>::None)
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // 3. Check current Version SSTables with BlockCache
+        auto vs_res = self.current_version.get_at_seq(key, target_seq, cache_opt)
+        if vs_res.is_err() {
+            return Result<Option<string>, KvError>::Err(vs_res.unwrap_err())
+        }
+        auto lookup_res = vs_res.unwrap()
+        match lookup_res {
+            auto LookupResult::Hit(&val) => return Result<Option<string>, KvError>::Ok(Option<string>::Some(val.clone()))
+            auto LookupResult::Deleted => return Result<Option<string>, KvError>::Ok(Option<string>::None)
+            auto LookupResult::NotFound => return Result<Option<string>, KvError>::Ok(Option<string>::None)
+        }
+    }
+
+    pub fn get(self, key: string, cache_opt: Option<BlockCache>) -> Result<Option<string>, KvError> {
+        return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
+    }
+}
+
+/// WriterState: Single-writer resources guarded by Mutex.
+/// Strictly implements @Send only; thread-safe sharing is provided via Mutex<WriterState>.
+pub shape WriterState (
+    wal_writer#: WalWriter,
+    version_set#: VersionSet,
+    next_seq#: u64,
+    next_flush_id#: u64,
+    opened#: bool,
+    poisoned#: bool,
+    db_dir: string
+)
+
+impl WriterState@Encap {}
+impl WriterState@Send {}
+
+/// Capability required to acquire a snapshot lease.
+/// Unconstructible by external callers due to @Encap and absence of public factories.
+pub shape EngineSnapshotCapability (
+    token: u64,
+    engine_id: u64
+)
+
+impl EngineSnapshotCapability@Encap {}
+
+impl EngineSnapshotCapability {
+    fn grant_for_engine(token: u64, engine_id: u64) -> EngineSnapshotCapability {
+        return EngineSnapshotCapability(token = token, engine_id = engine_id)
+    }
+}
+
+shape SnapshotEntry (
+    id: u64,
+    sequence: u64
+)
+
+/// In-Engine Thread-safe dynamic Snapshot Registry.
+/// Dynamically sized with zero arbitrary capacity caps. Pure Safe Toka implementation.
+pub shape SnapshotRegistry (
+    entries#: Vec<SnapshotEntry>,
+    next_id#: u64,
+    capability_token#: u64
+)
+
+impl SnapshotRegistry@Encap {}
+impl SnapshotRegistry@Send {}
+
+impl SnapshotRegistry {
+    pub fn new(capability_token: u64) -> SnapshotRegistry {
+        return SnapshotRegistry(
+            entries = Vec<SnapshotEntry>::new(),
+            next_id = 1:u64,
+            capability_token = capability_token
+        )
+    }
+
+    /// Internal non-pub lease creation requiring valid matching capability:
+    fn acquire_lease_with_cap(self#, sequence: u64, engine_id: u64, ~reg: Mutex<SnapshotRegistry>, cap: EngineSnapshotCapability) -> Result<SnapshotLease, KvError> {
+        if cap.token != self.capability_token || cap.engine_id != engine_id {
+            return Result<SnapshotLease, KvError>::Err(KvError::corrupted("invalid_snapshot_capability"))
+        }
+        auto snap_id = self.next_id
+        self.next_id = self.next_id + 1:u64
+        self.entries#.push(SnapshotEntry(id = snap_id, sequence = sequence))
+        return Result<SnapshotLease, KvError>::Ok(SnapshotLease(
+            ~registry = ~reg,
+            id = snap_id,
+            engine_id = engine_id
+        ))
+    }
+
+    pub fn unregister(self#, snap_id: u64) {
+        auto idx# = -1:i64
+        auto i# = 0:usize
+        loop i < self.entries.len() {
+            auto e = self.entries.get(i)
+            if e.id == snap_id {
+                idx = i as i64
+                break
+            }
+            i = i + 1:usize
+        }
+        if idx >= 0:i64 {
+            self.entries#.remove(idx as usize)
+        }
+    }
+
+    /// Retrieves authoritative registered sequence for a snapshot ID.
+    pub fn get_sequence_for_id(self, snap_id: u64) -> Option<u64> {
+        auto i# = 0:usize
+        loop i < self.entries.len() {
+            auto e = self.entries.get(i)
+            if e.id == snap_id {
+                return Option<u64>::Some(e.sequence)
+            }
+            i = i + 1:usize
+        }
+        return Option<u64>::None
+    }
+
+    pub fn oldest_sequence(self) -> Option<u64> {
+        if self.entries.len() == 0:usize {
+            return Option<u64>::None
+        }
+        auto min_seq# = 0xFFFFFFFFFFFFFFFF:u64
+        auto i# = 0:usize
+        loop i < self.entries.len() {
+            auto e = self.entries.get(i)
+            if e.sequence < min_seq {
+                min_seq = e.sequence
+            }
+            i = i + 1:usize
+        }
+        return Option<u64>::Some(min_seq)
+    }
+
+    pub fn is_active(self, snap_id: u64) -> bool {
+        auto i# = 0:usize
+        loop i < self.entries.len() {
+            auto e = self.entries.get(i)
+            if e.id == snap_id {
+                return true
+            }
+            i = i + 1:usize
+        }
+        return false
+    }
+
+    pub fn active_count(self) -> usize {
+        return self.entries.len()
+    }
+}
+
+/// RAII Snapshot Lease representing a pinned point-in-time database sequence.
+/// Encapsulated resource: cannot be forged, duplicated, or leaked.
+/// Can only be created by TokaKvEngine::acquire_snapshot.
+pub shape SnapshotLease (
+    ~registry: Mutex<SnapshotRegistry>,
+    id#: u64,
+    engine_id#: u64
+)
+
+impl SnapshotLease@Encap {
+    fn drop(self#) {
+        if self.id != 0:u64 {
+            auto lock_res = self.registry.lock()
+            if lock_res.is_ok() {
+                auto lock_g = lock_res.unwrap()
+                auto &reg# = lock_g.get_ref()
+                reg#.unregister(self.id)
+            }
+            self.id = 0:u64
+            self.engine_id = 0:u64
+        }
+    }
+}
+impl SnapshotLease@Send {}
+
+impl SnapshotLease {
+    /// Queries the authoritative sequence from the attached registry.
+    pub fn sequence(self) -> u64 {
+        auto lock_res = self.registry.lock()
+        if lock_res.is_ok() {
+            auto lock_g = lock_res.unwrap()
+            auto &reg = lock_g.get_ref()
+            auto seq_opt = reg.get_sequence_for_id(self.id)
+            if seq_opt.is_some() {
+                return seq_opt.unwrap()
+            }
+        }
+        return 0:u64
+    }
+
+    pub fn id(self) -> u64 {
+        return self.id
+    }
+
+    pub fn engine_id(self) -> u64 {
+        return self.engine_id
+    }
+}
+
+shape MaintenanceState (
+    pending_flush#: bool,
+    pending_compaction#: bool,
+    in_flight_flush#: bool,
+    in_flight_compaction#: bool,
+    shutdown#: bool
+)
+
+impl MaintenanceState@Encap {}
+impl MaintenanceState@Send {}
+
+impl MaintenanceState {
+    pub fn new() -> MaintenanceState {
+        return MaintenanceState(
+            pending_flush = false,
+            pending_compaction = false,
+            in_flight_flush = false,
+            in_flight_compaction = false,
+            shutdown = false
+        )
+    }
+}
+
+fn internal_flush_frozen_step(
+    ~reader: RwMutex<ReadState>,
+    ~writer: Mutex<WriterState>,
+    ~health: SharedHealth
+) -> Result<bool, KvError> {
+    if health.get() == (HEALTH_POISONED as i32) {
+        return Result<bool, KvError>::Err(KvError::poisoned())
+    }
+    if health.get() == (HEALTH_CLOSED as i32) {
+        return Result<bool, KvError>::Err(KvError::closed())
+    }
+
+    auto has_frozen# = false
+    auto cur_flush_id# = 0:u64
+    auto frozen_to_flush# = MemTable::new().freeze_with_id(0:u64)
+    {
+        auto r_lock_res = reader.read_lock()
+        if r_lock_res.is_err() {
+            return Result<bool, KvError>::Err(KvError::closed())
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        if rs.frozen_mems.len() > 0:usize {
+            has_frozen = true
+            unsafe {
+                auto *f_ptr = rs.frozen_mems.unsafe_get(0:usize)
+                cur_flush_id = f_ptr.flush_id()
+                frozen_to_flush = FrozenMemTable::clone_from_ptr((*f_ptr))
+            }
+        }
+    }
+
+    if !has_frozen {
+        return Result<bool, KvError>::Ok(false)
+    }
+    if frozen_to_flush.len() == 0:usize {
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            if rs.frozen_mems.len() > 0:usize {
+                auto _ = rs.frozen_mems#.remove(0:usize)
+            }
+        }
+        return Result<bool, KvError>::Ok(true)
+    }
+
+    auto w_lock_res = writer.lock()
+    if w_lock_res.is_err() {
+        return Result<bool, KvError>::Err(KvError::closed())
+    }
+    auto w_lock = w_lock_res.unwrap()
+    auto &w# = w_lock.get_ref()
+    if !w.opened {
+        return Result<bool, KvError>::Err(KvError::closed())
+    }
+    if w.poisoned || w.wal_writer.is_poisoned() {
+        health.set(HEALTH_POISONED as i32)
+        return Result<bool, KvError>::Err(KvError::poisoned())
+    }
+
+    auto alloc_res = w.version_set#.durable_allocate_file_number()
+    if alloc_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_POISONED
+        }
+        return Result<bool, KvError>::Err(alloc_res.unwrap_err())
+    }
+    auto file_num = alloc_res.unwrap()
+    auto sst_path = resolve_table_path(w.db_dir.clone(), file_num)
+
+    auto max_seq = frozen_to_flush.max_seq()
+    auto w_res = SSTableWriter::write(sst_path.clone(), cede frozen_to_flush)
+    if w_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_POISONED
+        }
+        return Result<bool, KvError>::Err(w_res.unwrap_err())
+    }
+    auto meta# = w_res.unwrap()
+    meta.file_number = file_num
+
+    auto retained_sealed# = Vec<SealedLogMetadata>::new()
+    auto pruned_sealed_nums# = Vec<u64>::new()
+    auto cur_sealed = w.version_set#.sealed_logs()
+    auto sl_i# = 0:usize
+    loop sl_i < cur_sealed.len() {
+        auto sl = cur_sealed.get(sl_i)
+        if sl.last_seq <= max_seq {
+            pruned_sealed_nums#.push(sl.log_number)
+        } else {
+            retained_sealed#.push(sl.clone())
+        }
+        sl_i = sl_i + 1:usize
+    }
+
+    auto edit_last_p_seq# = max_seq
+    if edit_last_p_seq < w.version_set#.last_persisted_seq() {
+        edit_last_p_seq = w.version_set#.last_persisted_seq()
+    }
+    auto edit# = VersionEdit::new(0:u64, 0:u64, edit_last_p_seq)
+    edit#.add_table(cede meta)
+    edit#.set_sealed_logs(cede retained_sealed)
+
+    auto apply_res = w.version_set#.log_and_apply(cede edit)
+    if apply_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_POISONED
+        }
+        return Result<bool, KvError>::Err(apply_res.unwrap_err())
+    }
+
+    auto new_version = w.version_set#.current()
+
+    auto r_wlock_res2 = reader.write_lock()
+    if r_wlock_res2.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        return Result<bool, KvError>::Err(KvError::poisoned())
+    }
+    {
+        auto r_wlock2 = r_wlock_res2.unwrap()
+        auto &rs2# = r_wlock2.get_ref()
+
+        auto del_idx# = -1:i64
+        auto fi# = 0:usize
+        loop fi < rs2.frozen_mems.len() {
+            unsafe {
+                auto *f_item_ptr = rs2.frozen_mems.unsafe_get(fi)
+                if f_item_ptr.flush_id() == cur_flush_id {
+                    del_idx = fi as i64
+                    break
+                }
+            }
+            fi = fi + 1:usize
+        }
+        if del_idx >= 0:i64 {
+            auto _ = rs2.frozen_mems#.remove(del_idx as usize)
+        }
+        rs2.current_version = new_version.clone()
+    }
+
+    auto p_idx# = 0:usize
+    loop p_idx < pruned_sealed_nums.len() {
+        auto old_log_num = pruned_sealed_nums.get(p_idx)
+        auto old_log_path = build_wal_path(w.db_dir.clone(), old_log_num)
+        remove_file(old_log_path)
+        p_idx = p_idx + 1:usize
+    }
+    if pruned_sealed_nums.len() > 0:usize {
+        sync_directory(w.db_dir.clone())
+    }
+
+    return Result<bool, KvError>::Ok(true)
+}
+
+fn internal_compact_l0_step(
+    ~reader: RwMutex<ReadState>,
+    ~writer: Mutex<WriterState>,
+    ~health: SharedHealth,
+    ~snapshots: Mutex<SnapshotRegistry>
+) -> Result<bool, KvError> {
+    if health.get() == (HEALTH_POISONED as i32) {
+        return Result<bool, KvError>::Err(KvError::poisoned())
+    }
+    if health.get() == (HEALTH_CLOSED as i32) {
+        return Result<bool, KvError>::Err(KvError::closed())
+    }
+    auto w_lock_res = writer.lock()
+    if w_lock_res.is_err() {
+        return Result<bool, KvError>::Err(KvError::closed())
+    }
+    auto w_lock = w_lock_res.unwrap()
+    auto &w# = w_lock.get_ref()
+
+    if !w.opened {
+        return Result<bool, KvError>::Err(KvError::closed())
+    }
+    if w.poisoned || w.wal_writer.is_poisoned() {
+        health.set(HEALTH_POISONED as i32)
+        return Result<bool, KvError>::Err(KvError::poisoned())
+    }
+
+    auto cur_ver = w.version_set#.current()
+    auto plan_opt = CompactionPlan::build(cur_ver)
+    if plan_opt.is_none() {
+        return Result<bool, KvError>::Ok(false)
+    }
+    auto plan = plan_opt.unwrap()
+
+    auto oldest_snap_opt# = Option<u64>::None
+    {
+        auto snap_lock_res = snapshots.lock()
+        if snap_lock_res.is_err() {
+            health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            return Result<bool, KvError>::Err(KvError::closed())
+        }
+        auto snap_g = snap_lock_res.unwrap()
+        auto &reg = snap_g.get_ref()
+        oldest_snap_opt = reg.oldest_sequence()
+    }
+
+    auto comp_res = Compactor::compact_plan(w.db_dir.clone(), plan, w.version_set#, oldest_snap_opt, 2097152:usize)
+    if comp_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_POISONED
+        }
+        return Result<bool, KvError>::Err(comp_res.unwrap_err())
+    }
+    auto new_l1_tables = comp_res.unwrap()
+
+    auto l1_inv_res = validate_l1_disjoint(plan.untouched_l1_handles, new_l1_tables)
+    if l1_inv_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_POISONED
+        }
+        return Result<bool, KvError>::Err(l1_inv_res.unwrap_err())
+    }
+
+    check_test_failpoint("after_compaction_sstable_commit")
+    check_test_failpoint("after_l1_sstables_written_before_manifest")
+
+    auto cur_watermark = w.version_set#.last_persisted_seq()
+    auto edit# = VersionEdit::new(0:u64, 0:u64, cur_watermark)
+    auto add_i# = 0:usize
+    loop add_i < new_l1_tables.len() {
+        unsafe {
+            auto *m_ptr = new_l1_tables.unsafe_get(add_i)
+            auto sk = m_ptr.smallest_key.clone()
+            auto lk = m_ptr.largest_key.clone()
+            auto meta = TableMetadata::new(
+                m_ptr.file_number, m_ptr.file_size, m_ptr.min_seq, m_ptr.max_seq,
+                cede sk, cede lk, m_ptr.level
+            )
+            edit#.add_table(cede meta)
+        }
+        add_i = add_i + 1:usize
+    }
+    auto d_idx# = 0:usize
+    loop d_idx < plan.old_file_numbers.len() {
+        edit#.delete_table(plan.old_file_numbers.get(d_idx))
+        d_idx = d_idx + 1:usize
+    }
+
+    auto apply_res = w.version_set#.log_and_apply(cede edit)
+    if apply_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        auto r_wlock_res = reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_POISONED
+        }
+        return Result<bool, KvError>::Err(apply_res.unwrap_err())
+    }
+
+    check_test_failpoint("after_compaction_manifest_commit")
+    check_test_failpoint("after_l1_manifest_commit_before_unlink")
+
+    auto new_version = w.version_set#.current()
+    auto r_wlock_res = reader.write_lock()
+    if r_wlock_res.is_err() {
+        health.set(HEALTH_POISONED as i32)
+        w.poisoned = true
+        return Result<bool, KvError>::Err(KvError::poisoned())
+    }
+    {
+        auto r_wlock = r_wlock_res.unwrap()
+        auto &rs# = r_wlock.get_ref()
+        rs.current_version = new_version.clone()
+    }
+
+    check_test_failpoint("before_compaction_old_file_unlink")
+
+    if health.get() == (HEALTH_READY as i32) {
+        auto u_idx# = 0:usize
+        loop u_idx < plan.old_file_numbers.len() {
+            auto old_num = plan.old_file_numbers.get(u_idx)
+            auto old_path = resolve_table_path(w.db_dir.clone(), old_num)
+            remove_file(old_path)
+            u_idx = u_idx + 1:usize
+        }
+    }
+
+    return Result<bool, KvError>::Ok(true)
+}
+
+/// TokaKvEngine: Thread-safe high performance storage engine facade.
+pub shape TokaKvEngine (
+    ~reader: RwMutex<ReadState>,
+    ~writer: Mutex<WriterState>,
+    ~health: SharedHealth,
+    ~snapshots: Mutex<SnapshotRegistry>,
+    ~maintenance: Mutex<MaintenanceState>,
+    ~worker: Mutex<Option<JoinHandle<i32>>>,
+    block_cache: BlockCache,
+    db_dir: string,
+    engine_id: u64,
+    snapshot_cap_token: u64,
+    write_buffer_size: usize,
+    write_buffer_max_entries: usize,
+    l0_compaction_threshold: usize,
+    l0_stop_writes_threshold: usize
+)
+
+impl TokaKvEngine@Encap {}
+impl TokaKvEngine@Send {}
+impl TokaKvEngine@Sync {}
+
+impl TokaKvEngine {
+    pub fn clone(self) -> TokaKvEngine {
+        return TokaKvEngine(
+            ~reader = self.~reader,
+            ~writer = self.~writer,
+            ~health = self.~health,
+            ~snapshots = self.~snapshots,
+            ~maintenance = self.~maintenance,
+            ~worker = self.~worker,
+            block_cache = self.block_cache.clone(),
+            db_dir = self.db_dir.clone(),
+            engine_id = self.engine_id,
+            snapshot_cap_token = self.snapshot_cap_token,
+            write_buffer_size = self.write_buffer_size,
+            write_buffer_max_entries = self.write_buffer_max_entries,
+            l0_compaction_threshold = self.l0_compaction_threshold,
+            l0_stop_writes_threshold = self.l0_stop_writes_threshold
+        )
+    }
+
+    /// Opens TokaKV storage engine from db_dir with default 8MB BlockCache.
+    pub fn open(db_dir: string) -> Result<TokaKvEngine, KvError> {
+        return TokaKvEngine::open_with_options(db_dir, 8388608:usize, 4194304:usize, 16384:usize, 4:usize, 12:usize)
+    }
+
+    /// Opens TokaKV storage engine with custom BlockCache capacity.
+    pub fn open_with_cache_capacity(db_dir: string, capacity_bytes: usize) -> Result<TokaKvEngine, KvError> {
+        return TokaKvEngine::open_with_options(db_dir, capacity_bytes, 4194304:usize, 16384:usize, 4:usize, 12:usize)
+    }
+
+    /// Opens TokaKV storage engine with fully customized maintenance thresholds.
+    pub fn open_with_options(
+        db_dir: string,
+        capacity_bytes: usize,
+        write_buffer_size: usize,
+        write_buffer_max_entries: usize,
+        l0_compaction_threshold: usize,
+        l0_stop_writes_threshold: usize
+    ) -> Result<TokaKvEngine, KvError> {
+        // Ensure db_dir exists and is a valid directory
+        auto meta_res = metadata(db_dir.clone())
+        if meta_res.is_ok() {
+            auto meta = meta_res.unwrap()
+            if !meta.is_dir() {
+                return Result<TokaKvEngine, KvError>::Err(
+                    KvError::io(IoError::new("open_db_dir", 20:i32, "database path exists but is not a directory"))
+                )
+            }
+        } else {
+            if !create_dir(db_dir.clone()) {
+                return Result<TokaKvEngine, KvError>::Err(
+                    KvError::io(IoError::new("create_db_dir", 2:i32, "failed to create database directory"))
+                )
+            }
+            // Durably sync the parent directory of db_dir
+            auto parent_p = extract_parent_dir(db_dir.clone())
+            auto p_sync = sync_directory(parent_p)
+            if p_sync.is_err() {
+                return Result<TokaKvEngine, KvError>::Err(KvError::io(p_sync.unwrap_err()))
+            }
+        }
+
+        auto vs_res = VersionSet::open_or_create(db_dir.clone())
+        if vs_res.is_err() {
+            return Result<TokaKvEngine, KvError>::Err(vs_res.unwrap_err())
+        }
+        auto vs# = vs_res.unwrap()
+        auto watermark = vs#.last_persisted_seq()
+        auto active_log_meta = vs#.active_log()
+        auto sealed_logs = vs#.sealed_logs()
+
+        auto mem# = MemTable::new()
+        auto highest_seq# = watermark
+        auto expected_seq_baseline# = 0:u64
+        if watermark > 0:u64 {
+            expected_seq_baseline = watermark + 1:u64
+        }
+
+        // 1. Replay sealed logs in chronological order
+        auto s_idx# = 0:usize
+        loop s_idx < sealed_logs.len() {
+            auto s_meta = sealed_logs.get(s_idx)
+            auto s_path = build_wal_path(db_dir.clone(), s_meta.log_number)
+            auto s_meta_res = metadata(s_path.clone())
+            if s_meta_res.is_err() {
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("required_sealed_wal_missing"))
+            }
+            auto s_file_meta = s_meta_res.unwrap()
+            if s_file_meta.is_dir() {
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("required_sealed_wal_missing"))
+            }
+            auto f_size = s_file_meta.len()
+
+            auto s_rec_res = replay_and_recover(s_path.clone())
+            if s_rec_res.is_err() {
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(s_rec_res.unwrap_err())
+            }
+            auto s_rec = s_rec_res.unwrap()
+            if s_rec.truncated_torn_tail() || s_rec.valid_end_offset() != f_size {
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("sealed_wal_truncated"))
+            }
+
+            auto s_entries = s_rec.entries()
+            if s_entries.len() == 0:usize {
+                if s_meta.first_seq > 0:u64 {
+                    vs#.close()
+                    return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("sealed_wal_bounds_mismatch"))
+                }
+            } else {
+                auto first_e = s_entries.get(0:usize)
+                auto last_e = s_entries.get(s_entries.len() - 1:usize)
+                if first_e.seq != s_meta.first_seq || last_e.seq != s_meta.last_seq {
+                    vs#.close()
+                    return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("sealed_wal_bounds_mismatch"))
+                }
+            }
+
+            auto e_i# = 0:usize
+            loop e_i < s_entries.len() {
+                auto e = s_entries.get(e_i)
+                if e.seq > watermark {
+                    if expected_seq_baseline > 0:u64 && e.seq != expected_seq_baseline {
+                        vs#.close()
+                        return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("non_monotonic_sequence_across_generations"))
+                    }
+                    expected_seq_baseline = e.seq + 1:u64
+                    if e.seq > highest_seq {
+                        highest_seq = e.seq
+                    }
+                    auto k = e.key.clone()
+                    if e.is_del {
+                        mem#.delete(e.seq, cede k)
+                    } else {
+                        auto v = e.value.clone()
+                        mem#.put(e.seq, cede k, cede v)
+                    }
+                }
+                e_i = e_i + 1:usize
+            }
+            s_idx = s_idx + 1:usize
+        }
+
+        // 2. Replay active log
+        auto act_path = build_wal_path(db_dir.clone(), active_log_meta.log_number)
+        auto act_meta_res = metadata(act_path.clone())
+        auto act_exists# = false
+        auto is_existing_db = vs#.manifest_seq() > 0:u64 || vs#.current().tables_count() > 0:usize || sealed_logs.len() > 0:usize
+        if act_meta_res.is_err() {
+            if is_existing_db {
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("required_active_wal_missing"))
+            }
+        } else {
+            act_exists = true
+            auto act_file_meta = act_meta_res.unwrap()
+            if act_file_meta.is_dir() {
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("required_active_wal_missing"))
+            }
+        }
+        auto act_recovery_res = replay_and_recover(act_path.clone())
+        if act_recovery_res.is_err() {
+            vs#.close()
+            return Result<TokaKvEngine, KvError>::Err(act_recovery_res.unwrap_err())
+        }
+        auto act_recovery = act_recovery_res.unwrap()
+        auto act_entries = act_recovery.entries()
+        auto a_i# = 0:usize
+        loop a_i < act_entries.len() {
+            auto e = act_entries.get(a_i)
+            if e.seq > watermark {
+                if expected_seq_baseline > 0:u64 && e.seq != expected_seq_baseline {
+                    vs#.close()
+                    return Result<TokaKvEngine, KvError>::Err(KvError::corrupted("non_monotonic_sequence_across_generations"))
+                }
+                expected_seq_baseline = e.seq + 1:u64
+                if e.seq > highest_seq {
+                    highest_seq = e.seq
+                }
+                auto k = e.key.clone()
+                if e.is_del {
+                    mem#.delete(e.seq, cede k)
+                } else {
+                    auto v = e.value.clone()
+                    mem#.put(e.seq, cede k, cede v)
+                }
+            }
+            a_i = a_i + 1:usize
+        }
+
+        // 3. Open WalWriter on active log
+        auto writer_res = WalWriter::open(act_path.clone(), act_recovery.valid_end_offset(), highest_seq)
+        if writer_res.is_err() {
+            vs#.close()
+            return Result<TokaKvEngine, KvError>::Err(writer_res.unwrap_err())
+        }
+        auto writer# = writer_res.unwrap()
+
+        if !act_exists {
+            auto d_sync = sync_directory(db_dir.clone())
+            if d_sync.is_err() {
+                writer#.close()
+                vs#.close()
+                return Result<TokaKvEngine, KvError>::Err(KvError::io(d_sync.unwrap_err()))
+            }
+        }
+
+        auto start_seq# = 1:u64
+        if highest_seq > 0:u64 {
+            start_seq = highest_seq + 1:u64
+        }
+
+        auto initial_version = vs#.current()
+        auto empty_frozens = Vec<FrozenMemTable>::new()
+        auto read_state = ReadState::new(cede mem, cede empty_frozens, cede initial_version)
+        auto ~r_rwlock = RwMutex<ReadState>::make_shared(cede read_state)
+
+        auto writer_state = WriterState(
+            wal_writer = cede writer,
+            version_set = cede vs,
+            next_seq = start_seq,
+            next_flush_id = 1:u64,
+            opened = true,
+            poisoned = false,
+            db_dir = db_dir.clone()
+        )
+        auto ~w_mutex = Mutex<WriterState>::make_shared(cede writer_state)
+        auto ~shared_health = new SharedHealth(ptr = sys_atomic_init_i32(HEALTH_READY as i32))
+        auto engine_id# = 0:u64
+        unsafe {
+            engine_id = toka_kv_next_engine_id()
+        }
+        auto cap_token = engine_id ^ 0xA5A5A5A55A5A5A5A:u64
+        auto ~shared_snapshots = Mutex<SnapshotRegistry>::make_shared(SnapshotRegistry::new(cap_token))
+        auto cache = BlockCache::new(capacity_bytes)
+
+        auto m_state = MaintenanceState::new()
+        auto ~shared_maint = Mutex<MaintenanceState>::make_shared(cede m_state)
+        auto none_handle = Option<JoinHandle<i32>>::None
+        auto ~shared_worker = Mutex<Option<JoinHandle<i32>>>::make_shared(cede none_handle)
+
+        auto engine = TokaKvEngine(
+            ~reader = ~r_rwlock,
+            ~writer = ~w_mutex,
+            ~health = ~shared_health,
+            ~snapshots = ~shared_snapshots,
+            ~maintenance = ~shared_maint,
+            ~worker = ~shared_worker,
+            block_cache = cede cache,
+            db_dir = db_dir.clone(),
+            engine_id = engine_id,
+            snapshot_cap_token = cap_token,
+            write_buffer_size = write_buffer_size,
+            write_buffer_max_entries = write_buffer_max_entries,
+            l0_compaction_threshold = l0_compaction_threshold,
+            l0_stop_writes_threshold = l0_stop_writes_threshold
+        )
+
+        return Result<TokaKvEngine, KvError>::Ok(cede engine)
+    }
+
+    fn run_maintenance_worker_loop(self) {
+        loop {
+            auto should_stop# = false
+            auto do_flush# = false
+            auto do_compaction# = false
+
+            {
+                auto m_lock_res = self.maintenance.lock()
+                if m_lock_res.is_err() {
+                    break
+                }
+                auto m_lock = m_lock_res.unwrap()
+                auto &ms# = m_lock.get_ref()
+
+                if ms.shutdown || self.health.get() == (HEALTH_POISONED as i32) || self.health.get() == (HEALTH_CLOSED as i32) {
+                    should_stop = true
+                }
+
+                if ms.pending_flush {
+                    do_flush = true
+                    ms.pending_flush = false
+                    ms.in_flight_flush = true
+                } else if ms.pending_compaction {
+                    do_compaction = true
+                    ms.pending_compaction = false
+                    ms.in_flight_compaction = true
+                }
+            }
+
+            if should_stop && !do_flush && !do_compaction {
+                break
+            }
+
+            if do_flush {
+                auto f_res = internal_flush_frozen_step(self.~reader, self.~writer, self.~health)
+                {
+                    auto m_lock_res2 = self.maintenance.lock()
+                    if m_lock_res2.is_ok() {
+                        auto m_lock2 = m_lock_res2.unwrap()
+                        auto &ms2# = m_lock2.get_ref()
+                        ms2.in_flight_flush = false
+                    }
+                }
+                if f_res.is_err() {
+                    self.health.set(HEALTH_POISONED as i32)
+                    break
+                }
+                // Check if L0 compaction needed after flush
+                auto r_lock_res = self.reader.read_lock()
+                if r_lock_res.is_ok() {
+                    auto r_lock = r_lock_res.unwrap()
+                    auto &rs = r_lock.get_ref()
+                    if rs.current_version.l0_count() >= self.l0_compaction_threshold {
+                        auto m_lock_res3 = self.maintenance.lock()
+                        if m_lock_res3.is_ok() {
+                            auto m_lock3 = m_lock_res3.unwrap()
+                            auto &ms3# = m_lock3.get_ref()
+                            ms3.pending_compaction = true
+                        }
+                    }
+                }
+            } else if do_compaction {
+                auto c_res = internal_compact_l0_step(self.~reader, self.~writer, self.~health, self.~snapshots)
+                {
+                    auto m_lock_res4 = self.maintenance.lock()
+                    if m_lock_res4.is_ok() {
+                        auto m_lock4 = m_lock_res4.unwrap()
+                        auto &ms4# = m_lock4.get_ref()
+                        ms4.in_flight_compaction = false
+                    }
+                }
+                if c_res.is_err() {
+                    self.health.set(HEALTH_POISONED as i32)
+                    break
+                }
+            } else {
+                sleep_ms(2:u32)
+            }
+        }
+    }
+
+    /// Checks if engine is poisoned (fail-closed state).
+    pub fn is_poisoned(self) -> bool {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return true
+        }
+        auto r_lock_res = self.reader.read_lock()
+        if r_lock_res.is_err() {
+            return true
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        return rs.health == HEALTH_POISONED
+    }
+
+    /// Checks if engine is closed.
+    pub fn is_closed(self) -> bool {
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return true
+        }
+        auto r_lock_res = self.reader.read_lock()
+        if r_lock_res.is_err() {
+            return true
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        return rs.health == HEALTH_CLOSED
+    }
+
+    /// Acquires a point-in-time Snapshot lease with RAII auto-deregistration.
+    pub fn acquire_snapshot(self) -> Result<SnapshotLease, KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<SnapshotLease, KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<SnapshotLease, KvError>::Err(KvError::closed())
+        }
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return Result<SnapshotLease, KvError>::Err(KvError::closed())
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w = w_lock.get_ref()
+        if !w.opened {
+            return Result<SnapshotLease, KvError>::Err(KvError::closed())
+        }
+        if w.poisoned || w.wal_writer.is_poisoned() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<SnapshotLease, KvError>::Err(KvError::poisoned())
+        }
+
+        auto seq# = 0:u64
+        if w.next_seq > 1:u64 {
+            seq = w.next_seq - 1:u64
+        }
+        auto snap_lock_res = self.snapshots.lock()
+        if snap_lock_res.is_err() {
+            return Result<SnapshotLease, KvError>::Err(KvError::closed())
+        }
+        auto snap_g = snap_lock_res.unwrap()
+        auto &reg# = snap_g.get_ref()
+        auto cap = EngineSnapshotCapability::grant_for_engine(self.snapshot_cap_token, self.engine_id)
+        return reg#.acquire_lease_with_cap(seq, self.engine_id, self.~snapshots, cap)
+    }
+
+    /// Point lookup at a specific snapshot point-in-time using authoritative registered sequence.
+    pub fn get_at_snapshot(self, key: string, lease: SnapshotLease) -> Result<Option<string>, KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<Option<string>, KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        if lease.engine_id() != self.engine_id {
+            return Result<Option<string>, KvError>::Err(KvError::corrupted("snapshot_lease_engine_mismatch"))
+        }
+        auto snap_lock_res = self.snapshots.lock()
+        if snap_lock_res.is_err() {
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        auto snap_g = snap_lock_res.unwrap()
+        auto &reg = snap_g.get_ref()
+        auto seq_opt = reg.get_sequence_for_id(lease.id())
+        if seq_opt.is_none() {
+            return Result<Option<string>, KvError>::Err(KvError::corrupted("snapshot_lease_expired_or_released"))
+        }
+        auto authoritative_seq = seq_opt.unwrap()
+
+        auto r_lock_res = self.reader.read_lock()
+        if r_lock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        if rs.health == HEALTH_POISONED {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<Option<string>, KvError>::Err(KvError::poisoned())
+        }
+        if rs.health == HEALTH_CLOSED {
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        return rs.get_at_seq(key, authoritative_seq, Option<BlockCache>::Some(self.block_cache.clone()))
+    }
+
+    /// Returns the oldest live snapshot sequence (Result<Option<u64>, KvError>). Fail-closed on lock error.
+    pub fn oldest_live_snapshot_seq(self) -> Result<Option<u64>, KvError> {
+        auto snap_lock_res = self.snapshots.lock()
+        if snap_lock_res.is_err() {
+            return Result<Option<u64>, KvError>::Err(KvError::closed())
+        }
+        auto snap_g = snap_lock_res.unwrap()
+        auto &reg = snap_g.get_ref()
+        return Result<Option<u64>, KvError>::Ok(reg.oldest_sequence())
+    }
+
+    /// Point lookup for a key taking immutable self receiver.
+    /// Runs concurrently across reader threads without taking the writer mutex.
+    pub fn get(self, key: string) -> Result<Option<string>, KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<Option<string>, KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        auto r_lock_res = self.reader.read_lock()
+        if r_lock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        if rs.health == HEALTH_POISONED {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<Option<string>, KvError>::Err(KvError::poisoned())
+        }
+        if rs.health == HEALTH_CLOSED {
+            return Result<Option<string>, KvError>::Err(KvError::closed())
+        }
+        return rs.get(key, Option<BlockCache>::Some(self.block_cache.clone()))
+    }
+
+    pub fn signal_maintenance(self, flush: bool, compaction: bool) {
+        auto m_lock_res = self.maintenance.lock()
+        if m_lock_res.is_ok() {
+            auto m_lock = m_lock_res.unwrap()
+            auto &ms# = m_lock.get_ref()
+            if flush {
+                ms.pending_flush = true
+            }
+            if compaction {
+                ms.pending_compaction = true
+            }
+        }
+    }
+
+    fn rotate_active_to_frozen_and_signal(self) {
+        auto rot_res = self.rotate_memtable()
+        if rot_res.is_ok() {
+            auto _ = self.rotate_wal()
+            self.signal_maintenance(true, false)
+        }
+    }
+
+    /// Writes a key-value pair.
+    pub fn put(self, key: string, value: string) -> Result<u64, KvError> {
+        loop {
+            if self.health.get() == (HEALTH_POISONED as i32) {
+                return Result<u64, KvError>::Err(KvError::poisoned())
+            }
+            if self.health.get() == (HEALTH_CLOSED as i32) {
+                return Result<u64, KvError>::Err(KvError::closed())
+            }
+
+            auto need_stall# = false
+            {
+                auto r_lock_res = self.reader.read_lock()
+                if r_lock_res.is_ok() {
+                    auto r_lock = r_lock_res.unwrap()
+                    auto &rs = r_lock.get_ref()
+                    if rs.health == HEALTH_POISONED {
+                        self.health.set(HEALTH_POISONED as i32)
+                        return Result<u64, KvError>::Err(KvError::poisoned())
+                    }
+                    if rs.health == HEALTH_CLOSED {
+                        return Result<u64, KvError>::Err(KvError::closed())
+                    }
+                    if rs.frozen_mems.len() >= 3:usize || rs.current_version.l0_count() >= self.l0_stop_writes_threshold {
+                        need_stall = true
+                    }
+                }
+            }
+            if !need_stall {
+                break
+            }
+            self.signal_maintenance(true, true)
+            sleep_ms(1:u32)
+        }
+
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w# = w_lock.get_ref()
+
+        if !w.opened {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        if w.poisoned || w.wal_writer.is_poisoned() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<u64, KvError>::Err(KvError::poisoned())
+        }
+
+        auto seq = w.next_seq
+        auto wal_res = w.wal_writer#.append(OP_PUT, seq, key.clone(), value.clone())
+        if wal_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            auto r_wlock_res = self.reader.write_lock()
+            if r_wlock_res.is_ok() {
+                auto r_wlock = r_wlock_res.unwrap()
+                auto &rs# = r_wlock.get_ref()
+                rs.health = HEALTH_POISONED
+            }
+            return Result<u64, KvError>::Err(wal_res.unwrap_err())
+        }
+
+        w.next_seq = w.next_seq + 1:u64
+
+        auto r_wlock_res = self.reader.write_lock()
+        if r_wlock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            return Result<u64, KvError>::Err(KvError::poisoned())
+        }
+        {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            auto k_mem = key.clone()
+            auto v_mem = value.clone()
+            rs.active_mem#.put(seq, cede k_mem, cede v_mem)
+        }
+
+        auto need_rotate# = false
+        {
+            auto r_lock_res3 = self.reader.read_lock()
+            if r_lock_res3.is_ok() {
+                auto r_lock3 = r_lock_res3.unwrap()
+                auto &rs3 = r_lock3.get_ref()
+                if rs3.active_mem.size_bytes() >= self.write_buffer_size || rs3.active_mem.len() >= self.write_buffer_max_entries {
+                    need_rotate = true
+                }
+            }
+        }
+        if need_rotate {
+            self.rotate_active_to_frozen_and_signal()
+        } else {
+            auto need_comp# = false
+            {
+                auto r_lock_res4 = self.reader.read_lock()
+                if r_lock_res4.is_ok() {
+                    auto r_lock4 = r_lock_res4.unwrap()
+                    auto &rs4 = r_lock4.get_ref()
+                    if rs4.current_version.l0_count() >= self.l0_compaction_threshold {
+                        need_comp = true
+                    }
+                }
+            }
+            if need_comp {
+                self.signal_maintenance(false, true)
+            }
+        }
+
+        return Result<u64, KvError>::Ok(seq)
+    }
+
+    /// Marks a key as deleted.
+    pub fn delete(self, key: string) -> Result<u64, KvError> {
+        loop {
+            if self.health.get() == (HEALTH_POISONED as i32) {
+                return Result<u64, KvError>::Err(KvError::poisoned())
+            }
+            if self.health.get() == (HEALTH_CLOSED as i32) {
+                return Result<u64, KvError>::Err(KvError::closed())
+            }
+
+            auto need_stall# = false
+            {
+                auto r_lock_res = self.reader.read_lock()
+                if r_lock_res.is_ok() {
+                    auto r_lock = r_lock_res.unwrap()
+                    auto &rs = r_lock.get_ref()
+                    if rs.health == HEALTH_POISONED {
+                        self.health.set(HEALTH_POISONED as i32)
+                        return Result<u64, KvError>::Err(KvError::poisoned())
+                    }
+                    if rs.health == HEALTH_CLOSED {
+                        return Result<u64, KvError>::Err(KvError::closed())
+                    }
+                    if rs.frozen_mems.len() >= 3:usize || rs.current_version.l0_count() >= self.l0_stop_writes_threshold {
+                        need_stall = true
+                    }
+                }
+            }
+            if !need_stall {
+                break
+            }
+            self.signal_maintenance(true, true)
+            sleep_ms(1:u32)
+        }
+
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w# = w_lock.get_ref()
+
+        if !w.opened {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        if w.poisoned || w.wal_writer.is_poisoned() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<u64, KvError>::Err(KvError::poisoned())
+        }
+
+        auto seq = w.next_seq
+        auto wal_res = w.wal_writer#.append(OP_DELETE, seq, key.clone(), string::new())
+        if wal_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            auto r_wlock_res = self.reader.write_lock()
+            if r_wlock_res.is_ok() {
+                auto r_wlock = r_wlock_res.unwrap()
+                auto &rs# = r_wlock.get_ref()
+                rs.health = HEALTH_POISONED
+            }
+            return Result<u64, KvError>::Err(wal_res.unwrap_err())
+        }
+
+        w.next_seq = w.next_seq + 1:u64
+
+        auto r_wlock_res = self.reader.write_lock()
+        if r_wlock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            return Result<u64, KvError>::Err(KvError::poisoned())
+        }
+        {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            auto k_mem = key.clone()
+            rs.active_mem#.delete(seq, cede k_mem)
+        }
+
+        auto need_rotate# = false
+        {
+            auto r_lock_res3 = self.reader.read_lock()
+            if r_lock_res3.is_ok() {
+                auto r_lock3 = r_lock_res3.unwrap()
+                auto &rs3 = r_lock3.get_ref()
+                if rs3.active_mem.size_bytes() >= self.write_buffer_size || rs3.active_mem.len() >= self.write_buffer_max_entries {
+                    need_rotate = true
+                }
+            }
+        }
+        if need_rotate {
+            self.rotate_active_to_frozen_and_signal()
+        } else {
+            auto need_comp# = false
+            {
+                auto r_lock_res4 = self.reader.read_lock()
+                if r_lock_res4.is_ok() {
+                    auto r_lock4 = r_lock_res4.unwrap()
+                    auto &rs4 = r_lock4.get_ref()
+                    if rs4.current_version.l0_count() >= self.l0_compaction_threshold {
+                        need_comp = true
+                    }
+                }
+            }
+            if need_comp {
+                self.signal_maintenance(false, true)
+            }
+        }
+
+        return Result<u64, KvError>::Ok(seq)
+    }
+
+    /// Two-stage flush: rotates active MemTable to frozen, writes SSTable & commits Manifest unlocked,
+    /// and installs new Version with zero query gaps.
+    pub fn flush_active_memtable(self) -> Result<(), KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<(), KvError>::Err(KvError::closed())
+        }
+
+        auto is_active_empty# = true
+        {
+            auto r_lock_res = self.reader.read_lock()
+            if r_lock_res.is_ok() {
+                auto r_lock = r_lock_res.unwrap()
+                auto &rs = r_lock.get_ref()
+                is_active_empty = rs.active_mem.is_empty()
+            }
+        }
+        if !is_active_empty {
+            auto rot_res = self.rotate_memtable()
+            if rot_res.is_err() {
+                return Result<(), KvError>::Err(rot_res.unwrap_err())
+            }
+            auto wal_rot_res = self.rotate_wal()
+            if wal_rot_res.is_err() {
+                return Result<(), KvError>::Err(wal_rot_res.unwrap_err())
+            }
+        }
+
+        loop {
+            auto f_res = internal_flush_frozen_step(self.~reader, self.~writer, self.~health)
+            if f_res.is_err() {
+                return Result<(), KvError>::Err(f_res.unwrap_err())
+            }
+            if !f_res.unwrap() {
+                break
+            }
+        }
+        return Result<(), KvError>::Ok(())
+    }
+
+    /// Freezes active MemTable and moves it to frozen_mems queue.
+    pub fn rotate_memtable(self) -> Result<(), KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<(), KvError>::Err(KvError::closed())
+        }
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return Result<(), KvError>::Err(KvError::closed())
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w# = w_lock.get_ref()
+
+        if !w.opened {
+            return Result<(), KvError>::Err(KvError::closed())
+        }
+        if w.poisoned || w.wal_writer.is_poisoned() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+
+        auto cur_flush_id = w.next_flush_id
+        w.next_flush_id = w.next_flush_id + 1:u64
+
+        auto r_wlock_res = self.reader.write_lock()
+        if r_wlock_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            return Result<(), KvError>::Err(KvError::poisoned())
+        }
+        auto r_wlock = r_wlock_res.unwrap()
+        auto &rs# = r_wlock.get_ref()
+
+        auto frozen = rs#.rotate_active(cur_flush_id)
+        rs.frozen_mems#.push(cede frozen)
+        return Result<(), KvError>::Ok(())
+    }
+
+    /// Rotates active WAL generation into a sealed log and installs a new active WAL writer.
+    pub fn rotate_wal(self) -> Result<u64, KvError> {
+        if self.health.get() == (HEALTH_POISONED as i32) {
+            return Result<u64, KvError>::Err(KvError::poisoned())
+        }
+        if self.health.get() == (HEALTH_CLOSED as i32) {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w# = w_lock.get_ref()
+
+        if !w.opened {
+            return Result<u64, KvError>::Err(KvError::closed())
+        }
+        if w.poisoned || w.wal_writer.is_poisoned() {
+            self.health.set(HEALTH_POISONED as i32)
+            return Result<u64, KvError>::Err(KvError::poisoned())
+        }
+
+        auto cur_active_meta = w.version_set#.active_log()
+        auto old_log_num = cur_active_meta.log_number
+        auto old_first_seq = cur_active_meta.first_seq
+        auto old_last_seq = w.wal_writer.last_seq()
+
+        // 1. Allocate new file number for new WAL generation
+        auto alloc_res = w.version_set#.durable_allocate_file_number()
+        if alloc_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            auto r_wlock_res = self.reader.write_lock()
+            if r_wlock_res.is_ok() {
+                auto r_wlock = r_wlock_res.unwrap()
+                auto &rs# = r_wlock.get_ref()
+                rs.health = HEALTH_POISONED
+            }
+            return Result<u64, KvError>::Err(alloc_res.unwrap_err())
+        }
+        auto new_log_num = alloc_res.unwrap()
+        auto new_wal_path = build_wal_path(w.db_dir.clone(), new_log_num)
+
+        // 2. Open and create new WalWriter
+        auto new_writer_res = WalWriter::open(new_wal_path.clone(), 0:u64, old_last_seq)
+        if new_writer_res.is_err() {
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            auto r_wlock_res = self.reader.write_lock()
+            if r_wlock_res.is_ok() {
+                auto r_wlock = r_wlock_res.unwrap()
+                auto &rs# = r_wlock.get_ref()
+                rs.health = HEALTH_POISONED
+            }
+            return Result<u64, KvError>::Err(new_writer_res.unwrap_err())
+        }
+        auto new_writer# = new_writer_res.unwrap()
+
+        // Sync directory to ensure new WAL file entry is durable
+        auto d_sync = sync_directory(w.db_dir.clone())
+        if d_sync.is_err() {
+            new_writer#.close()
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            return Result<u64, KvError>::Err(KvError::io(d_sync.unwrap_err()))
+        }
+
+        // Test-only failpoint 1: After new WAL file create, before Manifest commit
+        check_test_failpoint("after_wal_rotation_file_create")
+
+        // 3. Construct and commit durable Manifest VersionEdit
+        auto cur_watermark = w.version_set#.last_persisted_seq()
+        auto edit# = VersionEdit::new(0:u64, 0:u64, cur_watermark)
+        edit#.set_active_log(new_log_num, w.next_seq)
+
+        // Add old active log to sealed_logs only if it had actual mutations
+        auto retained_sealed# = Vec<SealedLogMetadata>::new()
+        auto pruned_sealed_nums# = Vec<u64>::new()
+        auto cur_sealed = w.version_set#.sealed_logs()
+        auto sl_i# = 0:usize
+        loop sl_i < cur_sealed.len() {
+            auto sl = cur_sealed.get(sl_i)
+            if sl.last_seq <= cur_watermark {
+                pruned_sealed_nums#.push(sl.log_number)
+            } else {
+                retained_sealed#.push(sl.clone())
+            }
+            sl_i = sl_i + 1:usize
+        }
+
+        if old_last_seq >= old_first_seq && old_last_seq > 0:u64 {
+            if old_last_seq <= cur_watermark {
+                pruned_sealed_nums#.push(old_log_num)
+            } else {
+                retained_sealed#.push(SealedLogMetadata::new(old_log_num, old_first_seq, old_last_seq))
+            }
+        }
+
+        edit#.set_sealed_logs(cede retained_sealed)
+
+        auto apply_res = w.version_set#.log_and_apply(cede edit)
+        if apply_res.is_err() {
+            new_writer#.close()
+            self.health.set(HEALTH_POISONED as i32)
+            w.poisoned = true
+            auto r_wlock_res = self.reader.write_lock()
+            if r_wlock_res.is_ok() {
+                auto r_wlock = r_wlock_res.unwrap()
+                auto &rs# = r_wlock.get_ref()
+                rs.health = HEALTH_POISONED
+            }
+            return Result<u64, KvError>::Err(apply_res.unwrap_err())
+        }
+
+        // Test-only failpoint 2: After Manifest commit, before switching writer
+        check_test_failpoint("after_wal_rotation_manifest_commit")
+
+        // 4. Switch active WalWriter in WriterState
+        auto old_writer# = cede w.wal_writer
+        w.wal_writer = cede new_writer
+        old_writer#.close()
+
+        // Test-only failpoint 3: After switching writer, before unlinking pruned logs
+        check_test_failpoint("before_wal_rotation_old_log_unlink")
+
+        // 5. Best-effort unlink of fully covered pruned logs
+        auto p_i# = 0:usize
+        loop p_i < pruned_sealed_nums.len() {
+            auto del_num = pruned_sealed_nums.get(p_i)
+            auto del_path = build_wal_path(w.db_dir.clone(), del_num)
+            remove_file(del_path)
+            p_i = p_i + 1:usize
+        }
+        if pruned_sealed_nums.len() > 0:usize {
+            sync_directory(w.db_dir.clone())
+        }
+
+        return Result<u64, KvError>::Ok(new_log_num)
+    }
+
+    /// Single-writer, synchronous Level-0 compaction.
+    pub fn compact_l0(self) -> Result<(), KvError> {
+        auto c_res = internal_compact_l0_step(self.~reader, self.~writer, self.~health, self.~snapshots)
+        if c_res.is_err() {
+            return Result<(), KvError>::Err(c_res.unwrap_err())
+        }
+        return Result<(), KvError>::Ok(())
+    }
+
+    /// Closes engine safely.
+    pub fn close(self) -> Result<(), KvError> {
+        // 1. Signal shutdown to maintenance queue
+        {
+            auto m_lock_res = self.maintenance.lock()
+            if m_lock_res.is_ok() {
+                auto m_lock = m_lock_res.unwrap()
+                auto &ms# = m_lock.get_ref()
+                ms.shutdown = true
+            }
+        }
+
+        // 2. Join background worker thread if active
+        {
+            auto w_h_lock_res = self.worker.lock()
+            if w_h_lock_res.is_ok() {
+                auto w_h_lock = w_h_lock_res.unwrap()
+                auto &handle_opt# = w_h_lock.get_ref()
+                if handle_opt.is_some() {
+                    match handle_opt {
+                        auto Option::Some(&h#) => {
+                            auto _ = h#.join()
+                        }
+                        _ => {}
+                    }
+                    handle_opt = Option<JoinHandle<i32>>::None
+                }
+            }
+        }
+
+        // 3. Mark engine health as closed. Closing does not implicitly rotate
+        // or flush the active MemTable; WAL replay remains the recovery source.
+        self.health.set(HEALTH_CLOSED as i32)
+
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return Result<(), KvError>::Ok(())
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w# = w_lock.get_ref()
+
+        if !w.opened {
+            return Result<(), KvError>::Ok(())
+        }
+        w.opened = false
+
+        // Mark reader health as closed
+        auto r_wlock_res = self.reader.write_lock()
+        if r_wlock_res.is_ok() {
+            auto r_wlock = r_wlock_res.unwrap()
+            auto &rs# = r_wlock.get_ref()
+            rs.health = HEALTH_CLOSED
+        }
+
+        auto wal_res = w.wal_writer#.close()
+        auto vs_res = w.version_set#.close()
+        if wal_res.is_err() {
+            return wal_res
+        }
+        return vs_res
+    }
+
+    pub fn active_mem_size(self) -> usize {
+        auto r_lock_res = self.reader.read_lock()
+        if r_lock_res.is_err() {
+            return 0:usize
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        return rs.active_mem.size_bytes()
+    }
+
+    pub fn current_seq(self) -> u64 {
+        auto w_lock_res = self.writer.lock()
+        if w_lock_res.is_err() {
+            return 0:u64
+        }
+        auto w_lock = w_lock_res.unwrap()
+        auto &w = w_lock.get_ref()
+        if w.next_seq > 0:u64 {
+            return w.next_seq - 1:u64
+        }
+        return 0:u64
+    }
+
+    pub fn current_version(self) -> Version {
+        auto r_lock_res = self.reader.read_lock()
+        if r_lock_res.is_err() {
+            auto empty_tables = Vec<TableHandle>::new()
+            return Version::new(cede empty_tables, 0:u64)
+        }
+        auto r_lock = r_lock_res.unwrap()
+        auto &rs = r_lock.get_ref()
+        return rs.current_version.clone()
+    }
+
+    pub fn block_cache_stats(self) -> CacheStats {
+        return self.block_cache.stats()
+    }
+}

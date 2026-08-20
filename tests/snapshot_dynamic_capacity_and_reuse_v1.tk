@@ -1,0 +1,84 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/snapshot_dynamic_capacity_and_reuse_v1.tk
+// Verification of dynamic SnapshotRegistry scaling (>512 leases), multi-query borrowing,
+// and correct advancing of oldest live snapshot sequence.
+
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine, SnapshotLease}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Acquire 600 concurrent active leases (verifying >512 capacity scaling)
+    auto total_leases = 600:usize
+    auto leases# = Vec<SnapshotLease>::new()
+    auto i# = 1:usize
+    loop i <= total_leases {
+        auto k# = string::from("dyn_key_")
+        k#.push_str(string::from_int(i as i32).as_str())
+        auto v# = string::from("dyn_val_")
+        v#.push_str(string::from_int(i as i32).as_str())
+        db#.put(cede k, cede v).unwrap()
+
+        auto lease_res = db#.acquire_snapshot()
+        assert(lease_res.is_ok(), "acquire_snapshot must succeed beyond 512 capacity")
+        auto lease = lease_res.unwrap()
+        assert(lease.sequence() == i as u64, "lease seq must match write seq")
+        leases#.push(cede lease)
+
+        i = i + 1:usize
+    }
+
+    assert(leases.len() == 600:usize, "must have 600 active leases")
+    assert(db#.oldest_live_snapshot_seq().unwrap().unwrap() == 1:u64, "oldest snapshot must be 1")
+
+    // 2. Multi-query test: query each lease twice, then move into checked
+    auto checked# = Vec<SnapshotLease>::new()
+    loop leases.len() > 0:usize {
+        auto lease = leases#.pop().unwrap()
+        auto seq = lease.sequence()
+        auto k# = string::from("dyn_key_")
+        k#.push_str(string::from_int(seq as i32).as_str())
+        auto exp_v# = string::from("dyn_val_")
+        exp_v#.push_str(string::from_int(seq as i32).as_str())
+
+        // Query 1 on lease
+        auto r1 = db#.get_at_snapshot(k.clone(), lease).unwrap()
+        assert(r1.is_some(), "r1 must find key")
+        assert(r1.unwrap().as_str().equals(exp_v.as_str()), "r1 val mismatch")
+
+        // Query 2 on same lease (proving non-destructive borrowing)
+        auto r2 = db#.get_at_snapshot(cede k, lease).unwrap()
+        assert(r2.is_some(), "r2 must find key")
+        assert(r2.unwrap().as_str().equals(exp_v.as_str()), "r2 val mismatch")
+
+        checked#.push(cede lease)
+    }
+
+    // 3. Drop first 300 leases (seq 1..300 are at the back of checked)
+    auto d# = 0:usize
+    loop d < 300:usize {
+        auto dropped_lease = checked#.pop().unwrap()
+        d = d + 1:usize
+    }
+
+    // Now checked contains seq 600 down to 301.
+    // 4. Oldest snapshot sequence must advance to 301
+    assert(db#.oldest_live_snapshot_seq().unwrap().unwrap() == 301:u64, "oldest snapshot must advance to 301")
+
+    // 5. Clear remaining leases (seq 301..600)
+    checked#.clear()
+    assert(db#.oldest_live_snapshot_seq().unwrap().is_none(), "oldest snapshot must be None after all drop")
+
+    db#.close().unwrap()
+    tmp#.remove()
+
+    println("[TokaKV] snapshot_dynamic_capacity_and_reuse_v1 PASSED!")
+    return 0
+}

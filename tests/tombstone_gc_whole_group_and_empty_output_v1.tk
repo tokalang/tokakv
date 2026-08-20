@@ -1,0 +1,83 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/tombstone_gc_whole_group_and_empty_output_v1.tk
+// Verification of whole-group tombstone GC policy, snapshot visibility, and 0-table empty compaction.
+
+import std/io::{println}
+import std/fs::{create_temp_file_system}
+import official/tokakv::{TokaKvEngine}
+
+fn main() -> i32 {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+
+    // 1. Key 1: put(v1) -> delete -> snap s1 -> put(v2) -> snap s2
+    db#.put(string::from("k1"), string::from("v1_1")).unwrap()
+    db#.delete(string::from("k1")).unwrap()
+    auto s1# = db#.acquire_snapshot().unwrap()
+    assert(s1.sequence() == 2:u64, "s1 seq is 2")
+
+    db#.put(string::from("k1"), string::from("v1_2")).unwrap()
+    auto s2# = db#.acquire_snapshot().unwrap()
+    assert(s2.sequence() == 3:u64, "s2 seq is 3")
+
+    // Flush and compact
+    db#.flush_active_memtable().unwrap()
+    db#.compact_l0().unwrap()
+
+    // Verify snapshot visibility: s1 sees None, s2 sees v1_2, latest sees v1_2
+    auto r_s1 = db#.get_at_snapshot(string::from("k1"), s1).unwrap()
+    assert(r_s1.is_none(), "s1 must see None (deleted)")
+
+    auto r_s2 = db#.get_at_snapshot(string::from("k1"), s2).unwrap()
+    assert(r_s2.is_some(), "s2 must see v1_2")
+    assert(r_s2.unwrap().as_str().equals("v1_2"), "s2 value correct")
+
+    auto r_latest = db#.get(string::from("k1")).unwrap()
+    assert(r_latest.is_some(), "latest must see v1_2")
+    assert(r_latest.unwrap().as_str().equals("v1_2"), "latest value correct")
+
+    // 2. Drop snapshots
+    {
+        auto s1_m = cede s1
+        auto s2_m = cede s2
+    }
+
+    // 3. Test Empty Output Compaction:
+    // Write 3 keys into L0 table 1
+    db#.put(string::from("del_a"), string::from("val_a")).unwrap()
+    db#.put(string::from("del_b"), string::from("val_b")).unwrap()
+    db#.put(string::from("del_c"), string::from("val_c")).unwrap()
+    db#.flush_active_memtable().unwrap()
+
+    // Delete all 3 keys into L0 table 2
+    db#.delete(string::from("del_a")).unwrap()
+    db#.delete(string::from("del_b")).unwrap()
+    db#.delete(string::from("del_c")).unwrap()
+    db#.flush_active_memtable().unwrap()
+
+    // Also delete k1 so whole database is empty
+    db#.delete(string::from("k1")).unwrap()
+    db#.flush_active_memtable().unwrap()
+
+    // Trigger compaction with NO live snapshots: all keys are deleted tombstones!
+    db#.compact_l0().unwrap()
+
+    // Verify: VersionEdit deleted all inputs and added 0 tables (no empty SSTables created!)
+    auto v_empty = db#.current_version()
+    assert(v_empty.tables_count() == 0:usize, "all tables must be removed without creating empty SSTable")
+
+    // Verify all keys are NotFound
+    assert(db#.get(string::from("del_a")).unwrap().is_none(), "del_a is None")
+    assert(db#.get(string::from("del_b")).unwrap().is_none(), "del_b is None")
+    assert(db#.get(string::from("del_c")).unwrap().is_none(), "del_c is None")
+    assert(db#.get(string::from("k1")).unwrap().is_none(), "k1 is None")
+
+    db#.close().unwrap()
+    tmp#.remove()
+
+    println("[TokaKV] tombstone_gc_whole_group_and_empty_output_v1 PASSED!")
+    return 0
+}

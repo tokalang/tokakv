@@ -1,0 +1,640 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/manifest/version.tk
+// TableMetadata, TableHandle, immutable Version snapshot, and VersionEdit representation.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import std/io::{println}
+import official/tokakv/types::{KvError, LookupResult}
+import official/tokakv/sstable/reader::{SSTableReader}
+import official/tokakv/cache/block_cache::{BlockCache}
+
+pub shape TableMetadata (
+    file_number: u64,
+    file_size: u64,
+    min_seq: u64,
+    max_seq: u64,
+    smallest_key: string,
+    largest_key: string,
+    level: u32
+)
+
+impl TableMetadata {
+    pub fn new(
+        file_number: u64,
+        file_size: u64,
+        min_seq: u64,
+        max_seq: u64,
+        cede smallest_key: string,
+        cede largest_key: string,
+        level: u32
+    ) -> TableMetadata {
+        return TableMetadata(
+            file_number = file_number,
+            file_size = file_size,
+            min_seq = min_seq,
+            max_seq = max_seq,
+            smallest_key = cede smallest_key,
+            largest_key = cede largest_key,
+            level = level
+        )
+    }
+
+    pub fn new_l0(
+        file_number: u64,
+        file_size: u64,
+        min_seq: u64,
+        max_seq: u64,
+        cede smallest_key: string,
+        cede largest_key: string
+    ) -> TableMetadata {
+        return TableMetadata::new(
+            file_number, file_size, min_seq, max_seq, cede smallest_key, cede largest_key, 0:u32
+        )
+    }
+
+    pub fn clone(self) -> TableMetadata {
+        return TableMetadata(
+            file_number = self.file_number,
+            file_size = self.file_size,
+            min_seq = self.min_seq,
+            max_seq = self.max_seq,
+            smallest_key = self.smallest_key.clone(),
+            largest_key = self.largest_key.clone(),
+            level = self.level
+        )
+    }
+}
+
+impl TableMetadata@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}
+
+pub shape TableHandle (
+    meta: TableMetadata,
+    reader: SSTableReader
+)
+
+impl TableHandle {
+    pub fn new(cede meta: TableMetadata, cede reader: SSTableReader) -> TableHandle {
+        return TableHandle(
+            meta = cede meta,
+            reader = cede reader
+        )
+    }
+
+    pub fn clone(self) -> TableHandle {
+        auto m = self.meta.clone()
+        auto r = self.reader.clone()
+        return TableHandle(
+            meta = cede m,
+            reader = cede r
+        )
+    }
+}
+
+impl TableHandle@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}
+
+/// Immutable Version representing active SSTables in the database at a specific version sequence.
+pub shape Version (
+    tables: Vec<TableHandle>,
+    version_id: u64
+)
+
+impl Version {
+    pub fn new(cede tables: Vec<TableHandle>, version_id: u64) -> Version {
+        auto in_tables# = cede tables
+        auto in_len = in_tables.len()
+        if in_len <= 1:usize {
+            return Version(
+                tables = cede in_tables,
+                version_id = version_id
+            )
+        }
+
+        auto l0_tables# = Vec<TableHandle>::with_capacity(in_len)
+        auto l1_tables# = Vec<TableHandle>::with_capacity(in_len)
+
+        auto i# = 0:usize
+        loop i < in_len {
+            unsafe {
+                auto *h_ptr = in_tables.unsafe_get(i)
+                auto sk = h_ptr.meta.smallest_key.clone()
+                auto lk = h_ptr.meta.largest_key.clone()
+                auto meta = TableMetadata::new(
+                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
+                    cede sk, cede lk, h_ptr.meta.level
+                )
+                auto r_clone = h_ptr.reader.clone()
+                auto handle = TableHandle::new(cede meta, cede r_clone)
+                if handle.meta.level == 0:u32 {
+                    l0_tables#.push(cede handle)
+                } else {
+                    auto ins_idx# = l1_tables.len()
+                    auto j# = 0:usize
+                    loop j < l1_tables.len() {
+                        auto *other_ptr = l1_tables.unsafe_get(j)
+                        if handle.meta.smallest_key.as_str().cmp(other_ptr.meta.smallest_key.as_str()) < 0:i32 {
+                            ins_idx = j
+                            break
+                        }
+                        j = j + 1:usize
+                    }
+                    if ins_idx == l1_tables.len() {
+                        l1_tables#.push(cede handle)
+                    } else {
+                        l1_tables#.insert(ins_idx, cede handle)
+                    }
+                }
+            }
+            i = i + 1:usize
+        }
+
+        auto final_tables# = Vec<TableHandle>::with_capacity(in_len)
+        auto l0_i# = 0:usize
+        loop l0_i < l0_tables.len() {
+            unsafe {
+                auto *h_ptr = l0_tables.unsafe_get(l0_i)
+                auto sk = h_ptr.meta.smallest_key.clone()
+                auto lk = h_ptr.meta.largest_key.clone()
+                auto meta = TableMetadata::new(
+                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
+                    cede sk, cede lk, h_ptr.meta.level
+                )
+                auto r_clone = h_ptr.reader.clone()
+                auto handle = TableHandle::new(cede meta, cede r_clone)
+                final_tables#.push(cede handle)
+            }
+            l0_i = l0_i + 1:usize
+        }
+
+        auto l1_i# = 0:usize
+        loop l1_i < l1_tables.len() {
+            unsafe {
+                auto *h_ptr = l1_tables.unsafe_get(l1_i)
+                auto sk = h_ptr.meta.smallest_key.clone()
+                auto lk = h_ptr.meta.largest_key.clone()
+                auto meta = TableMetadata::new(
+                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
+                    cede sk, cede lk, h_ptr.meta.level
+                )
+                auto r_clone = h_ptr.reader.clone()
+                auto handle = TableHandle::new(cede meta, cede r_clone)
+                final_tables#.push(cede handle)
+            }
+            l1_i = l1_i + 1:usize
+        }
+
+        return Version(
+            tables = cede final_tables,
+            version_id = version_id
+        )
+    }
+
+    pub fn empty() -> Version {
+        return Version(
+            tables = Vec<TableHandle>::new(),
+            version_id = 0:u64
+        )
+    }
+
+    pub fn tables_count(self) -> usize {
+        return self.tables.len()
+    }
+
+    pub fn id(self) -> u64 {
+        return self.version_id
+    }
+
+    pub fn l0_count(self) -> usize {
+        auto cnt# = 0:usize
+        auto i# = 0:usize
+        loop i < self.tables.len() {
+            unsafe {
+                auto *h = self.tables.unsafe_get(i)
+                if h.meta.level == 0:u32 {
+                    cnt = cnt + 1:usize
+                }
+            }
+            i = i + 1:usize
+        }
+        return cnt
+    }
+
+    pub fn get_table(self, index: usize) -> TableHandle {
+        unsafe {
+            auto *h_ptr = self.tables.unsafe_get(index)
+            auto m_sk = h_ptr.meta.smallest_key.clone()
+            auto m_lk = h_ptr.meta.largest_key.clone()
+            auto meta = TableMetadata::new(
+                h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
+                cede m_sk, cede m_lk, h_ptr.meta.level
+            )
+            auto r_clone = h_ptr.reader.clone()
+            return TableHandle::new(cede meta, cede r_clone)
+        }
+    }
+
+    /// Point lookup across active SSTables at a specific sequence watermark:
+    /// 1. Level 0 tables checked from newest to oldest.
+    /// 2. If not found in L0, Level 1+ tables checked via candidate range check.
+    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+        auto count = self.tables.len()
+        if count == 0:usize {
+            return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
+        }
+
+        // 1. Search Level 0 tables in reverse order (newest to oldest)
+        auto idx# = count
+        loop idx > 0:usize {
+            idx = idx - 1:usize
+            unsafe {
+                auto *h_ptr = self.tables.unsafe_get(idx)
+                if h_ptr.meta.level == 0:u32 {
+                    if key.as_str().cmp(h_ptr.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(h_ptr.meta.largest_key.as_str()) <= 0:i32 {
+                        auto cache_arg# = Option<BlockCache>::None
+                        match cache_opt {
+                            auto Option::Some(&bc) => {
+                                cache_arg = Option<BlockCache>::Some(bc.clone())
+                            }
+                            _ => {}
+                        }
+                        auto r_get = h_ptr.reader.get_at_seq(key.clone(), target_seq, cache_arg)
+                        if r_get.is_err() {
+                            return r_get
+                        }
+                        auto res = r_get.unwrap()
+                        match res {
+                            auto LookupResult::Hit(&val) => {
+                                return Result<LookupResult, KvError>::Ok(LookupResult::Hit(val.clone()))
+                            }
+                            auto LookupResult::Deleted => {
+                                return Result<LookupResult, KvError>::Ok(LookupResult::Deleted)
+                            }
+                            auto LookupResult::NotFound => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Search Level 1 tables (which are disjoint and non-overlapping)
+        auto l1_idx# = 0:usize
+        loop l1_idx < count {
+            unsafe {
+                auto *h_ptr = self.tables.unsafe_get(l1_idx)
+                if h_ptr.meta.level == 1:u32 {
+                    if key.as_str().cmp(h_ptr.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(h_ptr.meta.largest_key.as_str()) <= 0:i32 {
+                        auto cache_arg# = Option<BlockCache>::None
+                        match cache_opt {
+                            auto Option::Some(&bc) => {
+                                cache_arg = Option<BlockCache>::Some(bc.clone())
+                            }
+                            _ => {}
+                        }
+                        auto r_get = h_ptr.reader.get_at_seq(key.clone(), target_seq, cache_arg)
+                        if r_get.is_err() {
+                            return r_get
+                        }
+                        auto res = r_get.unwrap()
+                        match res {
+                            auto LookupResult::Hit(&val) => {
+                                return Result<LookupResult, KvError>::Ok(LookupResult::Hit(val.clone()))
+                            }
+                            auto LookupResult::Deleted => {
+                                return Result<LookupResult, KvError>::Ok(LookupResult::Deleted)
+                            }
+                            auto LookupResult::NotFound => {}
+                        }
+                    }
+                }
+            }
+            l1_idx = l1_idx + 1:usize
+        }
+
+        return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
+    }
+
+    /// Point lookup across active SSTables without external cache:
+    pub fn get(self, key: string) -> Result<LookupResult, KvError> {
+        return self.get_with_cache(key, Option<BlockCache>::None)
+    }
+
+    /// Point lookup across active SSTables with optional block cache:
+    pub fn get_with_cache(self, key: string, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+        return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
+    }
+
+    /// Validates Level 1+ non-overlapping and key ordering invariants, and rejects level > 1.
+    pub fn validate_invariants(self) -> Result<(), KvError> {
+        auto count = self.tables.len()
+        auto has_prev_l1# = false
+        auto prev_l1_largest# = string::new()
+
+        auto i# = 0:usize
+        loop i < count {
+            unsafe {
+                auto *h_ptr = self.tables.unsafe_get(i)
+                if h_ptr.meta.level > 1:u32 {
+                    return Result<(), KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
+                }
+                if h_ptr.meta.level == 1:u32 {
+                    if h_ptr.meta.smallest_key.as_str().cmp(h_ptr.meta.largest_key.as_str()) > 0:i32 {
+                        return Result<(), KvError>::Err(KvError::corrupted("invalid_table_key_bounds"))
+                    }
+                    if has_prev_l1 {
+                        if prev_l1_largest.as_str().cmp(h_ptr.meta.smallest_key.as_str()) >= 0:i32 {
+                            return Result<(), KvError>::Err(KvError::corrupted("level1_tables_overlap_or_unsorted"))
+                        }
+                    }
+                    has_prev_l1 = true
+                    prev_l1_largest = h_ptr.meta.largest_key.clone()
+                }
+            }
+            i = i + 1:usize
+        }
+        return Result<(), KvError>::Ok(())
+    }
+
+    pub fn clone(self) -> Version {
+        auto copy_tables# = Vec<TableHandle>::with_capacity(self.tables.len())
+        auto i# = 0:usize
+        loop i < self.tables.len() {
+            unsafe {
+                auto *h_ptr = self.tables.unsafe_get(i)
+                auto m_sk = h_ptr.meta.smallest_key.clone()
+                auto m_lk = h_ptr.meta.largest_key.clone()
+                auto meta = TableMetadata::new(
+                    h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
+                    cede m_sk, cede m_lk, h_ptr.meta.level
+                )
+                auto r_clone = h_ptr.reader.clone()
+                auto handle = TableHandle::new(cede meta, cede r_clone)
+                copy_tables#.push(cede handle)
+            }
+            i = i + 1:usize
+        }
+        return Version(
+            tables = cede copy_tables,
+            version_id = self.version_id
+        )
+    }
+}
+
+/// Validates that newly emitted L1 tables together with untouched L1 tables form a strictly monotonic, non-overlapping sequence.
+pub fn validate_l1_disjoint(untouched_l1: Vec<TableHandle>, new_l1: Vec<TableMetadata>) -> Result<(), KvError> {
+    auto all_l1# = Vec<TableMetadata>::new()
+    auto u_i# = 0:usize
+    loop u_i < untouched_l1.len() {
+        unsafe {
+            auto *h_ptr = untouched_l1.unsafe_get(u_i)
+            if h_ptr.meta.level > 1:u32 {
+                return Result<(), KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
+            }
+            auto sk = h_ptr.meta.smallest_key.clone()
+            auto lk = h_ptr.meta.largest_key.clone()
+            auto meta = TableMetadata::new(
+                h_ptr.meta.file_number, h_ptr.meta.file_size, h_ptr.meta.min_seq, h_ptr.meta.max_seq,
+                cede sk, cede lk, h_ptr.meta.level
+            )
+            auto ins_idx# = all_l1.len()
+            auto j# = 0:usize
+            loop j < all_l1.len() {
+                auto *other = all_l1.unsafe_get(j)
+                if meta.smallest_key.as_str().cmp(other.smallest_key.as_str()) < 0:i32 {
+                    ins_idx = j
+                    break
+                }
+                j = j + 1:usize
+            }
+            if ins_idx == all_l1.len() {
+                all_l1#.push(cede meta)
+            } else {
+                all_l1#.insert(ins_idx, cede meta)
+            }
+        }
+        u_i = u_i + 1:usize
+    }
+
+    auto n_i# = 0:usize
+    loop n_i < new_l1.len() {
+        unsafe {
+            auto *m_ptr = new_l1.unsafe_get(n_i)
+            if m_ptr.level > 1:u32 {
+                return Result<(), KvError>::Err(KvError::corrupted("invalid_table_level_above_l1"))
+            }
+            auto sk = m_ptr.smallest_key.clone()
+            auto lk = m_ptr.largest_key.clone()
+            auto meta = TableMetadata::new(
+                m_ptr.file_number, m_ptr.file_size, m_ptr.min_seq, m_ptr.max_seq,
+                cede sk, cede lk, m_ptr.level
+            )
+            auto ins_idx# = all_l1.len()
+            auto j# = 0:usize
+            loop j < all_l1.len() {
+                auto *other = all_l1.unsafe_get(j)
+                if meta.smallest_key.as_str().cmp(other.smallest_key.as_str()) < 0:i32 {
+                    ins_idx = j
+                    break
+                }
+                j = j + 1:usize
+            }
+            if ins_idx == all_l1.len() {
+                all_l1#.push(cede meta)
+            } else {
+                all_l1#.insert(ins_idx, cede meta)
+            }
+        }
+        n_i = n_i + 1:usize
+    }
+
+    auto prev_largest# = string::new()
+    auto has_prev# = false
+    auto chk_i# = 0:usize
+    loop chk_i < all_l1.len() {
+        unsafe {
+            auto *m_ptr = all_l1.unsafe_get(chk_i)
+            if m_ptr.smallest_key.as_str().cmp(m_ptr.largest_key.as_str()) > 0:i32 {
+                return Result<(), KvError>::Err(KvError::corrupted("invalid_table_key_bounds"))
+            }
+            if has_prev {
+                if prev_largest.as_str().cmp(m_ptr.smallest_key.as_str()) >= 0:i32 {
+                    return Result<(), KvError>::Err(KvError::corrupted("level1_tables_overlap_or_unsorted"))
+                }
+            }
+            has_prev = true
+            prev_largest = m_ptr.largest_key.clone()
+        }
+        chk_i = chk_i + 1:usize
+    }
+    return Result<(), KvError>::Ok(())
+}
+
+impl Version@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}
+
+pub shape ActiveLogMetadata (
+    log_number: u64,
+    first_seq: u64
+)
+
+impl ActiveLogMetadata {
+    pub fn new(log_number: u64, first_seq: u64) -> ActiveLogMetadata {
+        return ActiveLogMetadata(
+            log_number = log_number,
+            first_seq = first_seq
+        )
+    }
+
+    pub fn clone(self) -> ActiveLogMetadata {
+        return ActiveLogMetadata(
+            log_number = self.log_number,
+            first_seq = self.first_seq
+        )
+    }
+}
+
+pub shape SealedLogMetadata (
+    log_number: u64,
+    first_seq: u64,
+    last_seq: u64
+)
+
+impl SealedLogMetadata {
+    pub fn new(log_number: u64, first_seq: u64, last_seq: u64) -> SealedLogMetadata {
+        return SealedLogMetadata(
+            log_number = log_number,
+            first_seq = first_seq,
+            last_seq = last_seq
+        )
+    }
+
+    pub fn clone(self) -> SealedLogMetadata {
+        return SealedLogMetadata(
+            log_number = self.log_number,
+            first_seq = self.first_seq,
+            last_seq = self.last_seq
+        )
+    }
+}
+
+/// Accumulator for an atomic batch version mutation.
+pub shape VersionEdit (
+    version_seq: u64,
+    next_file_number: u64,
+    last_persisted_seq: u64,
+    has_active_log: bool,
+    active_log_num: u64,
+    active_log_first_seq: u64,
+    has_custom_sealed_logs: bool,
+    sealed_logs: Vec<SealedLogMetadata>,
+    add_tables: Vec<TableMetadata>,
+    deleted_tables: Vec<u64>
+)
+
+impl VersionEdit {
+    pub fn new(
+        version_seq: u64,
+        next_file_number: u64,
+        last_persisted_seq: u64
+    ) -> VersionEdit {
+        return VersionEdit(
+            version_seq = version_seq,
+            next_file_number = next_file_number,
+            last_persisted_seq = last_persisted_seq,
+            has_active_log = false,
+            active_log_num = 0:u64,
+            active_log_first_seq = 0:u64,
+            has_custom_sealed_logs = false,
+            sealed_logs = Vec<SealedLogMetadata>::new(),
+            add_tables = Vec<TableMetadata>::new(),
+            deleted_tables = Vec<u64>::new()
+        )
+    }
+
+    pub fn set_active_log(self#, log_number: u64, first_seq: u64) {
+        self.has_active_log = true
+        self.active_log_num = log_number
+        self.active_log_first_seq = first_seq
+    }
+
+    pub fn add_sealed_log(self#, log_number: u64, first_seq: u64, last_seq: u64) {
+        self.has_custom_sealed_logs = true
+        self.sealed_logs#.push(SealedLogMetadata::new(log_number, first_seq, last_seq))
+    }
+
+    pub fn set_sealed_logs(self#, cede logs: Vec<SealedLogMetadata>) {
+        self.has_custom_sealed_logs = true
+        self.sealed_logs = cede logs
+    }
+
+    pub fn add_table(self#, cede meta: TableMetadata) {
+        self.add_tables#.push(cede meta)
+    }
+
+    pub fn delete_table(self#, file_number: u64) {
+        self.deleted_tables#.push(file_number)
+    }
+
+    pub fn clone(self) -> VersionEdit {
+        auto sl# = Vec<SealedLogMetadata>::with_capacity(self.sealed_logs.len())
+        auto s_idx# = 0:usize
+        loop s_idx < self.sealed_logs.len() {
+            auto sl_item = self.sealed_logs.get(s_idx)
+            sl#.push(sl_item.clone())
+            s_idx = s_idx + 1:usize
+        }
+
+        auto at# = Vec<TableMetadata>::with_capacity(self.add_tables.len())
+        auto i# = 0:usize
+        loop i < self.add_tables.len() {
+            unsafe {
+                auto *tm_ptr = self.add_tables.unsafe_get(i)
+                auto sk = tm_ptr.smallest_key.clone()
+                auto lk = tm_ptr.largest_key.clone()
+                auto tm = TableMetadata::new(
+                    tm_ptr.file_number, tm_ptr.file_size, tm_ptr.min_seq, tm_ptr.max_seq,
+                    cede sk, cede lk, tm_ptr.level
+                )
+                at#.push(cede tm)
+            }
+            i = i + 1:usize
+        }
+        auto dt# = Vec<u64>::with_capacity(self.deleted_tables.len())
+        auto d# = 0:usize
+        loop d < self.deleted_tables.len() {
+            dt#.push(self.deleted_tables.get(d))
+            d = d + 1:usize
+        }
+        return VersionEdit(
+            version_seq = self.version_seq,
+            next_file_number = self.next_file_number,
+            last_persisted_seq = self.last_persisted_seq,
+            has_active_log = self.has_active_log,
+            active_log_num = self.active_log_num,
+            active_log_first_seq = self.active_log_first_seq,
+            has_custom_sealed_logs = self.has_custom_sealed_logs,
+            sealed_logs = cede sl,
+            add_tables = cede at,
+            deleted_tables = cede dt
+        )
+    }
+}
+
+impl VersionEdit@Dup {
+    pub fn dup(self) -> Self {
+        return self.clone()
+    }
+}

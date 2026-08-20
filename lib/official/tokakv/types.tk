@@ -1,0 +1,171 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/types.tk
+// Core types, entries, operation codes, and errors for TokaKV.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/option::{Option}
+import std/error::{IoError}
+
+pub const OP_PUT: u8 = 1:u8
+pub const OP_DELETE: u8 = 2:u8
+
+pub const MAX_KEY_BYTES: usize = 65536:usize        // 64 KB
+pub const MAX_VALUE_BYTES: usize = 33554432:usize    // 32 MB
+pub const MAX_RECORD_BYTES: usize = 33620000:usize   // 32 MB + Header buffer
+
+/// Three-tier point lookup result for SSTable / MemTable queries:
+/// - Hit(string): Key found with value
+/// - Deleted: Key found with deletion marker (Tombstone)
+/// - NotFound: Key not present in table
+pub shape LookupResult (
+    Hit(string) = 1 |
+    Deleted = 2 |
+    NotFound = 0
+)
+
+/// WAL / MemTable key-value entry
+pub shape Entry (
+    key: string,
+    value: string,
+    seq: u64,
+    is_del: bool
+)
+
+impl Entry {
+    pub fn new_put(cede key: string, cede value: string, seq: u64) -> Entry {
+        return Entry(
+            key = cede key,
+            value = cede value,
+            seq = seq,
+            is_del = false
+        )
+    }
+
+    pub fn new_delete(cede key: string, seq: u64) -> Entry {
+        return Entry(
+            key = cede key,
+            value = string::new(),
+            seq = seq,
+            is_del = true
+        )
+    }
+
+    pub fn clone(self) -> Entry {
+        auto k = self.key.clone()
+        if self.is_del {
+            return Entry::new_delete(cede k, self.seq)
+        } else {
+            auto v = self.value.clone()
+            return Entry::new_put(cede k, cede v, self.seq)
+        }
+    }
+
+    pub fn clone_from_ptr(entry_ptr: *Entry) -> Entry {
+        unsafe {
+            auto k = string::from(entry_ptr.key.as_str())
+            if entry_ptr.is_del {
+                return Entry::new_delete(cede k, entry_ptr.seq)
+            } else {
+                auto v = string::from(entry_ptr.value.as_str())
+                return Entry::new_put(cede k, cede v, entry_ptr.seq)
+            }
+        }
+    }
+}
+
+impl Entry@Dup {
+    pub fn dup(self) -> Self {
+        auto k = self.key.clone()
+        if self.is_del {
+            return Entry::new_delete(cede k, self.seq)
+        } else {
+            auto v = self.value.clone()
+            return Entry::new_put(cede k, cede v, self.seq)
+        }
+    }
+}
+
+/// TokaKV core error structure
+pub shape KvError (
+    kind: string,
+    code: i32,
+    message: string
+)
+
+impl KvError {
+    pub fn io(err: IoError) -> KvError {
+        return KvError(
+            kind = string::from("io"),
+            code = err.code(),
+            message = err.message()
+        )
+    }
+
+    pub fn commit_uncertain(err: IoError) -> KvError {
+        return KvError(
+            kind = string::from("commit_uncertain"),
+            code = err.code(),
+            message = err.message()
+        )
+    }
+
+    pub fn corrupted(message: str) -> KvError {
+        return KvError(
+            kind = string::from("corrupted"),
+            code = -1:i32,
+            message = string::from(message)
+        )
+    }
+
+    pub fn key_too_large(size: usize, max: usize) -> KvError {
+        auto msg# = string::from("key size exceeds maximum allowed limit")
+        return KvError(
+            kind = string::from("key_too_large"),
+            code = -2:i32,
+            message = cede msg
+        )
+    }
+
+    pub fn value_too_large(size: usize, max: usize) -> KvError {
+        auto msg# = string::from("value size exceeds maximum allowed limit")
+        return KvError(
+            kind = string::from("value_too_large"),
+            code = -3:i32,
+            message = cede msg
+        )
+    }
+
+    pub fn record_too_large(size: usize, max: usize) -> KvError {
+        auto msg# = string::from("record size exceeds maximum allowed limit")
+        return KvError(
+            kind = string::from("record_too_large"),
+            code = -4:i32,
+            message = cede msg
+        )
+    }
+
+    pub fn closed() -> KvError {
+        return KvError(
+            kind = string::from("closed"),
+            code = -5:i32,
+            message = string::from("engine or wal file is closed")
+        )
+    }
+
+    pub fn poisoned() -> KvError {
+        return KvError(
+            kind = string::from("poisoned"),
+            code = -6:i32,
+            message = string::from("engine or wal writer is poisoned due to previous write/sync failure")
+        )
+    }
+
+    pub fn record_too_large(size: usize, max: usize) -> KvError {
+        return KvError(
+            kind = string::from("record_too_large"),
+            code = -7:i32,
+            message = string::from("record size exceeds maximum allowed capacity")
+        )
+    }
+}

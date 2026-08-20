@@ -1,0 +1,160 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/sstable/writer.tk
+// SSTable offline writer from FrozenMemTable to crash-durable SSTable file.
+
+import core/types::{usize}
+import core/result::{Result}
+import std/vec::{Vec}
+import std/data_file::{PendingOutputFile}
+import official/tokakv/types::{Entry, KvError}
+import official/tokakv/memtable::{FrozenMemTable}
+import official/tokakv/sstable/format::{
+    Footer, IndexEntry, DEFAULT_BLOCK_SIZE, encode_footer
+}
+import official/tokakv/sstable/block::{
+    encode_data_block, encode_index_block
+}
+
+import official/tokakv/manifest/version::{TableMetadata}
+
+pub shape SSTableWriter ()
+
+impl SSTableWriter {
+    /// Writes a FrozenMemTable into an immutable SSTable file using the durable sibling temp commit pipeline.
+    pub fn write(target_path: string, cede frozen_in: FrozenMemTable) -> Result<TableMetadata, KvError> {
+        if frozen_in.is_empty() {
+            return Result<TableMetadata, KvError>::Err(KvError::corrupted("cannot_create_empty_sstable"))
+        }
+        auto all_entries = frozen_in.take_entries()
+        return SSTableWriter::write_entries(target_path, cede all_entries)
+    }
+
+    /// Writes a sorted, deduplicated sequence of entries into an SSTable file and returns its TableMetadata.
+    pub fn write_entries(target_path: string, entries: Vec<Entry>) -> Result<TableMetadata, KvError> {
+        auto total_count = entries.len()
+        if total_count == 0:usize {
+            return Result<TableMetadata, KvError>::Err(KvError::corrupted("cannot_create_empty_sstable"))
+        }
+
+        // 1. Scan exact min_seq and max_seq across all entries
+        auto min_seq# = 0xFFFFFFFFFFFFFFFF:u64
+        auto max_seq# = 0:u64
+        auto s_idx# = 0:usize
+        loop s_idx < total_count {
+            unsafe {
+                auto *entry = entries.unsafe_get(s_idx)
+                if entry.seq < min_seq {
+                    min_seq = entry.seq
+                }
+                if entry.seq > max_seq {
+                    max_seq = entry.seq
+                }
+            }
+            s_idx = s_idx + 1:usize
+        }
+
+        if min_seq == 0:u64 || min_seq > max_seq {
+            return Result<TableMetadata, KvError>::Err(KvError::corrupted("invalid_entry_sequences_in_sstable"))
+        }
+
+        auto smallest_key# = string::new()
+        auto largest_key# = string::new()
+        unsafe {
+            auto *first_entry = entries.unsafe_get(0:usize)
+            auto *last_entry = entries.unsafe_get(total_count - 1:usize)
+            smallest_key = string::from(first_entry.key.as_str())
+            largest_key = string::from(last_entry.key.as_str())
+        }
+
+        // 2. Create sibling temporary file in the exact same directory
+        auto pending_res = PendingOutputFile::create_sibling_temp(target_path)
+        if pending_res.is_err() {
+            return Result<TableMetadata, KvError>::Err(KvError::io(pending_res.unwrap_err()))
+        }
+        auto pending# = pending_res.unwrap()
+
+        // 3. Write data blocks and collect index entries
+        auto index_entries# = Vec<IndexEntry>::new()
+        auto current_block# = Vec<Entry>::new()
+        auto current_block_payload_bytes# = 0:usize
+        auto current_offset# = 0:u64
+
+        auto i# = 0:usize
+        loop i < total_count {
+            auto is_last = (i + 1:usize == total_count)
+            auto last_key# = string::new()
+            unsafe {
+                auto *entry = entries.unsafe_get(i)
+                auto entry_approx_bytes = entry.key.len() + entry.value.len() + 17:usize
+                current_block#.push(Entry::clone_from_ptr((*entry)))
+                current_block_payload_bytes = current_block_payload_bytes + entry_approx_bytes
+                last_key = string::from(entry.key.as_str())
+            }
+
+            if current_block_payload_bytes >= DEFAULT_BLOCK_SIZE || is_last {
+                auto blk_res = encode_data_block(current_block)
+                if blk_res.is_err() {
+                    return Result<TableMetadata, KvError>::Err(blk_res.unwrap_err())
+                }
+                auto blk_buf = blk_res.unwrap()
+                auto blk_len = blk_buf.len() as u64
+
+                auto w_res = pending#.write_all_at(cede blk_buf, current_offset)
+                if w_res.is_err() {
+                    auto w_err = w_res.unwrap_err()
+                    return Result<TableMetadata, KvError>::Err(KvError::io(w_err.error))
+                }
+
+                index_entries#.push(IndexEntry::new(cede last_key, current_offset, blk_len))
+                current_offset = current_offset + blk_len
+
+                current_block = Vec<Entry>::new()
+                current_block_payload_bytes = 0:usize
+            }
+
+            i = i + 1:usize
+        }
+
+        // 4. Encode and write Index Block
+        auto idx_res = encode_index_block(index_entries)
+        if idx_res.is_err() {
+            return Result<TableMetadata, KvError>::Err(idx_res.unwrap_err())
+        }
+        auto idx_buf = idx_res.unwrap()
+        auto index_offset = current_offset
+        auto index_length = idx_buf.len() as u64
+
+        auto idx_w_res = pending#.write_all_at(cede idx_buf, index_offset)
+        if idx_w_res.is_err() {
+            auto w_err = idx_w_res.unwrap_err()
+            return Result<TableMetadata, KvError>::Err(KvError::io(w_err.error))
+        }
+        current_offset = current_offset + index_length
+
+        // 5. Encode and write Footer (Fixed 48 Bytes)
+        auto footer = Footer::new(index_offset, index_length, min_seq, max_seq)
+        auto footer_buf = encode_footer(footer)
+        auto footer_w_res = pending#.write_all_at(cede footer_buf, current_offset)
+        if footer_w_res.is_err() {
+            auto w_err = footer_w_res.unwrap_err()
+            return Result<TableMetadata, KvError>::Err(KvError::io(w_err.error))
+        }
+        auto total_file_size = current_offset + 48:u64
+
+        // 6. Commit pipeline: fsync(temp) -> close(temp) -> rename(temp, target) -> fsync(parent_dir)
+        auto commit_res = pending#.commit()
+        if commit_res.is_err() {
+            auto c_err = commit_res.unwrap_err()
+            if c_err.operation.as_str().equals("commit_uncertain") {
+                return Result<TableMetadata, KvError>::Err(KvError::commit_uncertain(c_err))
+            }
+            return Result<TableMetadata, KvError>::Err(KvError::io(c_err))
+        }
+
+        auto meta = TableMetadata::new_l0(
+            0:u64, total_file_size, min_seq, max_seq,
+            cede smallest_key, cede largest_key
+        )
+        return Result<TableMetadata, KvError>::Ok(cede meta)
+    }
+}

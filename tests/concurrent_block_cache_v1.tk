@@ -1,0 +1,289 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/concurrent_block_cache_v1.tk
+// Multi-threaded stress test for BlockCache under concurrent hits, misses, double-check loads, and LRU evictions.
+
+import std/io::{println}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/thread::{thread_spawn, yield_now}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/types::{LookupResult}
+import official/tokakv/cache/block_cache::{BlockCache}
+import official/tokakv/manifest/version_set::{build_table_path}
+import official/tokakv/sstable/reader::{SSTableReader}
+
+fn make_key(i: usize) -> string {
+    auto s# = string::from("key:")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn make_val(i: usize) -> string {
+    auto s# = string::from("value_data_")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn test_concurrent_double_check_miss() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto k = string::from("alpha")
+    auto v = string::from("val_alpha")
+    db#.put(cede k, cede v).unwrap()
+    db#.flush_active_memtable().unwrap()
+    auto cur_v = db#.current_version()
+    auto fnum = cur_v.get_table(0:usize).meta.file_number
+    db#.close().unwrap()
+
+    auto sst_path = build_table_path(db_path.clone(), fnum)
+    auto r_open# = SSTableReader::open(sst_path.clone()).unwrap()
+    auto b_cand = r_open#.find_candidate_block(string::from("alpha").as_str()).unwrap()
+    auto b_offset = b_cand.offset
+    auto b_length = b_cand.length
+
+    auto cache = BlockCache::new(65536:usize)
+
+    auto c1 = cache.clone()
+    auto c2 = cache.clone()
+    auto c3 = cache.clone()
+    auto c4 = cache.clone()
+
+    auto p1 = sst_path.clone()
+    auto p2 = sst_path.clone()
+    auto p3 = sst_path.clone()
+    auto p4 = sst_path.clone()
+
+    auto f1# = { [cede c1, cede p1, copy b_offset, copy b_length, copy fnum] =>
+        auto lease = c1.get_or_load(fnum, b_offset, b_length, p1).unwrap()
+        auto r = lease.lookup(string::from("alpha").as_str())
+        match r {
+            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t1 val mismatch")
+            _ => assert(false, "t1 lookup failed")
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto f2# = { [cede c2, cede p2, copy b_offset, copy b_length, copy fnum] =>
+        auto lease = c2.get_or_load(fnum, b_offset, b_length, p2).unwrap()
+        auto r = lease.lookup(string::from("alpha").as_str())
+        match r {
+            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t2 val mismatch")
+            _ => assert(false, "t2 lookup failed")
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto f3# = { [cede c3, cede p3, copy b_offset, copy b_length, copy fnum] =>
+        auto lease = c3.get_or_load(fnum, b_offset, b_length, p3).unwrap()
+        auto r = lease.lookup(string::from("alpha").as_str())
+        match r {
+            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t3 val mismatch")
+            _ => assert(false, "t3 lookup failed")
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto f4# = { [cede c4, cede p4, copy b_offset, copy b_length, copy fnum] =>
+        auto lease = c4.get_or_load(fnum, b_offset, b_length, p4).unwrap()
+        auto r = lease.lookup(string::from("alpha").as_str())
+        match r {
+            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t4 val mismatch")
+            _ => assert(false, "t4 lookup failed")
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto t1# = thread_spawn<i32>(cede f1)
+    auto t2# = thread_spawn<i32>(cede f2)
+    auto t3# = thread_spawn<i32>(cede f3)
+    auto t4# = thread_spawn<i32>(cede f4)
+
+    t1#.join().unwrap()
+    t2#.join().unwrap()
+    t3#.join().unwrap()
+    t4#.join().unwrap()
+
+    auto s = cache.stats()
+    assert(s.resident_bytes > 0:usize, "Must have 1 resident block")
+    assert(s.eviction_count == 0:u64, "Eviction count must be 0")
+
+    tmp#.remove()
+}
+
+fn test_concurrent_hits_misses_evictions() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 1
+
+    loop i <= 20:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 2
+
+    loop i <= 30:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 3
+
+    loop i <= 40:usize {
+        auto k = make_key(i)
+        auto v = make_val(i)
+        db#.put(cede k, cede v).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Table 4
+    auto cur_v = db#.current_version()
+    auto fnum1 = cur_v.get_table(0:usize).meta.file_number
+    auto fnum2 = cur_v.get_table(1:usize).meta.file_number
+    auto fnum3 = cur_v.get_table(2:usize).meta.file_number
+    auto fnum4 = cur_v.get_table(3:usize).meta.file_number
+    db#.close().unwrap()
+
+    // Create tight cache (~2 blocks capacity)
+    auto cache = BlockCache::new(3000:usize)
+
+    auto sst1 = build_table_path(db_path.clone(), fnum1)
+    auto sst2 = build_table_path(db_path.clone(), fnum2)
+    auto sst3 = build_table_path(db_path.clone(), fnum3)
+    auto sst4 = build_table_path(db_path.clone(), fnum4)
+
+    auto r1# = SSTableReader::open(sst1.clone()).unwrap()
+    auto c1_cand = r1#.find_candidate_block(string::from("key:5").as_str()).unwrap()
+    auto off1 = c1_cand.offset
+    auto len1 = c1_cand.length
+
+    auto r2# = SSTableReader::open(sst2.clone()).unwrap()
+    auto c2_cand = r2#.find_candidate_block(string::from("key:15").as_str()).unwrap()
+    auto off2 = c2_cand.offset
+    auto len2 = c2_cand.length
+
+    auto r3# = SSTableReader::open(sst3.clone()).unwrap()
+    auto c3_cand = r3#.find_candidate_block(string::from("key:25").as_str()).unwrap()
+    auto off3 = c3_cand.offset
+    auto len3 = c3_cand.length
+
+    auto r4# = SSTableReader::open(sst4.clone()).unwrap()
+    auto c4_cand = r4#.find_candidate_block(string::from("key:35").as_str()).unwrap()
+    auto off4 = c4_cand.offset
+    auto len4 = c4_cand.length
+
+    auto c1 = cache.clone()
+    auto c2 = cache.clone()
+    auto c3 = cache.clone()
+    auto c4 = cache.clone()
+
+    auto p1 = sst1.clone()
+    auto p2 = sst2.clone()
+    auto p3 = sst3.clone()
+    auto p4 = sst4.clone()
+
+    auto w1_fn# = { [cede c1, cede p1, copy off1, copy len1, copy fnum1] =>
+        auto iter# = 0:usize
+        loop iter < 50:usize {
+            auto l1 = c1.get_or_load(fnum1, off1, len1, p1)
+            if l1.is_ok() {
+                auto r = l1.unwrap().lookup(string::from("key:5").as_str())
+                match r {
+                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_5"), "w1 key:5 mismatch")
+                    _ => {}
+                }
+            }
+            yield_now()
+            iter = iter + 1:usize
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto w2_fn# = { [cede c2, cede p2, copy off2, copy len2, copy fnum2] =>
+        auto iter# = 0:usize
+        loop iter < 50:usize {
+            auto l2 = c2.get_or_load(fnum2, off2, len2, p2)
+            if l2.is_ok() {
+                auto r = l2.unwrap().lookup(string::from("key:15").as_str())
+                match r {
+                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_15"), "w2 key:15 mismatch")
+                    _ => {}
+                }
+            }
+            yield_now()
+            iter = iter + 1:usize
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto w3_fn# = { [cede c3, cede p3, copy off3, copy len3, copy fnum3] =>
+        auto iter# = 0:usize
+        loop iter < 50:usize {
+            auto l3 = c3.get_or_load(fnum3, off3, len3, p3)
+            if l3.is_ok() {
+                auto r = l3.unwrap().lookup(string::from("key:25").as_str())
+                match r {
+                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_25"), "w3 key:25 mismatch")
+                    _ => {}
+                }
+            }
+            yield_now()
+            iter = iter + 1:usize
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto w4_fn# = { [cede c4, cede p4, copy off4, copy len4, copy fnum4] =>
+        auto iter# = 0:usize
+        loop iter < 50:usize {
+            auto l4 = c4.get_or_load(fnum4, off4, len4, p4)
+            if l4.is_ok() {
+                auto r = l4.unwrap().lookup(string::from("key:35").as_str())
+                match r {
+                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_35"), "w4 key:35 mismatch")
+                    _ => {}
+                }
+            }
+            yield_now()
+            iter = iter + 1:usize
+        }
+        return cede 0
+    }:fn#() -> cede i32
+
+    auto w1# = thread_spawn<i32>(cede w1_fn)
+    auto w2# = thread_spawn<i32>(cede w2_fn)
+    auto w3# = thread_spawn<i32>(cede w3_fn)
+    auto w4# = thread_spawn<i32>(cede w4_fn)
+
+    w1#.join().unwrap()
+    w2#.join().unwrap()
+    w3#.join().unwrap()
+    w4#.join().unwrap()
+
+    auto s = cache.stats()
+    assert(s.hit_count > 0:u64, "Must record hits during concurrent execution")
+    assert(s.miss_count > 0:u64, "Must record misses during concurrent execution")
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_concurrent_double_check_miss()
+    test_concurrent_hits_misses_evictions()
+    println("[PASS] Concurrent Block Cache v1 Stress Tests Qualified Successfully!")
+    return 0
+}

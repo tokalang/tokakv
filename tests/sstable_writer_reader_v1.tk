@@ -1,0 +1,230 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/sstable_writer_reader_v1.tk
+// Verification of single SSTable offline write and point-lookup closed loop.
+
+import std/io::{println}
+import std/env::{set_var}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system}
+import std/data_file::{ReadDataFile}
+import official/tokakv/types::{LookupResult}
+import official/tokakv/memtable::{MemTable}
+import official/tokakv/sstable/writer::{SSTableWriter}
+import official/tokakv/sstable/reader::{SSTableReader}
+import official/tokakv/sstable/format::{FOOTER_SIZE}
+
+fn make_key(idx: usize) -> string {
+    auto k# = string::from("user_key_")
+    if idx < 10:usize {
+        k#.push_str("000")
+    } else if idx < 100:usize {
+        k#.push_str("00")
+    } else if idx < 1000:usize {
+        k#.push_str("0")
+    }
+    auto n_str = string::from_i64(idx as i64)
+    k#.push_str(n_str.as_str())
+    return cede k
+}
+
+fn make_val(idx: usize) -> string {
+    auto v# = string::from("payload_value_for_user_entry_number_")
+    auto n_str = string::from_i64(idx as i64)
+    v#.push_str(n_str.as_str())
+    // Add extra padding to ensure blocks fill up and cross the 4KB boundary
+    v#.push_str("_padding_bytes_to_exceed_block_size_threshold_1234567890_abcdefghij")
+    return cede v
+}
+
+fn test_sstable_write_and_point_lookup() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto sst_path# = tmp.path().clone()
+    sst_path#.push_str("_table_0001.sst")
+
+    // Populate active MemTable with 150 keys (including tombstones)
+    auto mem# = MemTable::new()
+    auto seq# = 100:u64
+    auto i# = 0:usize
+    loop i < 150:usize {
+        auto k = make_key(i)
+        if i % 10:usize == 5:usize {
+            // Tombstone entry
+            mem#.delete(seq, cede k)
+        } else {
+            auto v = make_val(i)
+            mem#.put(seq, cede k, cede v)
+        }
+        seq = seq + 1:u64
+        i = i + 1:usize
+    }
+
+    auto frozen# = mem.freeze()
+    assert(frozen#.len() == 150:usize, "Frozen memtable must have 150 entries")
+
+    // Write SSTable to sst_path
+    auto w_res = SSTableWriter::write(sst_path.clone(), cede frozen)
+    assert(w_res.is_ok(), "SSTableWriter::write failed")
+
+    // Open SSTable with SSTableReader
+    auto r_res = SSTableReader::open(sst_path.clone())
+    assert(r_res.is_ok(), "SSTableReader::open failed")
+    auto reader# = r_res.unwrap()
+
+    assert(reader#.min_seq() == 100:u64, "min_seq must match 100")
+    assert(reader#.max_seq() == 249:u64, "max_seq must match 249")
+    assert(reader#.block_count() > 1:usize, "Must span multiple data blocks")
+
+    // 1. Verify point lookups for all 150 keys
+    auto q# = 0:usize
+    loop q < 150:usize {
+        auto q_key = make_key(q)
+        auto get_res = reader#.get(q_key)
+        assert(get_res.is_ok(), "reader.get must succeed")
+
+        if q % 10:usize == 5:usize {
+            // Must return Ok(LookupResult::Deleted) -> Tombstone
+            match get_res {
+                auto Result<LookupResult, KvError>::Ok(&lookup) => {
+                    match lookup {
+                        auto LookupResult::Deleted => {}
+                        _ => assert(false, "Tombstone key must return Deleted")
+                    }
+                }
+                _ => assert(false, "reader.get must be ok")
+            }
+        } else {
+            // Must return Ok(LookupResult::Hit(value))
+            match get_res {
+                auto Result<LookupResult, KvError>::Ok(&lookup) => {
+                    match lookup {
+                        auto LookupResult::Hit(&val) => {
+                            auto expected_v = make_val(q)
+                            assert(val.as_str().equals(expected_v.as_str()), "Value payload mismatch")
+                        }
+                        _ => assert(false, "Put key must return Hit")
+                    }
+                }
+                _ => assert(false, "reader.get must be ok")
+            }
+        }
+        q = q + 1:usize
+    }
+
+    // 2. Verify non-existent keys (Miss -> Ok(LookupResult::NotFound))
+    auto miss1 = reader#.get(string::from("aaa_before_all_keys"))
+    assert(miss1.is_ok(), "Miss 1 query must succeed")
+    match miss1 {
+        auto Result<LookupResult, KvError>::Ok(&lookup) => {
+            match lookup {
+                auto LookupResult::NotFound => {}
+                _ => assert(false, "Miss 1 must return NotFound")
+            }
+        }
+        _ => assert(false, "miss1 must be ok")
+    }
+
+    auto miss2 = reader#.get(string::from("user_key_0055_non_existent"))
+    assert(miss2.is_ok(), "Miss 2 query must succeed")
+    match miss2 {
+        auto Result<LookupResult, KvError>::Ok(&lookup) => {
+            match lookup {
+                auto LookupResult::NotFound => {}
+                _ => assert(false, "Miss 2 must return NotFound")
+            }
+        }
+        _ => assert(false, "miss2 must be ok")
+    }
+
+    auto miss3 = reader#.get(string::from("zzz_after_all_keys"))
+    assert(miss3.is_ok(), "Miss 3 query must succeed")
+    match miss3 {
+        auto Result<LookupResult, KvError>::Ok(&lookup) => {
+            match lookup {
+                auto LookupResult::NotFound => {}
+                _ => assert(false, "Miss 3 must return NotFound")
+            }
+        }
+        _ => assert(false, "miss3 must be ok")
+    }
+
+    // 3. Direct raw bytes verification of Footer Magic: 'T','O','K','A','S','S','T','1'
+    auto raw_file = ReadDataFile::open(sst_path.clone()).unwrap()
+    auto f_size = raw_file.size().unwrap()
+    auto footer_offset = f_size - (FOOTER_SIZE as u64)
+    auto f_buf# = Vec<u8>::with_capacity(FOOTER_SIZE)
+    auto f_read = raw_file.read_at(cede f_buf, footer_offset, FOOTER_SIZE).unwrap()
+    auto fb = f_read.take_buffer()
+
+    assert(fb.get(32:usize) == 0x54:u8, "Byte 32 must be 'T' (0x54)")
+    assert(fb.get(33:usize) == 0x4F:u8, "Byte 33 must be 'O' (0x4F)")
+    assert(fb.get(34:usize) == 0x4B:u8, "Byte 34 must be 'K' (0x4B)")
+    assert(fb.get(35:usize) == 0x41:u8, "Byte 35 must be 'A' (0x41)")
+    assert(fb.get(36:usize) == 0x53:u8, "Byte 36 must be 'S' (0x53)")
+    assert(fb.get(37:usize) == 0x53:u8, "Byte 37 must be 'S' (0x53)")
+    assert(fb.get(38:usize) == 0x54:u8, "Byte 38 must be 'T' (0x54)")
+    assert(fb.get(39:usize) == 0x31:u8, "Byte 39 must be '1' (0x31)")
+
+    tmp#.remove()
+}
+
+fn test_sstable_writer_commit_uncertain() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto sst_path# = tmp.path().clone()
+    sst_path#.push_str("_table_uncertain.sst")
+
+    auto mem# = MemTable::new()
+    auto k1 = string::from("key_uncertain_1")
+    auto v1 = string::from("val_uncertain_1")
+    mem#.put(50:u64, cede k1, cede v1)
+
+    auto k2 = string::from("key_uncertain_2")
+    auto v2 = string::from("val_uncertain_2")
+    mem#.put(51:u64, cede k2, cede v2)
+
+    auto frozen = mem.freeze()
+
+    // Inject parent directory sync error during commit
+    set_var(string::from("TOKA_FAILPOINT"), string::from("forced_parent_dir_sync_error"))
+    auto w_res = SSTableWriter::write(sst_path.clone(), cede frozen)
+    set_var(string::from("TOKA_FAILPOINT"), string::from(""))
+
+    assert(w_res.is_err(), "Writer MUST FAIL when parent directory sync fails")
+    auto err = w_res.unwrap_err()
+    assert(err.kind.as_str().equals("commit_uncertain"), "Error kind MUST BE commit_uncertain")
+
+    // The target file MUST NOT be deleted by drop since it was already renamed to final path
+    auto r_res = SSTableReader::open(sst_path.clone())
+    assert(r_res.is_ok(), "Target SSTable file must remain intact and readable on disk")
+    auto reader# = r_res.unwrap()
+
+    auto get1 = reader#.get(string::from("key_uncertain_1"))
+    match get1 {
+        auto Result<LookupResult, KvError>::Ok(&lookup) => {
+            match lookup {
+                auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_uncertain_1"), "Value mismatch")
+                _ => assert(false, "key_uncertain_1 must exist")
+            }
+        }
+        _ => assert(false, "get1 must be ok")
+    }
+
+    auto get2 = reader#.get(string::from("key_uncertain_2"))
+    match get2 {
+        auto Result<LookupResult, KvError>::Ok(&lookup) => {
+            match lookup {
+                auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_uncertain_2"), "Value mismatch")
+                _ => assert(false, "key_uncertain_2 must exist")
+            }
+        }
+        _ => assert(false, "get2 must be ok")
+    }
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    test_sstable_write_and_point_lookup()
+    test_sstable_writer_commit_uncertain()
+    println("[PASS] SSTable Writer & Reader v1 Qualified Successfully!")
+    return 0
+}

@@ -1,0 +1,36 @@
+// Static manifest for the official/tokakv package.
+pub const PACKAGE = (
+    name = "tokakv",
+    identity = "official/tokakv",
+    version = "0.1.0",
+    kind = "library",
+    license = "Apache-2.0",
+    compiler = "1.0.0-rc.5",
+    entry_modules = ("lib/official/tokakv.tk"),
+    targets = ("macos", "linux"),
+    dependencies = (),
+    native = (required = false, libraries = ())
+)
+
+pub const AI_CONTRACT = (
+    schema = "toka-official-package-v1",
+    summary = "Fast, durable, single-writer key-value engine with append-only WAL, CRC32 verification, crash recovery, and immutable MemTable rotation.",
+    capabilities = (
+        "binary WAL record framing with CRC32-IEEE checksum",
+        "synchronous durable commit via WalFile sync_data",
+        "fail-closed recovery: clean EOF and valid records restored, torn tails safely truncated, corrupted frames rejected",
+        "single-writer MemTable with consumed immutable freeze",
+        "Put, Delete (tombstone), and Get key-value operations"
+    ),
+    non_goals = (
+        "Redis protocol server",
+        "SSTable on-disk format",
+        "background LSM compaction",
+        "multi-version snapshots",
+        "async disk offload"
+    ),
+    safety = (
+        "zero unverified byte ingestion; corrupted full-frame CRC32 halts startup with KvError::CorruptedRecord; torn writes at EOF are safely physical-truncated via ftruncate; explicit bounds on key (64KB), value (32MB), and record (33.6MB) prevent unbounded allocations; freeze consumes active MemTable ownership"
+    ),
+    qualification = ("python3 tests/qualify_package.py")
+)

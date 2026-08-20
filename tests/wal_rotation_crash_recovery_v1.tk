@@ -1,0 +1,229 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/wal_rotation_crash_recovery_v1.tk
+// Verification of crash failpoints and multi-generation recovery during WAL rotation.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/io::{println, remove_file}
+import std/vec::{Vec}
+import std/fs::{create_temp_file_system, metadata}
+import std/data_file::{ReadDataFile, WalFile}
+import std/env::{args_count, get_arg, set_var}
+import std/process::{Command}
+import official/tokakv::{TokaKvEngine}
+import official/tokakv/manifest/version_set::{build_wal_path}
+
+fn make_key(i: usize) -> string {
+    auto s# = string::from("crash_k_")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn make_val(i: usize) -> string {
+    auto s# = string::from("crash_v_")
+    s#.push_str(string::from_int(i as i32).as_str())
+    return cede s
+}
+
+fn run_worker_fp1(db_path: string) {
+    auto db# = TokaKvEngine::open(db_path).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    set_var(string::from("TOKA_FAILPOINT"), string::from("after_wal_rotation_file_create"))
+    db#.rotate_wal().unwrap()
+}
+
+fn run_worker_fp2(db_path: string) {
+    auto db# = TokaKvEngine::open(db_path).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    set_var(string::from("TOKA_FAILPOINT"), string::from("after_wal_rotation_manifest_commit"))
+    db#.rotate_wal().unwrap()
+}
+
+fn run_worker_fp3(db_path: string) {
+    auto db# = TokaKvEngine::open(db_path).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    db#.flush_active_memtable().unwrap() // Covers seq 1..10 in SSTable
+
+    // Write in new un-flushed batch (seq 11..20)
+    loop i <= 20:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    set_var(string::from("TOKA_FAILPOINT"), string::from("before_wal_rotation_old_log_unlink"))
+    db#.rotate_wal().unwrap()
+}
+
+fn test_crash_point_1_file_created_pre_manifest(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db1")
+
+    // Worker creates 000002.log then SIGKILL before Manifest commit
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-fp1"))
+    cmd#.arg(db_path.clone())
+    auto out = cmd#.output().unwrap()
+    assert(!out.status.success(), "Worker FP1 must exit non-zero via SIGKILL")
+
+    // Parent reopen: Manifest still points to active log 1. 000002.log is an unreferenced orphan file.
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db#.current_seq() == 10:u64, "Recovered seq must be 10")
+
+    auto q# = 1:usize
+    loop q <= 10:usize {
+        auto res = db#.get(make_key(q)).unwrap()
+        assert(res.is_some(), "Key must exist after FP1 reopen")
+        assert(res.unwrap().as_str().equals(make_val(q).as_str()), "Value mismatch after FP1 reopen")
+        q = q + 1:usize
+    }
+
+    // Write key 11: continues safely
+    db#.put(make_key(11), make_val(11)).unwrap()
+    assert(db#.current_seq() == 11:u64, "Seq advances to 11")
+    db#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn test_crash_point_2_manifest_committed_pre_switch(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db2")
+
+    // Worker commits Manifest (active log 2, sealed log 1) then SIGKILL before writer switch
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-fp2"))
+    cmd#.arg(db_path.clone())
+    auto out = cmd#.output().unwrap()
+    assert(!out.status.success(), "Worker FP2 must exit non-zero via SIGKILL")
+
+    // Parent reopen: Manifest has sealed log 1 + active log 2. Replays sealed log 1 and opens active log 2.
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db#.current_seq() == 10:u64, "Recovered seq must be 10")
+
+    auto q# = 1:usize
+    loop q <= 10:usize {
+        auto res = db#.get(make_key(q)).unwrap()
+        assert(res.is_some(), "Key must exist after FP2 reopen")
+        assert(res.unwrap().as_str().equals(make_val(q).as_str()), "Value mismatch after FP2 reopen")
+        q = q + 1:usize
+    }
+
+    // Write key 11 into active log 2
+    db#.put(make_key(11), make_val(11)).unwrap()
+    assert(db#.current_seq() == 11:u64, "Seq advances to 11")
+    db#.close().unwrap()
+
+    tmp#.remove()
+}
+
+fn test_crash_point_3_writer_switched_pre_unlink(exe_path: string) {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db3")
+
+    // Worker switches writer then SIGKILL before unlinking covered sealed log
+    auto cmd# = Command::new(exe_path.clone())
+    cmd#.arg(string::from("--worker-fp3"))
+    cmd#.arg(db_path.clone())
+    auto out = cmd#.output().unwrap()
+    assert(!out.status.success(), "Worker FP3 must exit non-zero via SIGKILL")
+
+    // Parent reopen: Replays from SSTable + live logs cleanly
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    assert(db#.current_seq() == 20:u64, "Recovered seq must be 20")
+
+    auto q# = 1:usize
+    loop q <= 20:usize {
+        auto res = db#.get(make_key(q)).unwrap()
+        assert(res.is_some(), "Key must exist after FP3 reopen")
+        assert(res.unwrap().as_str().equals(make_val(q).as_str()), "Value mismatch after FP3 reopen")
+        q = q + 1:usize
+    }
+    db#.close().unwrap()
+    tmp#.remove()
+}
+
+fn test_sealed_log_bounds_mismatch_fail_closed() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto db_path# = tmp.path().clone()
+    db_path#.push_str("_db_mismatch")
+
+    auto db# = TokaKvEngine::open(db_path.clone()).unwrap()
+    auto i# = 1:usize
+    loop i <= 10:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    db#.rotate_wal().unwrap() // Seals log 1 (first_seq=1, last_seq=10)
+
+    loop i <= 20:usize {
+        db#.put(make_key(i), make_val(i)).unwrap()
+        i = i + 1:usize
+    }
+    db#.rotate_wal().unwrap() // Seals log 2 (first_seq=11, last_seq=20)
+    db#.close().unwrap()
+
+    // Read bytes from log 2
+    auto wal2_p = build_wal_path(db_path.clone(), 2:u64)
+    auto r2_f = ReadDataFile::open(wal2_p).unwrap()
+    auto r2_sz = r2_f.size().unwrap()
+    auto b# = Vec<u8>::with_capacity(r2_sz as usize)
+    auto b_out# = r2_f.read_at(cede b, 0:u64, r2_sz as usize).unwrap().take_buffer()
+
+    // Overwrite log 1 with log 2 contents (seq 11..20 instead of 1..10)
+    auto wal1_p = build_wal_path(db_path.clone(), 1:u64)
+    remove_file(wal1_p.clone())
+    auto w1_f# = WalFile::open(wal1_p).unwrap()
+    w1_f#.write_all_at(cede b_out, 0:u64).unwrap()
+    w1_f#.sync_all().unwrap()
+    w1_f#.close().unwrap()
+
+    // Reopen MUST fail closed due to bounds mismatch
+    auto reopen_res = TokaKvEngine::open(db_path.clone())
+    assert(reopen_res.is_err(), "Reopen with mismatched sealed log bounds MUST fail closed")
+
+    tmp#.remove()
+}
+
+fn main() -> i32 {
+    auto argc = args_count()
+    if argc >= 3 {
+        auto flag = get_arg(1)
+        auto target_db = get_arg(2)
+        if flag.as_str().equals("--worker-fp1") {
+            run_worker_fp1(target_db)
+            return 0
+        }
+        if flag.as_str().equals("--worker-fp2") {
+            run_worker_fp2(target_db)
+            return 0
+        }
+        if flag.as_str().equals("--worker-fp3") {
+            run_worker_fp3(target_db)
+            return 0
+        }
+    }
+
+    auto exe = get_arg(0)
+    test_crash_point_1_file_created_pre_manifest(exe.clone())
+    test_crash_point_2_manifest_committed_pre_switch(exe.clone())
+    test_crash_point_3_writer_switched_pre_unlink(exe.clone())
+    test_sealed_log_bounds_mismatch_fail_closed()
+
+    println("[PASS] WAL Rotation Crash Recovery & Failpoint Immunity Qualified Successfully!")
+    return 0
+}

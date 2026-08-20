@@ -1,0 +1,286 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/record.tk
+// Binary WAL Record codec with Length + CRC32-IEEE framing and bound checks.
+
+import core/types::{usize}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import official/tokakv/types::{
+    OP_PUT, OP_DELETE, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_RECORD_BYTES,
+    Entry, KvError
+}
+import official/tokakv/crc32::{crc32_ieee}
+
+pub const RECORD_HEADER_SIZE: usize = 8:usize
+
+/// Decoded record result containing Entry and total consumed frame bytes (Header + Payload).
+pub shape DecodedRecord (
+    entry: Entry,
+    frame_bytes: usize
+)
+
+impl DecodedRecord {
+    pub fn entry(self) -> Entry {
+        return self.entry.clone()
+    }
+
+    pub fn take_entry(cede self) -> Entry {
+        return cede self.entry
+    }
+
+    pub fn frame_bytes(self) -> usize {
+        return self.frame_bytes
+    }
+}
+
+/// Encodes single WAL record into binary frame appended to provided buffer.
+pub fn encode_record(
+    buffer#: Vec<u8>,
+    op: u8,
+    seq: u64,
+    key: string,
+    value: string
+) -> Result<usize, KvError> {
+    if op != OP_PUT && op != OP_DELETE {
+        return Result<usize, KvError>::Err(KvError::corrupted("invalid_op_type"))
+    }
+
+    auto key_len = key.len()
+    auto val_len# = 0:usize
+    if op == OP_PUT {
+        val_len = value.len()
+    } else {
+        if value.len() != 0:usize {
+            return Result<usize, KvError>::Err(KvError::corrupted("delete_record_contains_value"))
+        }
+    }
+
+    if key_len > MAX_KEY_BYTES {
+        return Result<usize, KvError>::Err(KvError::key_too_large(key_len, MAX_KEY_BYTES))
+    }
+    if val_len > MAX_VALUE_BYTES {
+        return Result<usize, KvError>::Err(KvError::value_too_large(val_len, MAX_VALUE_BYTES))
+    }
+
+    // Payload = Op(1B) + Seq(8B) + KeyLen(4B) + KeyBytes + ValLen(4B) + ValBytes
+    auto payload_len = 1:usize + 8:usize + 4:usize + key_len + 4:usize + val_len
+    if payload_len > MAX_RECORD_BYTES {
+        return Result<usize, KvError>::Err(KvError::record_too_large(payload_len, MAX_RECORD_BYTES))
+    }
+
+    auto start_pos = buffer.len()
+
+    // 1. Placeholder 4-byte CRC32 (backfilled after computing payload CRC)
+    buffer#.push(0:u8)
+    buffer#.push(0:u8)
+    buffer#.push(0:u8)
+    buffer#.push(0:u8)
+
+    // 2. Write 4-byte PayloadLen (LE)
+    auto p_len_u32 = payload_len as u32
+    buffer#.push((p_len_u32 & 0xFF:u32) as u8)
+    buffer#.push(((p_len_u32 >> 8:u32) & 0xFF:u32) as u8)
+    buffer#.push(((p_len_u32 >> 16:u32) & 0xFF:u32) as u8)
+    buffer#.push(((p_len_u32 >> 24:u32) & 0xFF:u32) as u8)
+
+    auto payload_start = buffer.len()
+
+    // 3. Write OpType
+    buffer#.push(op)
+
+    // 4. Write SeqNum (8B LE)
+    auto s# = seq
+    auto s_iter# = 0:usize
+    loop s_iter < 8:usize {
+        buffer#.push((s & 0xFF:u64) as u8)
+        s = s >> 8:u64
+        s_iter = s_iter + 1:usize
+    }
+
+    // 5. Write KeyLen (4B LE) + KeyBytes
+    auto k_len_u32 = key_len as u32
+    buffer#.push((k_len_u32 & 0xFF:u32) as u8)
+    buffer#.push(((k_len_u32 >> 8:u32) & 0xFF:u32) as u8)
+    buffer#.push(((k_len_u32 >> 16:u32) & 0xFF:u32) as u8)
+    buffer#.push(((k_len_u32 >> 24:u32) & 0xFF:u32) as u8)
+
+    if key_len > 0:usize {
+        unsafe {
+            auto *k_bytes = (key.c_str() as usize) as *[u8]
+            auto k_iter# = 0:usize
+            loop k_iter < key_len {
+                buffer#.push(k_bytes[k_iter])
+                k_iter = k_iter + 1:usize
+            }
+        }
+    }
+
+    // 6. Write ValLen (4B LE) + ValBytes
+    auto v_len_u32 = val_len as u32
+    buffer#.push((v_len_u32 & 0xFF:u32) as u8)
+    buffer#.push(((v_len_u32 >> 8:u32) & 0xFF:u32) as u8)
+    buffer#.push(((v_len_u32 >> 16:u32) & 0xFF:u32) as u8)
+    buffer#.push(((v_len_u32 >> 24:u32) & 0xFF:u32) as u8)
+
+    if op == OP_PUT && val_len > 0:usize {
+        unsafe {
+            auto *v_bytes = (value.c_str() as usize) as *[u8]
+            auto v_iter# = 0:usize
+            loop v_iter < val_len {
+                buffer#.push(v_bytes[v_iter])
+                v_iter = v_iter + 1:usize
+            }
+        }
+    }
+
+    // 7. Calculate CRC32 and backfill to frame header
+    auto calculated_crc = crc32_ieee(buffer, payload_start, payload_len)
+    buffer#.set(start_pos + 0:usize, (calculated_crc & 0xFF:u32) as u8)
+    buffer#.set(start_pos + 1:usize, ((calculated_crc >> 8:u32) & 0xFF:u32) as u8)
+    buffer#.set(start_pos + 2:usize, ((calculated_crc >> 16:u32) & 0xFF:u32) as u8)
+    buffer#.set(start_pos + 3:usize, ((calculated_crc >> 24:u32) & 0xFF:u32) as u8)
+
+    auto total_frame_len = RECORD_HEADER_SIZE + payload_len
+    return Result<usize, KvError>::Ok(total_frame_len)
+}
+
+/// Decodes a single WAL record from buffer at specified offset.
+pub fn decode_record(
+    buffer: Vec<u8>,
+    offset: usize,
+    available_len: usize
+) -> Result<DecodedRecord, KvError> {
+    auto buf_len = buffer.len()
+    if offset > buf_len || available_len > (buf_len - offset) {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("buffer_out_of_bounds")
+        )
+    }
+
+    if available_len < RECORD_HEADER_SIZE {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("incomplete_header")
+        )
+    }
+
+    // 1. Read CRC32 (4B LE)
+    auto b0 = buffer.get(offset + 0:usize) as u32
+    auto b1 = buffer.get(offset + 1:usize) as u32
+    auto b2 = buffer.get(offset + 2:usize) as u32
+    auto b3 = buffer.get(offset + 3:usize) as u32
+    auto stored_crc = b0 | (b1 << 8:u32) | (b2 << 16:u32) | (b3 << 24:u32)
+
+    // 2. Read PayloadLen (4B LE)
+    auto l0 = buffer.get(offset + 4:usize) as u32
+    auto l1 = buffer.get(offset + 5:usize) as u32
+    auto l2 = buffer.get(offset + 6:usize) as u32
+    auto l3 = buffer.get(offset + 7:usize) as u32
+    auto payload_len_u32 = l0 | (l1 << 8:u32) | (l2 << 16:u32) | (l3 << 24:u32)
+    auto payload_len = payload_len_u32 as usize
+
+    // Defensive validation: upper bounds and minimum payload size
+    if payload_len > MAX_RECORD_BYTES || payload_len < 17:usize {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("invalid_payload_length")
+        )
+    }
+
+    auto total_frame_len = RECORD_HEADER_SIZE + payload_len
+    if available_len < total_frame_len {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("incomplete_payload")
+        )
+    }
+
+    auto payload_start = offset + RECORD_HEADER_SIZE
+
+    // 3. CRC32 validation
+    auto actual_crc = crc32_ieee(buffer, payload_start, payload_len)
+    if stored_crc != actual_crc {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("crc_mismatch")
+        )
+    }
+
+    // 4. Parse OpType
+    auto op = buffer.get(payload_start)
+    if op != OP_PUT && op != OP_DELETE {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("invalid_op_type")
+        )
+    }
+
+    // 5. Parse SeqNum (8B LE)
+    auto seq# = 0:u64
+    auto s_iter# = 0:usize
+    loop s_iter < 8:usize {
+        auto sb = buffer.get(payload_start + 1:usize + s_iter) as u64
+        seq = seq | (sb << ((s_iter * 8:usize) as u64))
+        s_iter = s_iter + 1:usize
+    }
+
+    // 6. Parse KeyLen (4B LE) + KeyBytes
+    auto k_offset = payload_start + 9:usize
+    auto kb0 = buffer.get(k_offset + 0:usize) as u32
+    auto kb1 = buffer.get(k_offset + 1:usize) as u32
+    auto kb2 = buffer.get(k_offset + 2:usize) as u32
+    auto kb3 = buffer.get(k_offset + 3:usize) as u32
+    auto key_len_u32 = kb0 | (kb1 << 8:u32) | (kb2 << 16:u32) | (kb3 << 24:u32)
+    auto key_len = key_len_u32 as usize
+
+    if key_len > MAX_KEY_BYTES || (17:usize + key_len) > payload_len {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("invalid_key_length")
+        )
+    }
+
+    auto key_bytes_start = k_offset + 4:usize
+    auto key_str# = string::new()
+    if key_len > 0:usize {
+        auto *key_ptr = buffer.unsafe_get(key_bytes_start)
+        key_str = string::from_raw(*key_ptr, key_len)
+    }
+
+    // 7. Parse ValLen (4B LE) + ValBytes
+    auto v_offset = key_bytes_start + key_len
+    auto vb0 = buffer.get(v_offset + 0:usize) as u32
+    auto vb1 = buffer.get(v_offset + 1:usize) as u32
+    auto vb2 = buffer.get(v_offset + 2:usize) as u32
+    auto vb3 = buffer.get(v_offset + 3:usize) as u32
+    auto val_len_u32 = vb0 | (vb1 << 8:u32) | (vb2 << 16:u32) | (vb3 << 24:u32)
+    auto val_len = val_len_u32 as usize
+
+    if val_len > MAX_VALUE_BYTES || (17:usize + key_len + val_len) != payload_len {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("invalid_value_length")
+        )
+    }
+
+    // Delete record must have val_len == 0
+    if op == OP_DELETE && val_len != 0:usize {
+        return Result<DecodedRecord, KvError>::Err(
+            KvError::corrupted("delete_record_contains_value")
+        )
+    }
+
+    auto val_bytes_start = v_offset + 4:usize
+    auto val_str# = string::new()
+    if op == OP_PUT && val_len > 0:usize {
+        auto *val_ptr = buffer.unsafe_get(val_bytes_start)
+        val_str = string::from_raw(*val_ptr, val_len)
+    }
+
+    auto dummy = string::new()
+    auto entry# = Entry::new_delete(cede dummy, seq)
+    if op == OP_PUT {
+        entry = Entry::new_put(cede key_str, cede val_str, seq)
+    } else {
+        entry = Entry::new_delete(cede key_str, seq)
+    }
+
+    return Result<DecodedRecord, KvError>::Ok(DecodedRecord(
+        entry = cede entry,
+        frame_bytes = total_frame_len
+    ))
+}

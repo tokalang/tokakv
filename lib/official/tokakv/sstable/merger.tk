@@ -1,0 +1,95 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// official/tokakv/sstable/merger.tk
+// Multi-way merging iterator over multiple SSTable iterators.
+
+import core/types::{usize}
+import core/traits::{@Dup}
+import core/result::{Result}
+import core/option::{Option}
+import std/vec::{Vec}
+import official/tokakv/types::{Entry, KvError}
+import official/tokakv/sstable/iterator::{SSTableIterator}
+
+pub shape MergingIterator (
+    children#: Vec<SSTableIterator>
+)
+
+impl MergingIterator {
+    pub fn new(cede children: Vec<SSTableIterator>) -> MergingIterator {
+        return MergingIterator(
+            children = cede children
+        )
+    }
+
+    pub fn is_valid(self#) -> bool {
+        auto count = self.children.len()
+        auto i# = 0:usize
+        loop i < count {
+            unsafe {
+                auto *child# = self.children.unsafe_get(i)
+                if child#.is_valid() {
+                    return true
+                }
+            }
+            i = i + 1:usize
+        }
+        return false
+    }
+
+    pub fn next_entry(self#) -> Result<Option<Entry>, KvError> {
+        auto count = self.children.len()
+        if count == 0:usize {
+            return Result<Option<Entry>, KvError>::Ok(Option<Entry>::None)
+        }
+
+        auto best_idx# = -1:i64
+
+        auto i# = 0:usize
+        loop i < count {
+            unsafe {
+                auto *child# = self.children.unsafe_get(i)
+                if child#.is_valid() {
+                    if best_idx < 0:i64 {
+                        best_idx = i as i64
+                    } else {
+                        auto *best_child# = self.children.unsafe_get(best_idx as usize)
+                        auto cur_opt = child#.current()
+                        auto best_opt = best_child#.current()
+                        if cur_opt.is_some() && best_opt.is_some() {
+                            auto cur_e = cur_opt.unwrap()
+                            auto best_e = best_opt.unwrap()
+                            auto cmp = cur_e.key.as_str().cmp(best_e.key.as_str())
+                            if cmp < 0:i32 {
+                                best_idx = i as i64
+                            } else if cmp == 0:i32 {
+                                if cur_e.seq > best_e.seq {
+                                    best_idx = i as i64
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = i + 1:usize
+        }
+
+        if best_idx < 0:i64 {
+            return Result<Option<Entry>, KvError>::Ok(Option<Entry>::None)
+        }
+
+        auto chosen_idx = best_idx as usize
+        unsafe {
+            auto *chosen_child# = self.children.unsafe_get(chosen_idx)
+            auto opt_entry = chosen_child#.current()
+            if opt_entry.is_none() {
+                return Result<Option<Entry>, KvError>::Ok(Option<Entry>::None)
+            }
+            auto result_entry = opt_entry.unwrap()
+            auto adv_res = chosen_child#.advance()
+            if adv_res.is_err() {
+                return Result<Option<Entry>, KvError>::Err(adv_res.unwrap_err())
+            }
+            return Result<Option<Entry>, KvError>::Ok(Option<Entry>::Some(cede result_entry))
+        }
+    }
+}

@@ -1,0 +1,16 @@
+// Copyright (c) 2026 YiZhonghua<zhyi@dpai.com>. All rights reserved.
+// tokakv/tests/diag_block_cache_cannot_mutate_entries.tk
+// Diagnostic test: accessing private entries of @Encap CachedBlock must fail with E0418.
+
+import std/vec::{Vec}
+import official/tokakv/types::{Entry}
+import official/tokakv/cache/block_cache::{CachedBlock}
+
+fn main() -> i32 {
+    auto entries# = Vec<Entry>::new()
+    auto ~blk = CachedBlock::new(1:u64, 0:u64, cede entries, 100:usize)
+
+    // Attempting to access private entries field must trigger error[E0418]
+    auto e = blk.entries
+    return 0
+}

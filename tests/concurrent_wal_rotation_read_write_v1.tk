@@ -4,7 +4,7 @@
 
 import std/io::{println}
 import std/fs::{create_temp_file_system}
-import std/thread::{thread_spawn, yield_now}
+import std/thread::{thread_spawn_with_state, yield_now}
 import official/tokakv::{TokaKvEngine}
 
 fn make_key(i: usize) -> string {
@@ -19,6 +19,112 @@ fn make_val(i: usize, iter: usize) -> string {
     s#.push_str("_iter_")
     s#.push_str(string::from_int(iter as i32).as_str())
     return cede s
+}
+
+fn run_reader_1(db: TokaKvEngine) -> cede i32 {
+    auto iter# = 0:usize
+    loop iter < 50:usize {
+        auto k_idx# = 1:usize
+        loop k_idx <= 25:usize {
+            auto res = db.get(make_key(k_idx))
+            assert(res.is_ok(), "r1 get must succeed")
+            k_idx = k_idx + 1:usize
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
+}
+
+fn run_reader_2(db: TokaKvEngine) -> cede i32 {
+    auto iter# = 0:usize
+    loop iter < 50:usize {
+        auto k_idx# = 26:usize
+        loop k_idx <= 50:usize {
+            auto res = db.get(make_key(k_idx))
+            assert(res.is_ok(), "r2 get must succeed")
+            k_idx = k_idx + 1:usize
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
+}
+
+fn run_reader_3(db: TokaKvEngine) -> cede i32 {
+    auto iter# = 0:usize
+    loop iter < 50:usize {
+        auto k_idx# = 51:usize
+        loop k_idx <= 100:usize {
+            auto res = db.get(make_key(k_idx))
+            assert(res.is_ok(), "r3 get must succeed")
+            k_idx = k_idx + 1:usize
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
+}
+
+fn run_reader_4(db: TokaKvEngine) -> cede i32 {
+    auto iter# = 0:usize
+    loop iter < 50:usize {
+        auto k_idx# = 1:usize
+        loop k_idx <= 100:usize {
+            auto res = db.get(make_key(k_idx))
+            assert(res.is_ok(), "r4 get must succeed")
+            k_idx = k_idx + 2:usize
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
+}
+
+fn run_writer_1(db: TokaKvEngine) -> cede i32 {
+    auto iter# = 1:usize
+    loop iter <= 20:usize {
+        auto k_idx# = 51:usize
+        loop k_idx <= 100:usize {
+            auto p_res = db.put(make_key(k_idx), make_val(k_idx, iter))
+            assert(p_res.is_ok(), "w1 put must succeed")
+            k_idx = k_idx + 1:usize
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
+}
+
+fn run_writer_2(db: TokaKvEngine) -> cede i32 {
+    auto iter# = 1:usize
+    loop iter <= 20:usize {
+        auto k_idx# = 1:usize
+        loop k_idx <= 50:usize {
+            auto p_res = db.put(make_key(k_idx), make_val(k_idx, iter))
+            assert(p_res.is_ok(), "w2 put must succeed")
+            k_idx = k_idx + 1:usize
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
+}
+
+fn run_rotator(db: TokaKvEngine) -> cede i32 {
+    auto r_step# = 0:usize
+    loop r_step < 8:usize {
+        yield_now()
+        auto rot_res = db.rotate_wal()
+        assert(rot_res.is_ok(), "rotate_wal in thread must succeed")
+        yield_now()
+        if r_step % 2:usize == 0:usize {
+            auto fl_res = db.flush_active_memtable()
+            assert(fl_res.is_ok(), "flush_active_memtable in rotator thread must succeed")
+        }
+        r_step = r_step + 1:usize
+    }
+    return cede 0
 }
 
 fn test_concurrent_rotation_read_write() {
@@ -46,126 +152,20 @@ fn test_concurrent_rotation_read_write() {
     auto w2_db = db.clone()
     auto rot_db = db.clone()
 
-    // Reader 1: queries keys 1..25
-    auto r1_fn# = { [cede r1_db] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto k_idx# = 1:usize
-            loop k_idx <= 25:usize {
-                auto res = r1_db.get(make_key(k_idx))
-                assert(res.is_ok(), "r1 get must succeed")
-                k_idx = k_idx + 1:usize
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Reader 2: queries keys 26..50
-    auto r2_fn# = { [cede r2_db] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto k_idx# = 26:usize
-            loop k_idx <= 50:usize {
-                auto res = r2_db.get(make_key(k_idx))
-                assert(res.is_ok(), "r2 get must succeed")
-                k_idx = k_idx + 1:usize
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Reader 3: queries keys 51..100 (written concurrently)
-    auto r3_fn# = { [cede r3_db] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto k_idx# = 51:usize
-            loop k_idx <= 100:usize {
-                auto res = r3_db.get(make_key(k_idx))
-                assert(res.is_ok(), "r3 get must succeed")
-                k_idx = k_idx + 1:usize
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Reader 4: queries random ranges
-    auto r4_fn# = { [cede r4_db] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto k_idx# = 1:usize
-            loop k_idx <= 100:usize {
-                auto res = r4_db.get(make_key(k_idx))
-                assert(res.is_ok(), "r4 get must succeed")
-                k_idx = k_idx + 2:usize
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Writer 1: writes keys 51..100
-    auto w1_fn# = { [cede w1_db] =>
-        auto iter# = 1:usize
-        loop iter <= 20:usize {
-            auto k_idx# = 51:usize
-            loop k_idx <= 100:usize {
-                auto p_res = w1_db.put(make_key(k_idx), make_val(k_idx, iter))
-                assert(p_res.is_ok(), "w1 put must succeed")
-                k_idx = k_idx + 1:usize
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Writer 2: writes keys 1..50
-    auto w2_fn# = { [cede w2_db] =>
-        auto iter# = 1:usize
-        loop iter <= 20:usize {
-            auto k_idx# = 1:usize
-            loop k_idx <= 50:usize {
-                auto p_res = w2_db.put(make_key(k_idx), make_val(k_idx, iter))
-                assert(p_res.is_ok(), "w2 put must succeed")
-                k_idx = k_idx + 1:usize
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Rotator thread: performs periodic rotations and flushes
-    auto rot_fn# = { [cede rot_db] =>
-        auto r_step# = 0:usize
-        loop r_step < 8:usize {
-            yield_now()
-            auto rot_res = rot_db.rotate_wal()
-            assert(rot_res.is_ok(), "rotate_wal in thread must succeed")
-            yield_now()
-            if r_step % 2:usize == 0:usize {
-                auto fl_res = rot_db.flush_active_memtable()
-                assert(fl_res.is_ok(), "flush_active_memtable in rotator thread must succeed")
-            }
-            r_step = r_step + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto t_r1# = thread_spawn<i32>(cede r1_fn)
-    auto t_r2# = thread_spawn<i32>(cede r2_fn)
-    auto t_r3# = thread_spawn<i32>(cede r3_fn)
-    auto t_r4# = thread_spawn<i32>(cede r4_fn)
-    auto t_w1# = thread_spawn<i32>(cede w1_fn)
-    auto t_w2# = thread_spawn<i32>(cede w2_fn)
-    auto t_rot# = thread_spawn<i32>(cede rot_fn)
+    auto r1_entry = { state => return cede run_reader_1(state) }:fn(TokaKvEngine) -> cede i32
+    auto r2_entry = { state => return cede run_reader_2(state) }:fn(TokaKvEngine) -> cede i32
+    auto r3_entry = { state => return cede run_reader_3(state) }:fn(TokaKvEngine) -> cede i32
+    auto r4_entry = { state => return cede run_reader_4(state) }:fn(TokaKvEngine) -> cede i32
+    auto w1_entry = { state => return cede run_writer_1(state) }:fn(TokaKvEngine) -> cede i32
+    auto w2_entry = { state => return cede run_writer_2(state) }:fn(TokaKvEngine) -> cede i32
+    auto rot_entry = { state => return cede run_rotator(state) }:fn(TokaKvEngine) -> cede i32
+    auto t_r1# = thread_spawn_with_state<TokaKvEngine, i32>(cede r1_db, r1_entry)
+    auto t_r2# = thread_spawn_with_state<TokaKvEngine, i32>(cede r2_db, r2_entry)
+    auto t_r3# = thread_spawn_with_state<TokaKvEngine, i32>(cede r3_db, r3_entry)
+    auto t_r4# = thread_spawn_with_state<TokaKvEngine, i32>(cede r4_db, r4_entry)
+    auto t_w1# = thread_spawn_with_state<TokaKvEngine, i32>(cede w1_db, w1_entry)
+    auto t_w2# = thread_spawn_with_state<TokaKvEngine, i32>(cede w2_db, w2_entry)
+    auto t_rot# = thread_spawn_with_state<TokaKvEngine, i32>(cede rot_db, rot_entry)
 
     t_r1#.join().unwrap()
     t_r2#.join().unwrap()

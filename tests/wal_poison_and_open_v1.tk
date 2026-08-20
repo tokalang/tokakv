@@ -143,6 +143,8 @@ fn main() -> i32 {
 
     // Clear failpoint and cleanup
     set_var(string::from("TOKA_FAILPOINT"), string::from(""))
+    auto poisoned_close = eng_reopened#.close()
+    assert(poisoned_close.is_err(), "closing a poisoned engine must remain fail-closed after joining its worker")
     tmp2#.remove()
 
     println("[TokaKV] Sequence Monotonicity & Real Failpoint Poisoning Test PASSED!")

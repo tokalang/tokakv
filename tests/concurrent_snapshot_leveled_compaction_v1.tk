@@ -8,7 +8,7 @@ import core/option::{Option}
 import std/io::{println}
 import std/vec::{Vec}
 import std/fs::{create_temp_file_system}
-import std/thread::{thread_spawn, yield_now}
+import std/thread::{thread_spawn_with_state, yield_now}
 import official/tokakv::{TokaKvEngine}
 
 fn make_key(prefix: string, idx: i32) -> string {
@@ -24,6 +24,61 @@ fn make_val(prefix: string, idx: i32) -> string {
     v#.push_str("_")
     v#.push_str(string::from_int(idx).as_str())
     return cede v
+}
+
+fn run_snapshot_reader(db: TokaKvEngine) -> cede i32 {
+    auto round# = 0
+    loop round < 25 {
+        auto lease_res = db.acquire_snapshot()
+        assert(lease_res.is_ok(), "acquire_snapshot must succeed")
+        auto lease = lease_res.unwrap()
+
+        auto idx# = 0
+        loop idx < 15 {
+            auto k = make_key(string::from("seed"), idx)
+            auto r_res = db.get_at_snapshot(k, lease)
+            assert(r_res.is_ok(), "get_at_snapshot must succeed")
+            assert(r_res.unwrap().is_some(), "seed key must be visible in snapshot")
+            yield_now()
+            idx = idx + 1
+        }
+        round = round + 1
+    }
+    return cede 0
+}
+
+fn run_point_reader(db: TokaKvEngine) -> cede i32 {
+    auto round# = 0
+    loop round < 30 {
+        auto idx# = 0
+        loop idx < 15 {
+            auto k = make_key(string::from("seed"), idx)
+            auto r_res = db.get(k)
+            assert(r_res.is_ok(), "get must succeed")
+            yield_now()
+            idx = idx + 1
+        }
+        round = round + 1
+    }
+    return cede 0
+}
+
+fn run_writer_compactor(db: TokaKvEngine) -> cede i32 {
+    auto round# = 0
+    loop round < 5 {
+        auto idx# = 0
+        loop idx < 10 {
+            auto k = make_key(string::from("dyn"), idx + round * 10)
+            auto v = make_val(string::from("dyn"), idx + round * 10)
+            db.put(k, v).unwrap()
+            idx = idx + 1
+        }
+        db.flush_active_memtable().unwrap()
+        db.compact_l0().unwrap()
+        yield_now()
+        round = round + 1
+    }
+    return cede 0
 }
 
 fn test_concurrent_snapshot_leveled_compaction() {
@@ -51,67 +106,12 @@ fn test_concurrent_snapshot_leveled_compaction() {
     auto reader_db = db.clone()
     auto writer_db = db.clone()
 
-    // Thread 1: Snapshot reader
-    auto snap_fn# = { [cede snap_db] =>
-        auto round# = 0
-        loop round < 25 {
-            auto lease_res = snap_db.acquire_snapshot()
-            assert(lease_res.is_ok(), "acquire_snapshot must succeed")
-            auto lease = lease_res.unwrap()
-
-            auto idx# = 0
-            loop idx < 15 {
-                auto k = make_key(string::from("seed"), idx)
-                auto r_res = snap_db.get_at_snapshot(k, lease)
-                assert(r_res.is_ok(), "get_at_snapshot must succeed")
-                assert(r_res.unwrap().is_some(), "seed key must be visible in snapshot")
-                yield_now()
-                idx = idx + 1
-            }
-            round = round + 1
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Thread 2: Point reader
-    auto reader_fn# = { [cede reader_db] =>
-        auto round# = 0
-        loop round < 30 {
-            auto idx# = 0
-            loop idx < 15 {
-                auto k = make_key(string::from("seed"), idx)
-                auto r_res = reader_db.get(k)
-                assert(r_res.is_ok(), "get must succeed")
-                yield_now()
-                idx = idx + 1
-            }
-            round = round + 1
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    // Thread 3: Writer & compactor
-    auto writer_fn# = { [cede writer_db] =>
-        auto round# = 0
-        loop round < 5 {
-            auto idx# = 0
-            loop idx < 10 {
-                auto k = make_key(string::from("dyn"), idx + round * 10)
-                auto v = make_val(string::from("dyn"), idx + round * 10)
-                writer_db.put(k, v).unwrap()
-                idx = idx + 1
-            }
-            writer_db.flush_active_memtable().unwrap()
-            writer_db.compact_l0().unwrap()
-            yield_now()
-            round = round + 1
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto h_snap# = thread_spawn<i32>(cede snap_fn)
-    auto h_read# = thread_spawn<i32>(cede reader_fn)
-    auto h_write# = thread_spawn<i32>(cede writer_fn)
+    auto snap_entry = { state => return cede run_snapshot_reader(state) }:fn(TokaKvEngine) -> cede i32
+    auto read_entry = { state => return cede run_point_reader(state) }:fn(TokaKvEngine) -> cede i32
+    auto write_entry = { state => return cede run_writer_compactor(state) }:fn(TokaKvEngine) -> cede i32
+    auto h_snap# = thread_spawn_with_state<TokaKvEngine, i32>(cede snap_db, snap_entry)
+    auto h_read# = thread_spawn_with_state<TokaKvEngine, i32>(cede reader_db, read_entry)
+    auto h_write# = thread_spawn_with_state<TokaKvEngine, i32>(cede writer_db, write_entry)
 
     assert(h_snap#.join().unwrap() == 0, "Snapshot thread failed")
     assert(h_read#.join().unwrap() == 0, "Reader thread failed")

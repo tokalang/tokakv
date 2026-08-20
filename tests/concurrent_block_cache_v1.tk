@@ -5,7 +5,7 @@
 import std/io::{println}
 import std/vec::{Vec}
 import std/fs::{create_temp_file_system}
-import std/thread::{thread_spawn, yield_now}
+import std/thread::{thread_spawn_with_state, yield_now}
 import official/tokakv::{TokaKvEngine}
 import official/tokakv/types::{LookupResult}
 import official/tokakv/cache/block_cache::{BlockCache}
@@ -22,6 +22,51 @@ fn make_val(i: usize) -> string {
     auto s# = string::from("value_data_")
     s#.push_str(string::from_int(i as i32).as_str())
     return cede s
+}
+
+shape CacheWorkerState (
+    cache: BlockCache,
+    path: string,
+    key: string,
+    expected: string,
+    file_number: u64,
+    offset: u64,
+    length: u64,
+    iterations: usize,
+    strict#: bool
+)
+
+impl CacheWorkerState@Send {}
+
+fn run_cache_worker(state: CacheWorkerState) -> cede i32 {
+    auto iter# = 0:usize
+    loop iter < state.iterations {
+        auto loaded = state.cache.get_or_load(
+            state.file_number,
+            state.offset,
+            state.length,
+            state.path
+        )
+        if loaded.is_ok() {
+            auto r = loaded.unwrap().lookup(state.key.as_str())
+            match r {
+                auto LookupResult::Hit(&val) => assert(
+                    val.as_str().equals(state.expected.as_str()),
+                    "cache worker value mismatch"
+                )
+                _ => {
+                    if state.strict {
+                        assert(false, "cache worker lookup failed")
+                    }
+                }
+            }
+        } else if state.strict {
+            assert(false, "cache worker load failed")
+        }
+        yield_now()
+        iter = iter + 1:usize
+    }
+    return cede 0
 }
 
 fn test_concurrent_double_check_miss() {
@@ -46,60 +91,31 @@ fn test_concurrent_double_check_miss() {
 
     auto cache = BlockCache::new(65536:usize)
 
-    auto c1 = cache.clone()
-    auto c2 = cache.clone()
-    auto c3 = cache.clone()
-    auto c4 = cache.clone()
-
-    auto p1 = sst_path.clone()
-    auto p2 = sst_path.clone()
-    auto p3 = sst_path.clone()
-    auto p4 = sst_path.clone()
-
-    auto f1# = { [cede c1, cede p1, copy b_offset, copy b_length, copy fnum] =>
-        auto lease = c1.get_or_load(fnum, b_offset, b_length, p1).unwrap()
-        auto r = lease.lookup(string::from("alpha").as_str())
-        match r {
-            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t1 val mismatch")
-            _ => assert(false, "t1 lookup failed")
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto f2# = { [cede c2, cede p2, copy b_offset, copy b_length, copy fnum] =>
-        auto lease = c2.get_or_load(fnum, b_offset, b_length, p2).unwrap()
-        auto r = lease.lookup(string::from("alpha").as_str())
-        match r {
-            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t2 val mismatch")
-            _ => assert(false, "t2 lookup failed")
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto f3# = { [cede c3, cede p3, copy b_offset, copy b_length, copy fnum] =>
-        auto lease = c3.get_or_load(fnum, b_offset, b_length, p3).unwrap()
-        auto r = lease.lookup(string::from("alpha").as_str())
-        match r {
-            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t3 val mismatch")
-            _ => assert(false, "t3 lookup failed")
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto f4# = { [cede c4, cede p4, copy b_offset, copy b_length, copy fnum] =>
-        auto lease = c4.get_or_load(fnum, b_offset, b_length, p4).unwrap()
-        auto r = lease.lookup(string::from("alpha").as_str())
-        match r {
-            auto LookupResult::Hit(&val) => assert(val.as_str().equals("val_alpha"), "t4 val mismatch")
-            _ => assert(false, "t4 lookup failed")
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto t1# = thread_spawn<i32>(cede f1)
-    auto t2# = thread_spawn<i32>(cede f2)
-    auto t3# = thread_spawn<i32>(cede f3)
-    auto t4# = thread_spawn<i32>(cede f4)
+    auto s1 = CacheWorkerState(
+        cache = cache.clone(), path = sst_path.clone(), key = string::from("alpha"),
+        expected = string::from("val_alpha"), file_number = fnum,
+        offset = b_offset, length = b_length, iterations = 1:usize, strict = true
+    )
+    auto s2 = CacheWorkerState(
+        cache = cache.clone(), path = sst_path.clone(), key = string::from("alpha"),
+        expected = string::from("val_alpha"), file_number = fnum,
+        offset = b_offset, length = b_length, iterations = 1:usize, strict = true
+    )
+    auto s3 = CacheWorkerState(
+        cache = cache.clone(), path = sst_path.clone(), key = string::from("alpha"),
+        expected = string::from("val_alpha"), file_number = fnum,
+        offset = b_offset, length = b_length, iterations = 1:usize, strict = true
+    )
+    auto s4 = CacheWorkerState(
+        cache = cache.clone(), path = sst_path.clone(), key = string::from("alpha"),
+        expected = string::from("val_alpha"), file_number = fnum,
+        offset = b_offset, length = b_length, iterations = 1:usize, strict = true
+    )
+    auto worker_entry = { state => return cede run_cache_worker(state) }:fn(CacheWorkerState) -> cede i32
+    auto t1# = thread_spawn_with_state<CacheWorkerState, i32>(cede s1, worker_entry)
+    auto t2# = thread_spawn_with_state<CacheWorkerState, i32>(cede s2, worker_entry)
+    auto t3# = thread_spawn_with_state<CacheWorkerState, i32>(cede s3, worker_entry)
+    auto t4# = thread_spawn_with_state<CacheWorkerState, i32>(cede s4, worker_entry)
 
     t1#.join().unwrap()
     t2#.join().unwrap()
@@ -186,88 +202,31 @@ fn test_concurrent_hits_misses_evictions() {
     auto off4 = c4_cand.offset
     auto len4 = c4_cand.length
 
-    auto c1 = cache.clone()
-    auto c2 = cache.clone()
-    auto c3 = cache.clone()
-    auto c4 = cache.clone()
-
-    auto p1 = sst1.clone()
-    auto p2 = sst2.clone()
-    auto p3 = sst3.clone()
-    auto p4 = sst4.clone()
-
-    auto w1_fn# = { [cede c1, cede p1, copy off1, copy len1, copy fnum1] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto l1 = c1.get_or_load(fnum1, off1, len1, p1)
-            if l1.is_ok() {
-                auto r = l1.unwrap().lookup(string::from("key:5").as_str())
-                match r {
-                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_5"), "w1 key:5 mismatch")
-                    _ => {}
-                }
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto w2_fn# = { [cede c2, cede p2, copy off2, copy len2, copy fnum2] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto l2 = c2.get_or_load(fnum2, off2, len2, p2)
-            if l2.is_ok() {
-                auto r = l2.unwrap().lookup(string::from("key:15").as_str())
-                match r {
-                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_15"), "w2 key:15 mismatch")
-                    _ => {}
-                }
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto w3_fn# = { [cede c3, cede p3, copy off3, copy len3, copy fnum3] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto l3 = c3.get_or_load(fnum3, off3, len3, p3)
-            if l3.is_ok() {
-                auto r = l3.unwrap().lookup(string::from("key:25").as_str())
-                match r {
-                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_25"), "w3 key:25 mismatch")
-                    _ => {}
-                }
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto w4_fn# = { [cede c4, cede p4, copy off4, copy len4, copy fnum4] =>
-        auto iter# = 0:usize
-        loop iter < 50:usize {
-            auto l4 = c4.get_or_load(fnum4, off4, len4, p4)
-            if l4.is_ok() {
-                auto r = l4.unwrap().lookup(string::from("key:35").as_str())
-                match r {
-                    auto LookupResult::Hit(&val) => assert(val.as_str().equals("value_data_35"), "w4 key:35 mismatch")
-                    _ => {}
-                }
-            }
-            yield_now()
-            iter = iter + 1:usize
-        }
-        return cede 0
-    }:fn#() -> cede i32
-
-    auto w1# = thread_spawn<i32>(cede w1_fn)
-    auto w2# = thread_spawn<i32>(cede w2_fn)
-    auto w3# = thread_spawn<i32>(cede w3_fn)
-    auto w4# = thread_spawn<i32>(cede w4_fn)
+    auto s1 = CacheWorkerState(
+        cache = cache.clone(), path = sst1.clone(), key = string::from("key:5"),
+        expected = string::from("value_data_5"), file_number = fnum1,
+        offset = off1, length = len1, iterations = 50:usize, strict = false
+    )
+    auto s2 = CacheWorkerState(
+        cache = cache.clone(), path = sst2.clone(), key = string::from("key:15"),
+        expected = string::from("value_data_15"), file_number = fnum2,
+        offset = off2, length = len2, iterations = 50:usize, strict = false
+    )
+    auto s3 = CacheWorkerState(
+        cache = cache.clone(), path = sst3.clone(), key = string::from("key:25"),
+        expected = string::from("value_data_25"), file_number = fnum3,
+        offset = off3, length = len3, iterations = 50:usize, strict = false
+    )
+    auto s4 = CacheWorkerState(
+        cache = cache.clone(), path = sst4.clone(), key = string::from("key:35"),
+        expected = string::from("value_data_35"), file_number = fnum4,
+        offset = off4, length = len4, iterations = 50:usize, strict = false
+    )
+    auto worker_entry = { state => return cede run_cache_worker(state) }:fn(CacheWorkerState) -> cede i32
+    auto w1# = thread_spawn_with_state<CacheWorkerState, i32>(cede s1, worker_entry)
+    auto w2# = thread_spawn_with_state<CacheWorkerState, i32>(cede s2, worker_entry)
+    auto w3# = thread_spawn_with_state<CacheWorkerState, i32>(cede s3, worker_entry)
+    auto w4# = thread_spawn_with_state<CacheWorkerState, i32>(cede s4, worker_entry)
 
     w1#.join().unwrap()
     w2#.join().unwrap()

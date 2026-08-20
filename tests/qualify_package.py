@@ -13,6 +13,27 @@ def run_cmd(cmd, env=None):
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     return res
 
+def write_sanitizer_ir(source_path, output_path, sanitizer_attribute):
+    """Attach a sanitizer attribute to every Toka-defined LLVM function."""
+    definition_count = 0
+    with open(source_path, "r", encoding="utf-8") as source:
+        with open(output_path, "w", encoding="utf-8") as output:
+            for line in source:
+                if line.lstrip().startswith("define "):
+                    brace_index = line.rfind("{")
+                    if brace_index < 0:
+                        raise ValueError(f"multi-line LLVM function definition is unsupported: {line.rstrip()}")
+                    line = (
+                        line[:brace_index]
+                        + sanitizer_attribute
+                        + " "
+                        + line[brace_index:]
+                    )
+                    definition_count += 1
+                output.write(line)
+    if definition_count == 0:
+        raise ValueError(f"no LLVM function definitions found in {source_path}")
+
 def main():
     print("=== [TokaKV Package Qualification Suite] ===")
 
@@ -81,6 +102,7 @@ def main():
 
     passed = 0
     failed = 0
+    emitted_ir = {}
 
     clang_bin = "clang"
     if os.path.exists("/opt/homebrew/opt/llvm/bin/clang"):
@@ -91,6 +113,12 @@ def main():
     if os.path.exists("/opt/homebrew/include"):
         openssl_inc = ["-I/opt/homebrew/include"]
         openssl_lib = ["-L/opt/homebrew/lib", "-lssl", "-lcrypto"]
+
+    asan_env = os.environ.copy()
+    asan_env["ASAN_OPTIONS"] = "detect_leaks=1:halt_on_error=1:abort_on_error=1"
+    llvm_symbolizer = "/opt/homebrew/opt/llvm/bin/llvm-symbolizer"
+    if os.path.exists(llvm_symbolizer):
+        asan_env["ASAN_SYMBOLIZER_PATH"] = llvm_symbolizer
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # 1. Build Release runtime object (WITHOUT -DTOKA_TESTING)
@@ -124,7 +152,7 @@ def main():
         rt_res = run_cmd([
             clang_bin, "-DTOKA_HAS_OPENSSL=1", "-DTOKA_TESTING=1"
         ] + openssl_inc + [
-            "-fsanitize=address", "-g", "-c",
+            "-fsanitize=address", "-fno-omit-frame-pointer", "-g", "-c",
             os.path.join(TOKA_DIR, "lib", "sys", "toka_rt.c"),
             "-o", rt_asan_obj
         ])
@@ -145,22 +173,40 @@ def main():
             print(f"[FATAL] Failed to build TSan runtime object:\n{rt_tsan_res.stderr}")
             sys.exit(1)
 
-        # 5. Standard & ASan Tests
+        # 5. Standard & fully instrumented ASan tests.
+        #
+        # Emit the complete Toka program (test plus imported Toka libraries) to
+        # LLVM IR once. Compile that same IR through Clang twice so the ASan
+        # binary instruments Toka-generated memory accesses as well as the C
+        # runtime, rather than merely linking an instrumented runtime object to
+        # an otherwise uninstrumented Toka object.
         for name, test_path in tests:
             bin_path = os.path.join(tmp_dir, name)
+            ll_path = os.path.join(tmp_dir, f"{name}.ll")
             obj_path = os.path.join(tmp_dir, f"{name}.o")
+            asan_ll_path = os.path.join(tmp_dir, f"{name}_asan.ll")
+            asan_obj_path = os.path.join(tmp_dir, f"{name}_asan.o")
             asan_bin_path = os.path.join(tmp_dir, f"{name}_asan")
 
-            # Compile Toka source to object file
-            comp_obj = run_cmd([
+            emit_ll = run_cmd([
                 TOKAC,
                 "-I", os.path.join(TOKA_DIR, "lib"),
                 "-I", os.path.join(TOKAKV_DIR, "lib"),
+                "--emit-llvm",
                 test_path,
-                "-c", "-o", obj_path
+                "-o", ll_path
             ])
-            if comp_obj.returncode != 0:
-                print(f"[FAILED] Compilation failed for {name}:\n{comp_obj.stderr}")
+            if emit_ll.returncode != 0:
+                print(f"[FAILED] Failed to emit LLVM IR for {name}:\n{emit_ll.stderr}")
+                failed += 1
+                continue
+            emitted_ir[name] = ll_path
+
+            compile_std = run_cmd([
+                clang_bin, "-g", "-c", ll_path, "-o", obj_path
+            ])
+            if compile_std.returncode != 0:
+                print(f"[FAILED] Clang compilation of {name} Toka LLVM IR failed:\n{compile_std.stderr}")
                 failed += 1
                 continue
 
@@ -185,7 +231,7 @@ def main():
                 passed += 1
                 continue
 
-            print(f"-> Building and running {name} (standard & ASan)...", flush=True)
+            print(f"-> Building and running {name} (standard & fully instrumented ASan)...", flush=True)
 
             # Link standard test binary with Testing runtime
             link_std = run_cmd([
@@ -205,10 +251,26 @@ def main():
                 failed += 1
                 continue
 
-            # Link with ASan
+            # Compile the complete Toka LLVM IR with ASan instrumentation.
+            try:
+                write_sanitizer_ir(ll_path, asan_ll_path, "sanitize_address")
+            except (OSError, ValueError) as err:
+                print(f"[FAILED] Failed to prepare ASan LLVM IR for {name}: {err}")
+                failed += 1
+                continue
+            compile_asan = run_cmd([
+                clang_bin, "-fsanitize=address", "-fno-omit-frame-pointer",
+                "-g", "-c", asan_ll_path, "-o", asan_obj_path
+            ])
+            if compile_asan.returncode != 0:
+                print(f"[FAILED] Clang ASan compilation of {name} Toka LLVM IR failed:\n{compile_asan.stderr}")
+                failed += 1
+                continue
+
+            # Link the instrumented Toka object with the instrumented runtime.
             link_asan = run_cmd([
-                clang_bin, "-fsanitize=address",
-                obj_path, rt_asan_obj
+                clang_bin, "-fsanitize=address", "-fno-omit-frame-pointer",
+                asan_obj_path, rt_asan_obj
             ] + openssl_lib + [
                 "-lpthread", "-lm",
                 "-o", asan_bin_path
@@ -218,40 +280,42 @@ def main():
                 failed += 1
                 continue
 
-            # Execute under ASan
-            asan_exec = run_cmd([asan_bin_path])
+            # Make leak checking an explicit qualification requirement.
+            asan_exec = run_cmd([asan_bin_path], env=asan_env)
             if asan_exec.returncode != 0:
                 print(f"[FAILED] ASan execution failed for {name} (exit code {asan_exec.returncode}):\nSTDOUT:\n{asan_exec.stdout}\nSTDERR:\n{asan_exec.stderr}")
                 failed += 1
                 continue
 
-            print(f"[PASSED] {name} passed standard + ASan cleanly.", flush=True)
+            print(f"[PASSED] {name} passed standard + fully instrumented ASan cleanly.", flush=True)
             passed += 1
 
-        # 4. Fully Instrumented TSan Tests (Toka LLVM IR + Clang TSan instrumentation)
+        # 6. Fully Instrumented TSan Tests (Toka LLVM IR + Clang TSan instrumentation)
         for tsan_name, concurrent_test_path in tsan_tests:
             print(f"-> Building and running {tsan_name} (TSan fully instrumented)...", flush=True)
-            concurrent_ll_path = os.path.join(tmp_dir, f"{tsan_name}.ll")
+            concurrent_ll_path = emitted_ir.get(tsan_name)
+            concurrent_tsan_ll_path = os.path.join(tmp_dir, f"{tsan_name}_tsan.ll")
             concurrent_tsan_obj = os.path.join(tmp_dir, f"{tsan_name}_tsan.o")
             tsan_bin_path = os.path.join(tmp_dir, f"{tsan_name}_tsan_bin")
 
-            # Emit LLVM IR for Toka test and library code
-            emit_ll_res = run_cmd([
-                TOKAC,
-                "-I", os.path.join(TOKA_DIR, "lib"),
-                "-I", os.path.join(TOKAKV_DIR, "lib"),
-                "--emit-llvm",
-                concurrent_test_path,
-                "-o", concurrent_ll_path
-            ])
-            if emit_ll_res.returncode != 0:
-                print(f"[FAILED] Failed to emit LLVM IR for {tsan_name} TSan:\n{emit_ll_res.stderr}")
+            if concurrent_ll_path is None:
+                print(f"[FAILED] Missing previously emitted LLVM IR for {tsan_name} TSan")
                 failed += 1
             else:
+                try:
+                    write_sanitizer_ir(
+                        concurrent_ll_path,
+                        concurrent_tsan_ll_path,
+                        "sanitize_thread"
+                    )
+                except (OSError, ValueError) as err:
+                    print(f"[FAILED] Failed to prepare TSan LLVM IR for {tsan_name}: {err}")
+                    failed += 1
+                    continue
                 # Compile Toka LLVM IR through Clang with -fsanitize=thread to instrument all Toka functions & memory accesses
                 tsan_obj_res = run_cmd([
                     clang_bin, "-fsanitize=thread", "-g", "-c",
-                    concurrent_ll_path,
+                    concurrent_tsan_ll_path,
                     "-o", concurrent_tsan_obj
                 ])
                 if tsan_obj_res.returncode != 0:
@@ -278,7 +342,7 @@ def main():
                             print(f"[PASSED] {tsan_name} passed full TSan instrumentation cleanly.", flush=True)
                             passed += 1
 
-        # 5. Diagnostic Compile-Fail Tests
+        # 7. Diagnostic Compile-Fail Tests
         for diag_name, diag_path, expected_err in diag_tests:
             print(f"-> Running diagnostic compile-fail test {diag_name} (expecting {expected_err})...", flush=True)
             diag_bin = os.path.join(tmp_dir, diag_name)

@@ -82,37 +82,29 @@ impl FrozenMemTable {
         auto copy_entries# = Vec<Entry>::with_capacity(self.entries.len())
         auto i# = 0:usize
         loop i < self.entries.len() {
-            unsafe {
-                auto *entry_ptr = self.entries.unsafe_get(i)
-                copy_entries#.push(Entry::clone_from_ptr((*entry_ptr)))
-            }
+            auto &entry = self.entries.borrow(i)
+            copy_entries#.push(cede entry.clone())
             i = i + 1:usize
         }
         return cede copy_entries
     }
 
     pub fn clone(self) -> FrozenMemTable {
-        return FrozenMemTable::clone_from_ptr(*self)
-    }
-
-    pub fn clone_from_ptr(ptr: *FrozenMemTable) -> FrozenMemTable {
-        unsafe {
-            auto total = ptr.entries.len()
-            auto copy_entries# = Vec<Entry>::with_capacity(total)
-            auto i# = 0:usize
-            loop i < total {
-                auto *entry_ptr = ptr.entries.unsafe_get(i)
-                copy_entries#.push(Entry::clone_from_ptr((*entry_ptr)))
-                i = i + 1:usize
-            }
-            return FrozenMemTable(
-                entries = cede copy_entries,
-                size_bytes = ptr.size_bytes,
-                min_seq = ptr.min_seq,
-                max_seq = ptr.max_seq,
-                flush_id = ptr.flush_id
-            )
+        auto total = self.entries.len()
+        auto copy_entries# = Vec<Entry>::with_capacity(total)
+        auto i# = 0:usize
+        loop i < total {
+            auto &entry = self.entries.borrow(i)
+            copy_entries#.push(cede entry.clone())
+            i = i + 1:usize
         }
+        return FrozenMemTable(
+            entries = cede copy_entries,
+            size_bytes = self.size_bytes,
+            min_seq = self.min_seq,
+            max_seq = self.max_seq,
+            flush_id = self.flush_id
+        )
     }
 
     pub fn get_at_seq(self, key: string, target_seq: u64) -> LookupResult {
@@ -124,11 +116,8 @@ impl FrozenMemTable {
         auto high# = count
         loop low < high {
             auto mid = low + (high - low) / 2:usize
-            auto cmp# = 0:i32
-            unsafe {
-                auto *mid_entry = self.entries.unsafe_get(mid)
-                cmp = compare_internal_key(key.as_str(), target_seq, mid_entry.key.as_str(), mid_entry.seq)
-            }
+            auto &mid_entry = self.entries.borrow(mid)
+            auto cmp = compare_internal_key(key.as_str(), target_seq, mid_entry.key.as_str(), mid_entry.seq)
             if cmp <= 0:i32 {
                 high = mid
             } else {
@@ -136,14 +125,12 @@ impl FrozenMemTable {
             }
         }
         if low < count {
-            unsafe {
-                auto *e = self.entries.unsafe_get(low)
-                if e.key.as_str().equals(key.as_str()) && e.seq <= target_seq {
-                    if e.is_del {
-                        return LookupResult::Deleted
-                    } else {
-                        return LookupResult::Hit(e.value.clone())
-                    }
+            auto &entry = self.entries.borrow(low)
+            if entry.key.as_str().equals(key.as_str()) && entry.seq <= target_seq {
+                if entry.is_del {
+                    return LookupResult::Deleted
+                } else {
+                    return LookupResult::Hit(entry.value.clone())
                 }
             }
         }
@@ -214,11 +201,8 @@ impl MemTable {
         auto high# = count
         loop low < high {
             auto mid = low + (high - low) / 2:usize
-            auto cmp# = 0:i32
-            unsafe {
-                auto *mid_entry = self.entries.unsafe_get(mid)
-                cmp = compare_internal_key(key_slice, seq, mid_entry.key.as_str(), mid_entry.seq)
-            }
+            auto &mid_entry = self.entries.borrow(mid)
+            auto cmp = compare_internal_key(key_slice, seq, mid_entry.key.as_str(), mid_entry.seq)
             if cmp == 0:i32 {
                 return Result<usize, usize>::Ok(mid)
             }
@@ -284,11 +268,8 @@ impl MemTable {
         auto high# = count
         loop low < high {
             auto mid = low + (high - low) / 2:usize
-            auto cmp# = 0:i32
-            unsafe {
-                auto *mid_entry = self.entries.unsafe_get(mid)
-                cmp = compare_internal_key(key.as_str(), target_seq, mid_entry.key.as_str(), mid_entry.seq)
-            }
+            auto &mid_entry = self.entries.borrow(mid)
+            auto cmp = compare_internal_key(key.as_str(), target_seq, mid_entry.key.as_str(), mid_entry.seq)
             if cmp <= 0:i32 {
                 high = mid
             } else {
@@ -296,14 +277,12 @@ impl MemTable {
             }
         }
         if low < count {
-            unsafe {
-                auto *e = self.entries.unsafe_get(low)
-                if e.key.as_str().equals(key.as_str()) && e.seq <= target_seq {
-                    if e.is_del {
-                        return LookupResult::Deleted
-                    } else {
-                        return LookupResult::Hit(e.value.clone())
-                    }
+            auto &entry = self.entries.borrow(low)
+            if entry.key.as_str().equals(key.as_str()) && entry.seq <= target_seq {
+                if entry.is_del {
+                    return LookupResult::Deleted
+                } else {
+                    return LookupResult::Hit(entry.value.clone())
                 }
             }
         }

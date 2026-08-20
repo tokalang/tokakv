@@ -168,14 +168,12 @@ impl ReadState {
             auto idx# = f_count
             loop idx > 0:usize {
                 idx = idx - 1:usize
-                unsafe {
-                    auto *frozen = self.frozen_mems.unsafe_get(idx)
-                    auto f_res = frozen.get_at_seq(key.clone(), target_seq)
-                    match f_res {
-                        auto LookupResult::Hit(&val) => return Result<Option<string>, KvError>::Ok(Option<string>::Some(val.clone()))
-                        auto LookupResult::Deleted => return Result<Option<string>, KvError>::Ok(Option<string>::None)
-                        _ => {}
-                    }
+                auto &frozen = self.frozen_mems.borrow(idx)
+                auto f_res = frozen.get_at_seq(key.clone(), target_seq)
+                match f_res {
+                    auto LookupResult::Hit(&val) => return Result<Option<string>, KvError>::Ok(Option<string>::Some(val.clone()))
+                    auto LookupResult::Deleted => return Result<Option<string>, KvError>::Ok(Option<string>::None)
+                    _ => {}
                 }
             }
         }
@@ -438,11 +436,9 @@ fn internal_flush_frozen_step(
         auto &rs = r_lock.get_ref()
         if rs.frozen_mems.len() > 0:usize {
             has_frozen = true
-            unsafe {
-                auto *f_ptr = rs.frozen_mems.unsafe_get(0:usize)
-                cur_flush_id = f_ptr.flush_id()
-                frozen_to_flush = FrozenMemTable::clone_from_ptr((*f_ptr))
-            }
+            auto &frozen = rs.frozen_mems.borrow(0:usize)
+            cur_flush_id = frozen.flush_id()
+            frozen_to_flush = frozen.clone()
         }
     }
 
@@ -556,12 +552,14 @@ fn internal_flush_frozen_step(
         auto del_idx# = -1:i64
         auto fi# = 0:usize
         loop fi < rs2.frozen_mems.len() {
-            unsafe {
-                auto *f_item_ptr = rs2.frozen_mems.unsafe_get(fi)
-                if f_item_ptr.flush_id() == cur_flush_id {
-                    del_idx = fi as i64
-                    break
-                }
+            auto is_target# = false
+            {
+                auto &frozen = rs2.frozen_mems.borrow(fi)
+                is_target = frozen.flush_id() == cur_flush_id
+            }
+            if is_target {
+                del_idx = fi as i64
+                break
             }
             fi = fi + 1:usize
         }
@@ -666,16 +664,14 @@ fn internal_compact_l0_step(
     auto edit# = VersionEdit::new(0:u64, 0:u64, cur_watermark)
     auto add_i# = 0:usize
     loop add_i < new_l1_tables.len() {
-        unsafe {
-            auto *m_ptr = new_l1_tables.unsafe_get(add_i)
-            auto sk = m_ptr.smallest_key.clone()
-            auto lk = m_ptr.largest_key.clone()
-            auto meta = TableMetadata::new(
-                m_ptr.file_number, m_ptr.file_size, m_ptr.min_seq, m_ptr.max_seq,
-                cede sk, cede lk, m_ptr.level
-            )
-            edit#.add_table(cede meta)
-        }
+        auto &table = new_l1_tables.borrow(add_i)
+        auto sk = table.smallest_key.clone()
+        auto lk = table.largest_key.clone()
+        auto meta = TableMetadata::new(
+            table.file_number, table.file_size, table.min_seq, table.max_seq,
+            cede sk, cede lk, table.level
+        )
+        edit#.add_table(cede meta)
         add_i = add_i + 1:usize
     }
     auto d_idx# = 0:usize

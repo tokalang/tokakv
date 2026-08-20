@@ -47,11 +47,8 @@ impl CachedBlock {
 
         loop low < high {
             auto mid = low + ((high - low) / 2:usize)
-            auto cmp# = 0:i32
-            unsafe {
-                auto *mid_entry = self.entries.unsafe_get(mid)
-                cmp = compare_internal_key(key_slice, target_seq, mid_entry.key.as_str(), mid_entry.seq)
-            }
+            auto &mid_entry = self.entries.borrow(mid)
+            auto cmp = compare_internal_key(key_slice, target_seq, mid_entry.key.as_str(), mid_entry.seq)
             if cmp <= 0:i32 {
                 high = mid
             } else {
@@ -59,14 +56,12 @@ impl CachedBlock {
             }
         }
         if low < count {
-            unsafe {
-                auto *e = self.entries.unsafe_get(low)
-                if e.key.as_str().equals(key_slice) && e.seq <= target_seq {
-                    if e.is_del {
-                        return LookupResult::Deleted
-                    } else {
-                        return LookupResult::Hit(e.value.clone())
-                    }
+            auto &entry = self.entries.borrow(low)
+            if entry.key.as_str().equals(key_slice) && entry.seq <= target_seq {
+                if entry.is_del {
+                    return LookupResult::Deleted
+                } else {
+                    return LookupResult::Hit(entry.value.clone())
                 }
             }
         }

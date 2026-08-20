@@ -41,14 +41,12 @@ impl SSTableWriter {
         auto max_seq# = 0:u64
         auto s_idx# = 0:usize
         loop s_idx < total_count {
-            unsafe {
-                auto *entry = entries.unsafe_get(s_idx)
-                if entry.seq < min_seq {
-                    min_seq = entry.seq
-                }
-                if entry.seq > max_seq {
-                    max_seq = entry.seq
-                }
+            auto &entry = entries.borrow(s_idx)
+            if entry.seq < min_seq {
+                min_seq = entry.seq
+            }
+            if entry.seq > max_seq {
+                max_seq = entry.seq
             }
             s_idx = s_idx + 1:usize
         }
@@ -59,12 +57,10 @@ impl SSTableWriter {
 
         auto smallest_key# = string::new()
         auto largest_key# = string::new()
-        unsafe {
-            auto *first_entry = entries.unsafe_get(0:usize)
-            auto *last_entry = entries.unsafe_get(total_count - 1:usize)
-            smallest_key = string::from(first_entry.key.as_str())
-            largest_key = string::from(last_entry.key.as_str())
-        }
+        auto &first_entry = entries.borrow(0:usize)
+        auto &last_entry = entries.borrow(total_count - 1:usize)
+        smallest_key = string::from(first_entry.key.as_str())
+        largest_key = string::from(last_entry.key.as_str())
 
         // 2. Create sibling temporary file in the exact same directory
         auto pending_res = PendingOutputFile::create_sibling_temp(target_path)
@@ -83,13 +79,11 @@ impl SSTableWriter {
         loop i < total_count {
             auto is_last = (i + 1:usize == total_count)
             auto last_key# = string::new()
-            unsafe {
-                auto *entry = entries.unsafe_get(i)
-                auto entry_approx_bytes = entry.key.len() + entry.value.len() + 17:usize
-                current_block#.push(Entry::clone_from_ptr((*entry)))
-                current_block_payload_bytes = current_block_payload_bytes + entry_approx_bytes
-                last_key = string::from(entry.key.as_str())
-            }
+            auto &entry = entries.borrow(i)
+            auto entry_approx_bytes = entry.key.len() + entry.value.len() + 17:usize
+            current_block#.push(cede entry.clone())
+            current_block_payload_bytes = current_block_payload_bytes + entry_approx_bytes
+            last_key = string::from(entry.key.as_str())
 
             if current_block_payload_bytes >= DEFAULT_BLOCK_SIZE || is_last {
                 auto blk_res = encode_data_block(current_block)

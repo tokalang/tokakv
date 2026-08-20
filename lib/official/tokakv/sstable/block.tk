@@ -6,6 +6,7 @@ import core/types::{usize}
 import core/traits::{@Dup}
 import core/result::{Result}
 import core/option::{Option}
+import std/bytes::{append_bytes_to_vec, bytes_from_vec, copy_bytes_to_string}
 import std/vec::{Vec}
 import official/tokakv/types::{Entry, KvError, LookupResult}
 import official/tokakv/crc32::{crc32_ieee}
@@ -54,26 +55,12 @@ pub fn encode_data_block(entries: Vec<Entry>) -> Result<Vec<u8>, KvError> {
         put_u32_le(payload#, klen as u32)
 
         if klen > 0:usize {
-            unsafe {
-                auto *k_bytes = (entry.key.c_str() as usize) as *[u8]
-                auto k# = 0:usize
-                loop k < klen {
-                    payload#.push(k_bytes[k])
-                    k = k + 1:usize
-                }
-            }
+            append_bytes_to_vec(payload#, entry.key.as_str().as_bytes())
         }
 
         put_u32_le(payload#, vlen as u32)
         if vlen > 0:usize {
-            unsafe {
-                auto *v_bytes = (entry.value.c_str() as usize) as *[u8]
-                auto v# = 0:usize
-                loop v < vlen {
-                    payload#.push(v_bytes[v])
-                    v = v + 1:usize
-                }
-            }
+            append_bytes_to_vec(payload#, entry.value.as_str().as_bytes())
         }
 
         i = i + 1:usize
@@ -148,8 +135,9 @@ pub fn decode_and_validate_data_block(buf: Vec<u8>, expected_len: u64) -> Result
 
         auto key# = string::new()
         if klen > 0:usize {
-            auto *k_ptr = buf.unsafe_get(cursor)
-            key = string::from_raw(*k_ptr, klen)
+            auto buf_view = bytes_from_vec(buf)
+            auto key_view = buf_view.slice_bytes(cursor, cursor + klen)
+            key = copy_bytes_to_string(key_view)
             cursor = cursor + klen
         }
 
@@ -165,8 +153,9 @@ pub fn decode_and_validate_data_block(buf: Vec<u8>, expected_len: u64) -> Result
 
         auto value# = string::new()
         if vlen > 0:usize {
-            auto *v_ptr = buf.unsafe_get(cursor)
-            value = string::from_raw(*v_ptr, vlen)
+            auto buf_view = bytes_from_vec(buf)
+            auto value_view = buf_view.slice_bytes(cursor, cursor + vlen)
+            value = copy_bytes_to_string(value_view)
             cursor = cursor + vlen
         }
 
@@ -255,14 +244,7 @@ pub fn encode_index_block(entries: Vec<IndexEntry>) -> Result<Vec<u8>, KvError> 
         auto klen = entry.last_key.len()
         put_u32_le(payload#, klen as u32)
         if klen > 0:usize {
-            unsafe {
-                auto *k_bytes = (entry.last_key.c_str() as usize) as *[u8]
-                auto k# = 0:usize
-                loop k < klen {
-                    payload#.push(k_bytes[k])
-                    k = k + 1:usize
-                }
-            }
+            append_bytes_to_vec(payload#, entry.last_key.as_str().as_bytes())
         }
         put_u64_le(payload#, entry.offset)
         put_u64_le(payload#, entry.length)
@@ -335,8 +317,9 @@ pub fn decode_and_validate_index_block(
 
         auto last_key# = string::new()
         if klen > 0:usize {
-            auto *k_ptr = buf.unsafe_get(cursor)
-            last_key = string::from_raw(*k_ptr, klen)
+            auto buf_view = bytes_from_vec(buf)
+            auto key_view = buf_view.slice_bytes(cursor, cursor + klen)
+            last_key = copy_bytes_to_string(key_view)
             cursor = cursor + klen
         }
 

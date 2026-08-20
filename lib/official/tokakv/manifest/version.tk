@@ -251,7 +251,7 @@ impl Version {
     /// Point lookup across active SSTables at a specific sequence watermark:
     /// 1. Level 0 tables checked from newest to oldest.
     /// 2. If not found in L0, Level 1+ tables checked via candidate range check.
-    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<&BlockCache>) -> Result<LookupResult, KvError> {
         auto count = self.tables.len()
         if count == 0:usize {
             return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
@@ -265,14 +265,7 @@ impl Version {
                 auto &handle_ref = self.tables.borrow(idx)
                 if handle_ref.meta.level == 0:u32 {
                     if key.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(handle_ref.meta.largest_key.as_str()) <= 0:i32 {
-                        auto cache_arg# = Option<BlockCache>::None
-                        match cache_opt {
-                            auto Option::Some(&bc) => {
-                                cache_arg = Option<BlockCache>::Some(bc.clone())
-                            }
-                            _ => {}
-                        }
-                        auto r_get = handle_ref.reader.get_at_seq(key.clone(), target_seq, cache_arg)
+                        auto r_get = handle_ref.reader.get_at_seq(key.clone(), target_seq, cache_opt)
                         if r_get.is_err() {
                             return r_get
                         }
@@ -298,14 +291,7 @@ impl Version {
                 auto &handle_ref = self.tables.borrow(l1_idx)
                 if handle_ref.meta.level == 1:u32 {
                     if key.as_str().cmp(handle_ref.meta.smallest_key.as_str()) >= 0:i32 && key.as_str().cmp(handle_ref.meta.largest_key.as_str()) <= 0:i32 {
-                        auto cache_arg# = Option<BlockCache>::None
-                        match cache_opt {
-                            auto Option::Some(&bc) => {
-                                cache_arg = Option<BlockCache>::Some(bc.clone())
-                            }
-                            _ => {}
-                        }
-                        auto r_get = handle_ref.reader.get_at_seq(key.clone(), target_seq, cache_arg)
+                        auto r_get = handle_ref.reader.get_at_seq(key.clone(), target_seq, cache_opt)
                         if r_get.is_err() {
                             return r_get
                         }
@@ -330,11 +316,11 @@ impl Version {
 
     /// Point lookup across active SSTables without external cache:
     pub fn get(self, key: string) -> Result<LookupResult, KvError> {
-        return self.get_with_cache(key, Option<BlockCache>::None)
+        return self.get_with_cache(key, Option<&BlockCache>::None)
     }
 
     /// Point lookup across active SSTables with optional block cache:
-    pub fn get_with_cache(self, key: string, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+    pub fn get_with_cache(self, key: string, cache_opt: Option<&BlockCache>) -> Result<LookupResult, KvError> {
         return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
     }
 

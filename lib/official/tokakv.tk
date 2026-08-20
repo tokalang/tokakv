@@ -146,7 +146,7 @@ impl ReadState {
         return old_mem.freeze_with_id(flush_id)
     }
 
-    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<BlockCache>) -> Result<Option<string>, KvError> {
+    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<&BlockCache>) -> Result<Option<string>, KvError> {
         if self.health == HEALTH_POISONED {
             return Result<Option<string>, KvError>::Err(KvError::poisoned())
         }
@@ -191,7 +191,7 @@ impl ReadState {
         }
     }
 
-    pub fn get(self, key: string, cache_opt: Option<BlockCache>) -> Result<Option<string>, KvError> {
+    pub fn get(self, key: string, cache_opt: Option<&BlockCache>) -> Result<Option<string>, KvError> {
         return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
     }
 }
@@ -1221,7 +1221,7 @@ impl TokaKvEngine {
         if rs.health == HEALTH_CLOSED {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
-        return rs.get_at_seq(key, authoritative_seq, Option<BlockCache>::Some(self.block_cache.clone()))
+        return rs.get_at_seq(key, authoritative_seq, Option<&BlockCache>::Some(&(self.block_cache)))
     }
 
     /// Returns the oldest live snapshot sequence (Result<Option<u64>, KvError>). Fail-closed on lock error.
@@ -1258,7 +1258,7 @@ impl TokaKvEngine {
         if rs.health == HEALTH_CLOSED {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
-        return rs.get(key, Option<BlockCache>::Some(self.block_cache.clone()))
+        return rs.get(key, Option<&BlockCache>::Some(&(self.block_cache)))
     }
 
     pub fn signal_maintenance(self, flush: bool, compaction: bool) {

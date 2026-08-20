@@ -167,11 +167,11 @@ impl SSTableReader {
 
     /// Point lookup for a key without external cache:
     pub fn get(self, key: string) -> Result<LookupResult, KvError> {
-        return self.get_with_cache(key, Option<BlockCache>::None)
+        return self.get_with_cache(key, Option<&BlockCache>::None)
     }
 
     /// Point lookup for a key with optional block cache:
-    pub fn get_with_cache(self, key: string, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+    pub fn get_with_cache(self, key: string, cache_opt: Option<&BlockCache>) -> Result<LookupResult, KvError> {
         return self.get_at_seq(key, 0xFFFFFFFFFFFFFFFF:u64, cache_opt)
     }
 
@@ -180,7 +180,7 @@ impl SSTableReader {
     /// - Ok(LookupResult::Deleted): newest version <= target_seq is a Delete (Tombstone)
     /// - Ok(LookupResult::NotFound): no version <= target_seq present in this SSTable
     /// - Err(KvError): CRC corruption, framing error, or I/O failure (Fail-Closed)
-    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<BlockCache>) -> Result<LookupResult, KvError> {
+    pub fn get_at_seq(self, key: string, target_seq: u64, cache_opt: Option<&BlockCache>) -> Result<LookupResult, KvError> {
         if self.min_seq > target_seq {
             return Result<LookupResult, KvError>::Ok(LookupResult::NotFound)
         }
@@ -191,36 +191,38 @@ impl SSTableReader {
         }
         auto block_entry = candidate_opt.unwrap()
 
-        if cache_opt.is_some() {
-            auto cache = cache_opt.unwrap()
-            auto lease_res = cache.get_or_load(self.file_number, block_entry.offset, block_entry.length, self.path.clone())
-            if lease_res.is_err() {
-                return Result<LookupResult, KvError>::Err(lease_res.unwrap_err())
+        match cache_opt {
+            auto Option<&BlockCache>::Some(&cache) => {
+                auto lease_res = cache.get_or_load(self.file_number, block_entry.offset, block_entry.length, self.path.clone())
+                if lease_res.is_err() {
+                    return Result<LookupResult, KvError>::Err(lease_res.unwrap_err())
+                }
+                auto lease = lease_res.unwrap()
+                return Result<LookupResult, KvError>::Ok(lease.lookup_at_seq(key.as_str(), target_seq))
             }
-            auto lease = lease_res.unwrap()
-            return Result<LookupResult, KvError>::Ok(lease.lookup_at_seq(key.as_str(), target_seq))
-        } else {
-            auto blk_len = block_entry.length as usize
-            auto blk_buf# = Vec<u8>::with_capacity(blk_len)
-            auto read_res = self.file.read_at(cede blk_buf, block_entry.offset, blk_len)
-            if read_res.is_err() {
-                auto r_err = read_res.unwrap_err()
-                return Result<LookupResult, KvError>::Err(KvError::io(r_err.error))
-            }
-            auto read_out = read_res.unwrap()
-            if read_out.bytes_read != blk_len {
-                return Result<LookupResult, KvError>::Err(
-                    KvError::corrupted("truncated_data_block_read")
-                )
-            }
-
-            auto entries_res = decode_and_validate_data_block(read_out.take_buffer(), block_entry.length)
-            if entries_res.is_err() {
-                return Result<LookupResult, KvError>::Err(entries_res.unwrap_err())
-            }
-            auto entries = entries_res.unwrap()
-            return Result<LookupResult, KvError>::Ok(find_entry_in_block_at_seq(entries, key.as_str(), target_seq))
+            _ => {}
         }
+
+        auto blk_len = block_entry.length as usize
+        auto blk_buf# = Vec<u8>::with_capacity(blk_len)
+        auto read_res = self.file.read_at(cede blk_buf, block_entry.offset, blk_len)
+        if read_res.is_err() {
+            auto r_err = read_res.unwrap_err()
+            return Result<LookupResult, KvError>::Err(KvError::io(r_err.error))
+        }
+        auto read_out = read_res.unwrap()
+        if read_out.bytes_read != blk_len {
+            return Result<LookupResult, KvError>::Err(
+                KvError::corrupted("truncated_data_block_read")
+            )
+        }
+
+        auto entries_res = decode_and_validate_data_block(read_out.take_buffer(), block_entry.length)
+        if entries_res.is_err() {
+            return Result<LookupResult, KvError>::Err(entries_res.unwrap_err())
+        }
+        auto entries = entries_res.unwrap()
+        return Result<LookupResult, KvError>::Ok(find_entry_in_block_at_seq(entries, key.as_str(), target_seq))
     }
 
     /// Reads and decodes all entries in a specific data block by block index.

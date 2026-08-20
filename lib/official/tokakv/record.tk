@@ -5,6 +5,7 @@
 import core/types::{usize}
 import core/result::{Result}
 import core/option::{Option}
+import std/bytes::{append_bytes_to_vec, bytes_from_vec, copy_bytes_to_string}
 import std/vec::{Vec}
 import official/tokakv/types::{
     OP_PUT, OP_DELETE, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_RECORD_BYTES,
@@ -106,14 +107,7 @@ pub fn encode_record(
     buffer#.push(((k_len_u32 >> 24:u32) & 0xFF:u32) as u8)
 
     if key_len > 0:usize {
-        unsafe {
-            auto *k_bytes = (key.c_str() as usize) as *[u8]
-            auto k_iter# = 0:usize
-            loop k_iter < key_len {
-                buffer#.push(k_bytes[k_iter])
-                k_iter = k_iter + 1:usize
-            }
-        }
+        append_bytes_to_vec(buffer#, key.as_str().as_bytes())
     }
 
     // 6. Write ValLen (4B LE) + ValBytes
@@ -124,14 +118,7 @@ pub fn encode_record(
     buffer#.push(((v_len_u32 >> 24:u32) & 0xFF:u32) as u8)
 
     if op == OP_PUT && val_len > 0:usize {
-        unsafe {
-            auto *v_bytes = (value.c_str() as usize) as *[u8]
-            auto v_iter# = 0:usize
-            loop v_iter < val_len {
-                buffer#.push(v_bytes[v_iter])
-                v_iter = v_iter + 1:usize
-            }
-        }
+        append_bytes_to_vec(buffer#, value.as_str().as_bytes())
     }
 
     // 7. Calculate CRC32 and backfill to frame header
@@ -238,8 +225,9 @@ pub fn decode_record(
     auto key_bytes_start = k_offset + 4:usize
     auto key_str# = string::new()
     if key_len > 0:usize {
-        auto *key_ptr = buffer.unsafe_get(key_bytes_start)
-        key_str = string::from_raw(*key_ptr, key_len)
+        auto buffer_view = bytes_from_vec(buffer)
+        auto key_view = buffer_view.slice_bytes(key_bytes_start, key_bytes_start + key_len)
+        key_str = copy_bytes_to_string(key_view)
     }
 
     // 7. Parse ValLen (4B LE) + ValBytes
@@ -267,8 +255,9 @@ pub fn decode_record(
     auto val_bytes_start = v_offset + 4:usize
     auto val_str# = string::new()
     if op == OP_PUT && val_len > 0:usize {
-        auto *val_ptr = buffer.unsafe_get(val_bytes_start)
-        val_str = string::from_raw(*val_ptr, val_len)
+        auto buffer_view = bytes_from_vec(buffer)
+        auto val_view = buffer_view.slice_bytes(val_bytes_start, val_bytes_start + val_len)
+        val_str = copy_bytes_to_string(val_view)
     }
 
     auto dummy = string::new()

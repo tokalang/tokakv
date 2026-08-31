@@ -99,7 +99,7 @@
 
 4. **Immutable Outer Receiver & Double-Check Loading**:
    - `BlockCache::get_or_load(self, ...)` and `BlockCache::stats(self)` provide immutable `self` receivers backed by internal `Mutex<BlockCacheInner>`.
-   - Lock payload access uses safe borrowed references (`auto &inner# = lock.get_ref()`).
+   - Lock payload access uses safe borrowed references (`auto &inner# = lock.borrow_mut()`).
    - Miss loader performs un-locked disk I/O via path parameter (`sst_path: string`) rather than consuming `@Encap` resource handles.
    - Re-acquires cache mutex upon decoded block construction to perform double-check insertion against concurrent peer workers.
 

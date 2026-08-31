@@ -414,7 +414,7 @@ impl SnapshotLease@Encap {
             auto lock_res = self.registry.lock()
             if lock_res.is_ok() {
                 auto lock_g = lock_res.unwrap()
-                auto &reg# = lock_g.get_ref()
+                auto &reg# = lock_g.borrow_mut()
                 reg#.unregister(self.id)
             }
             self.id = 0:u64
@@ -430,7 +430,7 @@ impl SnapshotLease {
         auto lock_res = self.registry.lock()
         if lock_res.is_ok() {
             auto lock_g = lock_res.unwrap()
-            auto &reg = lock_g.get_ref()
+            auto &reg = lock_g.borrow_mut()
             auto seq_opt = reg.get_sequence_for_id(self.id)
             if seq_opt.is_some() {
                 return seq_opt.unwrap()
@@ -492,7 +492,7 @@ fn internal_flush_frozen_step(
             return Result<bool, KvError>::Err(KvError::closed())
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         if rs.frozen_mems.len() > 0:usize {
             has_frozen = true
             auto &frozen = rs.frozen_mems.borrow(0:usize)
@@ -508,7 +508,7 @@ fn internal_flush_frozen_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             if rs.frozen_mems.len() > 0:usize {
                 auto _ = rs.frozen_mems#.remove(0:usize)
             }
@@ -521,7 +521,7 @@ fn internal_flush_frozen_step(
         return Result<bool, KvError>::Err(KvError::closed())
     }
     auto w_lock = w_lock_res.unwrap()
-    auto &w# = w_lock.get_ref()
+    auto &w# = w_lock.borrow_mut()
     if !w.opened {
         return Result<bool, KvError>::Err(KvError::closed())
     }
@@ -537,7 +537,7 @@ fn internal_flush_frozen_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_POISONED
         }
         return Result<bool, KvError>::Err(alloc_res.unwrap_err())
@@ -553,7 +553,7 @@ fn internal_flush_frozen_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_POISONED
         }
         return Result<bool, KvError>::Err(w_res.unwrap_err())
@@ -590,7 +590,7 @@ fn internal_flush_frozen_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_POISONED
         }
         return Result<bool, KvError>::Err(apply_res.unwrap_err())
@@ -606,7 +606,7 @@ fn internal_flush_frozen_step(
     }
     {
         auto r_wlock2 = r_wlock_res2.unwrap()
-        auto &rs2# = r_wlock2.get_ref()
+        auto &rs2# = r_wlock2.borrow_mut()
 
         auto del_idx# = -1:i64
         auto fi# = 0:usize
@@ -659,7 +659,7 @@ fn internal_compact_l0_step(
         return Result<bool, KvError>::Err(KvError::closed())
     }
     auto w_lock = w_lock_res.unwrap()
-    auto &w# = w_lock.get_ref()
+    auto &w# = w_lock.borrow_mut()
 
     if !w.opened {
         return Result<bool, KvError>::Err(KvError::closed())
@@ -685,7 +685,7 @@ fn internal_compact_l0_step(
             return Result<bool, KvError>::Err(KvError::closed())
         }
         auto snap_g = snap_lock_res.unwrap()
-        auto &reg = snap_g.get_ref()
+        auto &reg = snap_g.borrow_mut()
         oldest_snap_opt = reg.oldest_sequence()
     }
 
@@ -696,7 +696,7 @@ fn internal_compact_l0_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_POISONED
         }
         return Result<bool, KvError>::Err(comp_res.unwrap_err())
@@ -710,7 +710,7 @@ fn internal_compact_l0_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_POISONED
         }
         return Result<bool, KvError>::Err(l1_inv_res.unwrap_err())
@@ -746,7 +746,7 @@ fn internal_compact_l0_step(
         auto r_wlock_res = reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_POISONED
         }
         return Result<bool, KvError>::Err(apply_res.unwrap_err())
@@ -764,7 +764,7 @@ fn internal_compact_l0_step(
     }
     {
         auto r_wlock = r_wlock_res.unwrap()
-        auto &rs# = r_wlock.get_ref()
+        auto &rs# = r_wlock.borrow_mut()
         rs.current_version = cede new_version
     }
 
@@ -1090,7 +1090,7 @@ impl TokaKvEngine {
                 return Result<TokaKvEngine, KvError>::Err(KvError::poisoned())
             }
             auto handle_lock = handle_lock_res.unwrap()
-            auto &handle_slot# = handle_lock.get_ref()
+            auto &handle_slot# = handle_lock.borrow_mut()
             handle_slot = Option<JoinHandle<i32>>::Some(cede worker_handle)
         }
 
@@ -1109,7 +1109,7 @@ impl TokaKvEngine {
                     break
                 }
                 auto m_lock = m_lock_res.unwrap()
-                auto &ms# = m_lock.get_ref()
+                auto &ms# = m_lock.borrow_mut()
 
                 if ms.shutdown || state.health.get() == (HEALTH_POISONED as i32) || state.health.get() == (HEALTH_CLOSED as i32) {
                     should_stop = true
@@ -1136,7 +1136,7 @@ impl TokaKvEngine {
                     auto m_lock_res2 = state.maintenance.lock()
                     if m_lock_res2.is_ok() {
                         auto m_lock2 = m_lock_res2.unwrap()
-                        auto &ms2# = m_lock2.get_ref()
+                        auto &ms2# = m_lock2.borrow_mut()
                         ms2.in_flight_flush = false
                     }
                 }
@@ -1148,12 +1148,12 @@ impl TokaKvEngine {
                 auto r_lock_res = state.reader.read_lock()
                 if r_lock_res.is_ok() {
                     auto r_lock = r_lock_res.unwrap()
-                    auto &rs = r_lock.get_ref()
+                    auto &rs = r_lock.borrow()
                     if rs.current_version.l0_count() >= state.l0_compaction_threshold {
                         auto m_lock_res3 = state.maintenance.lock()
                         if m_lock_res3.is_ok() {
                             auto m_lock3 = m_lock_res3.unwrap()
-                            auto &ms3# = m_lock3.get_ref()
+                            auto &ms3# = m_lock3.borrow_mut()
                             ms3.pending_compaction = true
                         }
                     }
@@ -1164,7 +1164,7 @@ impl TokaKvEngine {
                     auto m_lock_res4 = state.maintenance.lock()
                     if m_lock_res4.is_ok() {
                         auto m_lock4 = m_lock_res4.unwrap()
-                        auto &ms4# = m_lock4.get_ref()
+                        auto &ms4# = m_lock4.borrow_mut()
                         ms4.in_flight_compaction = false
                     }
                 }
@@ -1189,7 +1189,7 @@ impl TokaKvEngine {
             return true
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         return rs.health == HEALTH_POISONED
     }
 
@@ -1203,7 +1203,7 @@ impl TokaKvEngine {
             return true
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         return rs.health == HEALTH_CLOSED
     }
 
@@ -1220,7 +1220,7 @@ impl TokaKvEngine {
             return Result<SnapshotLease, KvError>::Err(KvError::closed())
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w = w_lock.get_ref()
+        auto &w = w_lock.borrow_mut()
         if !w.opened {
             return Result<SnapshotLease, KvError>::Err(KvError::closed())
         }
@@ -1238,7 +1238,7 @@ impl TokaKvEngine {
             return Result<SnapshotLease, KvError>::Err(KvError::closed())
         }
         auto snap_g = snap_lock_res.unwrap()
-        auto &reg# = snap_g.get_ref()
+        auto &reg# = snap_g.borrow_mut()
         auto cap = EngineSnapshotCapability::grant_for_engine(self.snapshot_cap_token, self.engine_id)
         return reg#.acquire_lease_with_cap(seq, self.engine_id, self.~snapshots, cap)
     }
@@ -1254,7 +1254,7 @@ impl TokaKvEngine {
             return Result<u64, KvError>::Err(KvError::closed())
         }
         auto snap_g = snap_lock_res.unwrap()
-        auto &reg = snap_g.get_ref()
+        auto &reg = snap_g.borrow_mut()
         auto seq_opt = reg.get_sequence_for_id(lease.id())
         if seq_opt.is_none() {
             return Result<u64, KvError>::Err(
@@ -1284,7 +1284,7 @@ impl TokaKvEngine {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         if rs.health == HEALTH_POISONED {
             self.health.set(HEALTH_POISONED as i32)
             return Result<Option<string>, KvError>::Err(KvError::poisoned())
@@ -1319,7 +1319,7 @@ impl TokaKvEngine {
             return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
         }
         auto read_lock = read_lock_res.unwrap()
-        auto &state = read_lock.get_ref()
+        auto &state = read_lock.borrow()
         if state.health == HEALTH_POISONED {
             self.health.set(HEALTH_POISONED as i32)
             return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
@@ -1341,7 +1341,7 @@ impl TokaKvEngine {
             return Result<Option<u64>, KvError>::Err(KvError::closed())
         }
         auto snap_g = snap_lock_res.unwrap()
-        auto &reg = snap_g.get_ref()
+        auto &reg = snap_g.borrow_mut()
         return Result<Option<u64>, KvError>::Ok(reg.oldest_sequence())
     }
 
@@ -1360,7 +1360,7 @@ impl TokaKvEngine {
             return Result<Option<string>, KvError>::Err(KvError::closed())
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         if rs.health == HEALTH_POISONED {
             self.health.set(HEALTH_POISONED as i32)
             return Result<Option<string>, KvError>::Err(KvError::poisoned())
@@ -1385,7 +1385,7 @@ impl TokaKvEngine {
             return Result<LeasedLookupResult, KvError>::Err(KvError::closed())
         }
         auto read_lock = read_lock_res.unwrap()
-        auto &state = read_lock.get_ref()
+        auto &state = read_lock.borrow()
         if state.health == HEALTH_POISONED {
             self.health.set(HEALTH_POISONED as i32)
             return Result<LeasedLookupResult, KvError>::Err(KvError::poisoned())
@@ -1403,7 +1403,7 @@ impl TokaKvEngine {
         auto m_lock_res = self.maintenance.lock()
         if m_lock_res.is_ok() {
             auto m_lock = m_lock_res.unwrap()
-            auto &ms# = m_lock.get_ref()
+            auto &ms# = m_lock.borrow_mut()
             if flush {
                 ms.pending_flush = true
             }
@@ -1436,7 +1436,7 @@ impl TokaKvEngine {
                 auto r_lock_res = self.reader.read_lock()
                 if r_lock_res.is_ok() {
                     auto r_lock = r_lock_res.unwrap()
-                    auto &rs = r_lock.get_ref()
+                    auto &rs = r_lock.borrow()
                     if rs.health == HEALTH_POISONED {
                         self.health.set(HEALTH_POISONED as i32)
                         return Result<u64, KvError>::Err(KvError::poisoned())
@@ -1461,7 +1461,7 @@ impl TokaKvEngine {
             return Result<u64, KvError>::Err(KvError::closed())
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w# = w_lock.get_ref()
+        auto &w# = w_lock.borrow_mut()
 
         if !w.opened {
             return Result<u64, KvError>::Err(KvError::closed())
@@ -1479,7 +1479,7 @@ impl TokaKvEngine {
             auto r_wlock_res = self.reader.write_lock()
             if r_wlock_res.is_ok() {
                 auto r_wlock = r_wlock_res.unwrap()
-                auto &rs# = r_wlock.get_ref()
+                auto &rs# = r_wlock.borrow_mut()
                 rs.health = HEALTH_POISONED
             }
             return Result<u64, KvError>::Err(wal_res.unwrap_err())
@@ -1495,7 +1495,7 @@ impl TokaKvEngine {
         }
         {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             auto k_mem = key.clone()
             auto v_mem = value.clone()
             rs.active_mem#.put(seq, cede k_mem, cede v_mem)
@@ -1506,7 +1506,7 @@ impl TokaKvEngine {
             auto r_lock_res3 = self.reader.read_lock()
             if r_lock_res3.is_ok() {
                 auto r_lock3 = r_lock_res3.unwrap()
-                auto &rs3 = r_lock3.get_ref()
+                auto &rs3 = r_lock3.borrow()
                 if rs3.active_mem.size_bytes() >= self.write_buffer_size || rs3.active_mem.len() >= self.write_buffer_max_entries {
                     need_rotate = true
                 }
@@ -1520,7 +1520,7 @@ impl TokaKvEngine {
                 auto r_lock_res4 = self.reader.read_lock()
                 if r_lock_res4.is_ok() {
                     auto r_lock4 = r_lock_res4.unwrap()
-                    auto &rs4 = r_lock4.get_ref()
+                    auto &rs4 = r_lock4.borrow()
                     if rs4.current_version.l0_count() >= self.l0_compaction_threshold {
                         need_comp = true
                     }
@@ -1549,7 +1549,7 @@ impl TokaKvEngine {
                 auto r_lock_res = self.reader.read_lock()
                 if r_lock_res.is_ok() {
                     auto r_lock = r_lock_res.unwrap()
-                    auto &rs = r_lock.get_ref()
+                    auto &rs = r_lock.borrow()
                     if rs.health == HEALTH_POISONED {
                         self.health.set(HEALTH_POISONED as i32)
                         return Result<u64, KvError>::Err(KvError::poisoned())
@@ -1574,7 +1574,7 @@ impl TokaKvEngine {
             return Result<u64, KvError>::Err(KvError::closed())
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w# = w_lock.get_ref()
+        auto &w# = w_lock.borrow_mut()
 
         if !w.opened {
             return Result<u64, KvError>::Err(KvError::closed())
@@ -1592,7 +1592,7 @@ impl TokaKvEngine {
             auto r_wlock_res = self.reader.write_lock()
             if r_wlock_res.is_ok() {
                 auto r_wlock = r_wlock_res.unwrap()
-                auto &rs# = r_wlock.get_ref()
+                auto &rs# = r_wlock.borrow_mut()
                 rs.health = HEALTH_POISONED
             }
             return Result<u64, KvError>::Err(wal_res.unwrap_err())
@@ -1608,7 +1608,7 @@ impl TokaKvEngine {
         }
         {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             auto k_mem = key.clone()
             rs.active_mem#.delete(seq, cede k_mem)
         }
@@ -1618,7 +1618,7 @@ impl TokaKvEngine {
             auto r_lock_res3 = self.reader.read_lock()
             if r_lock_res3.is_ok() {
                 auto r_lock3 = r_lock_res3.unwrap()
-                auto &rs3 = r_lock3.get_ref()
+                auto &rs3 = r_lock3.borrow()
                 if rs3.active_mem.size_bytes() >= self.write_buffer_size || rs3.active_mem.len() >= self.write_buffer_max_entries {
                     need_rotate = true
                 }
@@ -1632,7 +1632,7 @@ impl TokaKvEngine {
                 auto r_lock_res4 = self.reader.read_lock()
                 if r_lock_res4.is_ok() {
                     auto r_lock4 = r_lock_res4.unwrap()
-                    auto &rs4 = r_lock4.get_ref()
+                    auto &rs4 = r_lock4.borrow()
                     if rs4.current_version.l0_count() >= self.l0_compaction_threshold {
                         need_comp = true
                     }
@@ -1661,7 +1661,7 @@ impl TokaKvEngine {
             auto r_lock_res = self.reader.read_lock()
             if r_lock_res.is_ok() {
                 auto r_lock = r_lock_res.unwrap()
-                auto &rs = r_lock.get_ref()
+                auto &rs = r_lock.borrow()
                 is_active_empty = rs.active_mem.is_empty()
             }
         }
@@ -1701,7 +1701,7 @@ impl TokaKvEngine {
             return Result<(), KvError>::Err(KvError::closed())
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w# = w_lock.get_ref()
+        auto &w# = w_lock.borrow_mut()
 
         if !w.opened {
             return Result<(), KvError>::Err(KvError::closed())
@@ -1721,7 +1721,7 @@ impl TokaKvEngine {
             return Result<(), KvError>::Err(KvError::poisoned())
         }
         auto r_wlock = r_wlock_res.unwrap()
-        auto &rs# = r_wlock.get_ref()
+        auto &rs# = r_wlock.borrow_mut()
 
         auto frozen = rs#.rotate_active(cur_flush_id)
         rs.frozen_mems#.push(cede frozen)
@@ -1741,7 +1741,7 @@ impl TokaKvEngine {
             return Result<u64, KvError>::Err(KvError::closed())
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w# = w_lock.get_ref()
+        auto &w# = w_lock.borrow_mut()
 
         if !w.opened {
             return Result<u64, KvError>::Err(KvError::closed())
@@ -1764,7 +1764,7 @@ impl TokaKvEngine {
             auto r_wlock_res = self.reader.write_lock()
             if r_wlock_res.is_ok() {
                 auto r_wlock = r_wlock_res.unwrap()
-                auto &rs# = r_wlock.get_ref()
+                auto &rs# = r_wlock.borrow_mut()
                 rs.health = HEALTH_POISONED
             }
             return Result<u64, KvError>::Err(alloc_res.unwrap_err())
@@ -1780,7 +1780,7 @@ impl TokaKvEngine {
             auto r_wlock_res = self.reader.write_lock()
             if r_wlock_res.is_ok() {
                 auto r_wlock = r_wlock_res.unwrap()
-                auto &rs# = r_wlock.get_ref()
+                auto &rs# = r_wlock.borrow_mut()
                 rs.health = HEALTH_POISONED
             }
             return Result<u64, KvError>::Err(new_writer_res.unwrap_err())
@@ -1837,7 +1837,7 @@ impl TokaKvEngine {
             auto r_wlock_res = self.reader.write_lock()
             if r_wlock_res.is_ok() {
                 auto r_wlock = r_wlock_res.unwrap()
-                auto &rs# = r_wlock.get_ref()
+                auto &rs# = r_wlock.borrow_mut()
                 rs.health = HEALTH_POISONED
             }
             return Result<u64, KvError>::Err(apply_res.unwrap_err())
@@ -1884,7 +1884,7 @@ impl TokaKvEngine {
             auto m_lock_res = self.maintenance.lock()
             if m_lock_res.is_ok() {
                 auto m_lock = m_lock_res.unwrap()
-                auto &ms# = m_lock.get_ref()
+                auto &ms# = m_lock.borrow_mut()
                 ms.shutdown = true
             }
         }
@@ -1894,7 +1894,7 @@ impl TokaKvEngine {
             auto w_h_lock_res = self.worker.lock()
             if w_h_lock_res.is_ok() {
                 auto w_h_lock = w_h_lock_res.unwrap()
-                auto &handle_opt# = w_h_lock.get_ref()
+                auto &handle_opt# = w_h_lock.borrow_mut()
                 if handle_opt.is_some() {
                     match handle_opt {
                         auto Option::Some(&h#) => {
@@ -1916,7 +1916,7 @@ impl TokaKvEngine {
             return Result<(), KvError>::Ok(())
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w# = w_lock.get_ref()
+        auto &w# = w_lock.borrow_mut()
 
         if !w.opened {
             return Result<(), KvError>::Ok(())
@@ -1927,7 +1927,7 @@ impl TokaKvEngine {
         auto r_wlock_res = self.reader.write_lock()
         if r_wlock_res.is_ok() {
             auto r_wlock = r_wlock_res.unwrap()
-            auto &rs# = r_wlock.get_ref()
+            auto &rs# = r_wlock.borrow_mut()
             rs.health = HEALTH_CLOSED
         }
 
@@ -1945,7 +1945,7 @@ impl TokaKvEngine {
             return 0:usize
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         return rs.active_mem.size_bytes()
     }
 
@@ -1955,7 +1955,7 @@ impl TokaKvEngine {
             return 0:u64
         }
         auto w_lock = w_lock_res.unwrap()
-        auto &w = w_lock.get_ref()
+        auto &w = w_lock.borrow_mut()
         if w.next_seq > 0:u64 {
             return w.next_seq - 1:u64
         }
@@ -1969,7 +1969,7 @@ impl TokaKvEngine {
             return Version::new(cede empty_tables, 0:u64)
         }
         auto r_lock = r_lock_res.unwrap()
-        auto &rs = r_lock.get_ref()
+        auto &rs = r_lock.borrow()
         return rs.current_version.clone()
     }
 

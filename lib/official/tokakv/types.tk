@@ -61,7 +61,7 @@ impl Entry {
         }
     }
 
-    pub fn clone_from_ptr(entry_ptr: *Entry) -> Entry {
+    pub fn clone_from_ptr(*entry_ptr: Entry) -> Entry {
         unsafe {
             auto k = string::from(entry_ptr.key.as_str())
             if entry_ptr.is_del {

@@ -1104,7 +1104,7 @@ impl VersionSet {
                 active_next_file_number,
                 active_manifest_seq,
                 active_active_log,
-                active_sealed_logs
+                cede active_sealed_logs
             )
         }
 

@@ -8,7 +8,7 @@ import official/tokakv/cache/block_cache::{CachedBlock, BlockLease}
 fn main() -> i32 {
     auto entries = Vec<Entry>::new()
     auto ~blk = CachedBlock::new(1:u64, 0:u64, cede entries, 100:usize)
-    auto lease = BlockLease::new(~blk)
+    auto lease = BlockLease::new(cede ~blk)
     // Attempting to access private field block must trigger error[E0418]
     auto ~b = lease.~block
     return 0

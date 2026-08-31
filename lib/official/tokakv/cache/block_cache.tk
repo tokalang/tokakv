@@ -158,8 +158,8 @@ impl BlockLease@Send {}
 impl BlockLease@Sync {}
 
 impl BlockLease {
-    pub fn new(~block: CachedBlock) -> BlockLease {
-        return BlockLease(~block = ~block)
+    pub fn new(cede ~block: CachedBlock) -> BlockLease {
+        return BlockLease(~block = cede ~block)
     }
 
     /// Performs binary search lookup for a specific sequence watermark within the leased block.
@@ -217,7 +217,7 @@ impl ValueLease {
             estimated_size
         )
         return ValueLease(
-            lease = BlockLease::new(~block),
+            lease = BlockLease::new(cede ~block),
             index = 0:usize
         )
     }
@@ -311,6 +311,10 @@ impl BlockEntry {
     pub fn new(~block: CachedBlock) -> BlockEntry {
         return BlockEntry(~block = ~block)
     }
+
+    fn into_block(cede self) -> ~CachedBlock {
+        return cede self.~block
+    }
 }
 
 impl BlockEntry@Dup {
@@ -371,14 +375,14 @@ impl BlockCacheInner {
     }
 
     /// Looks up a cached block by (file_number, offset). If found, promotes it to MRU (front).
-    pub fn lookup_and_promote(self#, file_number: u64, offset: u64) -> Option<~CachedBlock> {
+    pub fn lookup_and_promote(self#, file_number: u64, offset: u64) -> Option<BlockLease> {
         auto count = self.entries.len()
         auto i# = 0:usize
         loop i < count {
             auto entry = self.entries.get(i)
             if entry.block.file_number == file_number && entry.block.offset == offset {
                 self.hit_count = self.hit_count + 1:u64
-                auto ~b = entry.~block
+                auto ~b = cede entry.into_block()
                 if i > 0:usize {
                     auto hit_opt = self.entries#.remove(i)
                     if hit_opt.is_some() {
@@ -386,22 +390,23 @@ impl BlockCacheInner {
                         self.entries#.insert(0:usize, cede hit_val)
                     }
                 }
-                return Option<~CachedBlock>::Some(~b)
+                auto lease = BlockLease::new(cede ~b)
+                return Option<BlockLease>::Some(cede lease)
             }
             i = i + 1:usize
         }
         self.miss_count = self.miss_count + 1:u64
-        return Option<~CachedBlock>::None
+        return Option<BlockLease>::None
     }
 
     /// Probes without counting miss (used for double-check before insertion).
-    pub fn probe(self#, file_number: u64, offset: u64) -> Option<~CachedBlock> {
+    pub fn probe(self#, file_number: u64, offset: u64) -> Option<BlockLease> {
         auto count = self.entries.len()
         auto i# = 0:usize
         loop i < count {
             auto entry = self.entries.get(i)
             if entry.block.file_number == file_number && entry.block.offset == offset {
-                auto ~b = entry.~block
+                auto ~b = cede entry.into_block()
                 if i > 0:usize {
                     auto hit_opt = self.entries#.remove(i)
                     if hit_opt.is_some() {
@@ -409,11 +414,12 @@ impl BlockCacheInner {
                         self.entries#.insert(0:usize, cede hit_val)
                     }
                 }
-                return Option<~CachedBlock>::Some(~b)
+                auto lease = BlockLease::new(cede ~b)
+                return Option<BlockLease>::Some(cede lease)
             }
             i = i + 1:usize
         }
-        return Option<~CachedBlock>::None
+        return Option<BlockLease>::None
     }
 
     /// Inserts a newly loaded block into MRU (index 0) and evicts LRU blocks (from tail)
@@ -489,7 +495,7 @@ impl BlockCache {
             return CacheStats::new(0:usize, self.capacity_bytes, 0:u64, 0:u64, 0:u64)
         }
         auto lock = lock_res.unwrap()
-        auto &inner = lock.get_ref()
+        auto &inner = lock.borrow_mut()
         return inner.stats()
     }
 
@@ -507,10 +513,11 @@ impl BlockCache {
             auto lock_res = self.inner.lock()
             if lock_res.is_ok() {
                 auto lock = lock_res.unwrap()
-                auto &inner# = lock.get_ref()
+                auto &inner# = lock.borrow_mut()
                 auto hit_opt = inner#.lookup_and_promote(file_number, offset)
                 if hit_opt.is_some() {
-                    return Result<BlockLease, KvError>::Ok(BlockLease::new(hit_opt.unwrap()))
+                    auto lease = cede hit_opt.unwrap()
+                    return Result<BlockLease, KvError>::Ok(cede lease)
                 }
             }
         }
@@ -555,19 +562,21 @@ impl BlockCache {
         auto lock_res2 = self.inner.lock()
         if lock_res2.is_ok() {
             auto lock2 = lock_res2.unwrap()
-            auto &inner2# = lock2.get_ref()
+            auto &inner2# = lock2.borrow_mut()
             // Double-check if another concurrent worker inserted it while we were reading disk
             auto peer_hit_opt = inner2#.probe(file_number, offset)
             if peer_hit_opt.is_some() {
                 // Return the existing resident block; ~new_block drops automatically
-                return Result<BlockLease, KvError>::Ok(BlockLease::new(peer_hit_opt.unwrap()))
+                auto lease = cede peer_hit_opt.unwrap()
+                return Result<BlockLease, KvError>::Ok(cede lease)
             }
 
             // Insert into cache (handles eviction if needed)
             inner2#.insert_and_evict(~new_block)
         }
 
-        return Result<BlockLease, KvError>::Ok(BlockLease::new(~new_block))
+        auto lease = BlockLease::new(cede ~new_block)
+        return Result<BlockLease, KvError>::Ok(cede lease)
     }
 }
 

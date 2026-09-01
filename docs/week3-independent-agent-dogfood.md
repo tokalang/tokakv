@@ -155,10 +155,34 @@ change:
 4. API/tooling ergonomics: project-aware check/evidence and scoped evidence;
 5. language semantics: no change indicated by these trials.
 
+## Remediation status
+
+The two P1 classes found by this trial have been addressed on the development
+line without changing language semantics:
+
+- [tokalang/toka#42](https://github.com/tokalang/toka/pull/42) makes `toka
+  doctor` execute the packaged Python helper, checks Linux OpenSSL linker
+  inputs, and makes `check` and semantic commands project-aware on the
+  published macOS/Linux SDK targets. Installed-SDK regression coverage passed
+  Linux x64, Linux arm64, macOS arm64, and the existing Windows/MSYS2 dogfood
+  path.
+- [tokalang/toka-web#2](https://github.com/tokalang/toka-web/pull/2) is deployed
+  and documents current-shell activation plus the complete Ubuntu/Debian
+  prerequisites in both languages and in the TokaKV tour.
+- [tokalang/toka#40](https://github.com/tokalang/toka/issues/40) is closed. The
+  project-resolution portion of [tokalang/toka#38](https://github.com/tokalang/toka/issues/38)
+  is fixed; scoped evidence volume remains open as a P2.
+
+RC10 is an immutable published artifact, so its embedded CLI has not changed.
+The CLI remediations will reach users in the next SDK candidate; the public
+documentation mitigations apply to RC10 immediately. A replay against that
+next candidate is still required before changing the Week 3 release-quality
+gate to accepted.
+
 ## Decision
 
 The product path is independently reproducible and comfortably meets the
 installation, timing, modification, diagnosis, and stability thresholds.
-Week 3 nevertheless remains **not accepted** until the P1 false-ready and
-project-aware semantic-command defects are fixed and the same black-box
-profiles are replayed.
+The P1 defects are fixed on `main`, but Week 3 remains **not accepted for
+RC10**. The same black-box profiles must be replayed against the next published
+SDK candidate before the release-quality gate can change to accepted.

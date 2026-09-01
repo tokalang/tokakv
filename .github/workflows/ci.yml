@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          brew install llvm@20 pkgconf openssl@3
+          brew install llvm@20 lld@20 pkgconf openssl@3
           llvm_prefix="$(brew --prefix llvm@20)"
           openssl_prefix="$(brew --prefix openssl@3)"
           echo "$llvm_prefix/bin" >> "$GITHUB_PATH"

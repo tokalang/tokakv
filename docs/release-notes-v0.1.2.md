@@ -3,11 +3,23 @@
 **Status:** Prepared for qualification and publication. No tag or immutable
 GitHub Release exists until the maintainer authorizes publication.
 
-TokaKV `v0.1.2` is the RC10 product-onboarding release. It does not change the
-qualified storage engine implementation or public API from `v0.1.1`; it aligns
-the package metadata with Toka `v1.0.0-rc.10` and adds a verified path for a new
-developer to install, write, read, restart, recover, and understand the engine's
-ownership model.
+TokaKV `v0.1.2` is the RC10 product-onboarding release. It keeps the public API
+from `v0.1.1`, aligns the package metadata with Toka `v1.0.0-rc.10`, fixes an
+MVCC SSTable block-boundary defect found by hosted stress qualification, and
+adds a verified path for a new developer to install, write, read, restart,
+recover, and understand the engine's ownership model.
+
+## Correctness fix
+
+- The SSTable writer now cuts a data block only at a user-key boundary. All
+  MVCC versions of one key remain in the single candidate block selected by the
+  index, preventing duplicate adjacent `last_key` entries when one version group
+  crosses the 4KB target size.
+- `sstable_writer_reader_v1` now deterministically crosses that boundary with
+  51 versions of one key and verifies both latest and point-in-time reads.
+- The concurrent WAL rotation/read/write stress test now prints the exact
+  `KvError` on failure. The corrected writer passed 100 consecutive default
+  schedules that previously reproduced the defect within a few iterations.
 
 ## User-facing additions
 
@@ -26,7 +38,7 @@ ownership model.
 - Package identity: `official/tokakv`
 - Native dependencies: none
 - Supported hosts: Linux and macOS, x86_64 and aarch64
-- Storage implementation and API: unchanged from `v0.1.1`
+- Public API: unchanged from `v0.1.1`
 - Current compaction boundary: L0-to-L1
 
 ## Publication gates

@@ -7,11 +7,13 @@ import std/env::{set_var}
 import std/vec::{Vec}
 import std/fs::{create_temp_file_system}
 import std/data_file::{ReadDataFile}
-import official/tokakv/types::{LookupResult}
+import core/option::{Option}
+import official/tokakv/types::{LookupResult, KvError}
 import official/tokakv/memtable::{MemTable}
 import official/tokakv/sstable/writer::{SSTableWriter}
 import official/tokakv/sstable/reader::{SSTableReader}
 import official/tokakv/sstable/format::{FOOTER_SIZE}
+import official/tokakv/cache/block_cache::{BlockCache}
 
 fn make_key(idx: usize) -> string {
     auto k# = string::from("user_key_")
@@ -34,6 +36,66 @@ fn make_val(idx: usize) -> string {
     // Add extra padding to ensure blocks fill up and cross the 4KB boundary
     v#.push_str("_padding_bytes_to_exceed_block_size_threshold_1234567890_abcdefghij")
     return cede v
+}
+
+fn make_version_value(seq: u64) -> string {
+    auto value# = string::from("version_")
+    value#.push_str(string::from_i64(seq as i64).as_str())
+    value#.push_str("_padding_to_force_one_user_key_across_the_default_block_target_abcdefghijklmnopqrstuvwxyz_0123456789")
+    return cede value
+}
+
+fn expect_hit(result: Result<LookupResult, KvError>, expected: string) {
+    assert(result.is_ok(), "versioned lookup must succeed")
+    match result {
+        auto Result<LookupResult, KvError>::Ok(&lookup) => {
+            match lookup {
+                auto LookupResult::Hit(&value) => {
+                    assert(value.as_str().equals(expected.as_str()), "versioned value mismatch")
+                }
+                _ => assert(false, "versioned lookup must hit")
+            }
+        }
+        _ => assert(false, "versioned lookup must be ok")
+    }
+}
+
+fn test_same_user_key_stays_in_one_data_block() {
+    auto tmp# = create_temp_file_system().unwrap()
+    auto sst_path# = tmp.path().clone()
+    sst_path#.push_str("_same_key_boundary.sst")
+
+    auto mem# = MemTable::new()
+    mem#.put(1:u64, string::from("aaa_before"), string::from("before"))
+
+    auto seq# = 2:u64
+    loop seq <= 52:u64 {
+        mem#.put(seq, string::from("repeated_key"), make_version_value(seq))
+        seq = seq + 1:u64
+    }
+    mem#.put(53:u64, string::from("zzz_after"), string::from("after"))
+
+    auto frozen = mem.freeze()
+    auto write_res = SSTableWriter::write(sst_path.clone(), cede frozen)
+    assert(write_res.is_ok(), "same-key MVCC group must write without duplicate index keys")
+
+    auto reader# = SSTableReader::open(sst_path.clone()).unwrap()
+    assert(reader#.block_count() > 1:usize, "fixture must cross the default data-block target")
+
+    expect_hit(
+        cede reader#.get(string::from("repeated_key")),
+        make_version_value(52:u64)
+    )
+    expect_hit(
+        cede reader#.get_at_seq(
+            string::from("repeated_key"),
+            17:u64,
+            Option<&BlockCache>::None
+        ),
+        make_version_value(17:u64)
+    )
+
+    tmp#.remove()
 }
 
 fn test_sstable_write_and_point_lookup() {
@@ -224,6 +286,7 @@ fn test_sstable_writer_commit_uncertain() {
 
 fn main() -> i32 {
     test_sstable_write_and_point_lookup()
+    test_same_user_key_stays_in_one_data_block()
     test_sstable_writer_commit_uncertain()
     println("[PASS] SSTable Writer & Reader v1 Qualified Successfully!")
     return 0

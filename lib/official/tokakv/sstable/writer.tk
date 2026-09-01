@@ -78,6 +78,8 @@ impl SSTableWriter {
         auto i# = 0:usize
         loop i < total_count {
             auto is_last = (i + 1:usize == total_count)
+            auto is_user_key_boundary# = is_last
+            auto should_flush_block# = is_last
             auto last_key# = string::new()
             auto &entry = entries.borrow(i)
             auto entry_approx_bytes = entry.key.len() + entry.value.len() + 17:usize
@@ -85,7 +87,18 @@ impl SSTableWriter {
             current_block_payload_bytes = current_block_payload_bytes + entry_approx_bytes
             last_key = string::from(entry.key.as_str())
 
-            if current_block_payload_bytes >= DEFAULT_BLOCK_SIZE || is_last {
+            // A point lookup selects exactly one data block from the index.
+            // Keep every MVCC version of one user key in that same block so
+            // adjacent index last_key values remain strictly increasing.
+            if !is_last {
+                auto &next_entry = entries.borrow(i + 1:usize)
+                is_user_key_boundary = !entry.key.as_str().equals(next_entry.key.as_str())
+            }
+            if current_block_payload_bytes >= DEFAULT_BLOCK_SIZE && is_user_key_boundary {
+                should_flush_block = true
+            }
+
+            if should_flush_block {
                 auto blk_res = encode_data_block(current_block)
                 if blk_res.is_err() {
                     return Result<TableMetadata, KvError>::Err(blk_res.unwrap_err())

@@ -87,7 +87,11 @@ fn run_writer_1(db: TokaKvEngine) -> cede i32 {
         auto k_idx# = 51:usize
         loop k_idx <= 100:usize {
             auto p_res = db.put(make_key(k_idx), make_val(k_idx, iter))
-            assert(p_res.is_ok(), "w1 put must succeed")
+            if p_res.is_err() {
+                auto err = p_res.unwrap_err()
+                println("w1 put error: kind={} code={} message={}", err.kind, err.code, err.message)
+                assert(false, "w1 put must succeed")
+            }
             k_idx = k_idx + 1:usize
         }
         yield_now()
@@ -102,7 +106,11 @@ fn run_writer_2(db: TokaKvEngine) -> cede i32 {
         auto k_idx# = 1:usize
         loop k_idx <= 50:usize {
             auto p_res = db.put(make_key(k_idx), make_val(k_idx, iter))
-            assert(p_res.is_ok(), "w2 put must succeed")
+            if p_res.is_err() {
+                auto err = p_res.unwrap_err()
+                println("w2 put error: kind={} code={} message={}", err.kind, err.code, err.message)
+                assert(false, "w2 put must succeed")
+            }
             k_idx = k_idx + 1:usize
         }
         yield_now()
@@ -116,11 +124,19 @@ fn run_rotator(db: TokaKvEngine) -> cede i32 {
     loop r_step < 8:usize {
         yield_now()
         auto rot_res = db.rotate_wal()
-        assert(rot_res.is_ok(), "rotate_wal in thread must succeed")
+        if rot_res.is_err() {
+            auto err = rot_res.unwrap_err()
+            println("rotate error: kind={} code={} message={}", err.kind, err.code, err.message)
+            assert(false, "rotate_wal in thread must succeed")
+        }
         yield_now()
         if r_step % 2:usize == 0:usize {
             auto fl_res = db.flush_active_memtable()
-            assert(fl_res.is_ok(), "flush_active_memtable in rotator thread must succeed")
+            if fl_res.is_err() {
+                auto err = fl_res.unwrap_err()
+                println("flush error: kind={} code={} message={}", err.kind, err.code, err.message)
+                assert(false, "flush_active_memtable in rotator thread must succeed")
+            }
         }
         r_step = r_step + 1:usize
     }

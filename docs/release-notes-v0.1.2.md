@@ -1,7 +1,8 @@
 # TokaKV v0.1.2 release notes
 
-**Status:** Prepared for qualification and publication. No tag or immutable
-GitHub Release exists until the maintainer authorizes publication.
+**Status:** Published on 2026-09-01 as
+[`v0.1.2`](https://github.com/tokalang/tokakv/releases/tag/v0.1.2) and indexed
+as the latest verified `official/tokakv` release at `pkg.tokalang.dev`.
 
 TokaKV `v0.1.2` is the RC10 product-onboarding release. It keeps the public API
 from `v0.1.1`, aligns the package metadata with Toka `v1.0.0-rc.10`, fixes an
@@ -63,3 +64,12 @@ python3 tools/qualify_release.py --sdk /path/to/extracted/rc10 \
 After publication, the registry entry must use the exact GitHub Release archive
 URL and SHA-256, then the bare `toka add tokakv` quickstart must pass again from
 a clean temporary project.
+
+## Publication evidence
+
+- Source/tag commit: `c703987aef9499be0e0161e9b36b577b126ae872`
+- Tag qualification: [run 33465589586](https://github.com/tokalang/tokakv/actions/runs/33465589586), Linux x64 and macOS arm64 passed
+- Release asset: `tokakv-0.1.2.tar.gz`
+- Release asset SHA-256: `75f494311347b0cbb46d381c5b27b5610b26db6571f54b2721deb71d670f992c`
+- Registry publication: [tokalang/toka-registry PR 10](https://github.com/tokalang/toka-registry/pull/10)
+- Final public replay: clean RC10 `toka add tokakv` resolved `0.1.2`; both process runs and `RECOVERY VERIFIED` passed

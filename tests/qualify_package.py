@@ -148,6 +148,12 @@ def main():
 
     asan_env = os.environ.copy()
     asan_env["ASAN_OPTIONS"] = "detect_leaks=1:halt_on_error=1:abort_on_error=1"
+    if sys.platform == "darwin":
+        asan_env["LSAN_OPTIONS"] = (
+            "suppressions="
+            + os.path.join(TOKAKV_DIR, "tests", "lsan_macos.supp")
+            + ":print_suppressions=1"
+        )
     llvm_symbolizer = "/opt/homebrew/opt/llvm/bin/llvm-symbolizer"
     if os.path.exists(llvm_symbolizer):
         asan_env["ASAN_SYMBOLIZER_PATH"] = llvm_symbolizer

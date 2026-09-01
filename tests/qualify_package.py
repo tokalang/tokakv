@@ -27,11 +27,24 @@ def write_sanitizer_ir(source_path, output_path, sanitizer_attribute):
                     brace_index = line.rfind("{")
                     if brace_index < 0:
                         raise ValueError(f"multi-line LLVM function definition is unsupported: {line.rstrip()}")
+                    insert_index = brace_index
+                    # LLVM requires direct sanitizer attributes before trailing
+                    # function metadata such as `comdat`. Apple Clang accepted
+                    # the historical `comdat sanitize_*` order, while upstream
+                    # Linux Clang correctly rejects it.
+                    for marker in (
+                        " comdat", " section ", " partition ", " align ",
+                        " gc ", " prefix ", " prologue ", " personality ",
+                    ):
+                        marker_index = line.find(marker)
+                        if 0 <= marker_index < insert_index:
+                            insert_index = marker_index
                     line = (
-                        line[:brace_index]
+                        line[:insert_index].rstrip()
+                        + " "
                         + sanitizer_attribute
                         + " "
-                        + line[brace_index:]
+                        + line[insert_index:].lstrip()
                     )
                     definition_count += 1
                 output.write(line)
@@ -128,7 +141,7 @@ def main():
         clang_bin = "/opt/homebrew/opt/llvm/bin/clang"
 
     openssl_inc = []
-    openssl_lib = []
+    openssl_lib = ["-lssl", "-lcrypto"]
     if os.path.exists("/opt/homebrew/include"):
         openssl_inc = ["-I/opt/homebrew/include"]
         openssl_lib = ["-L/opt/homebrew/lib", "-lssl", "-lcrypto"]

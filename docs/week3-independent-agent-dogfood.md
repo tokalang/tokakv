@@ -1,0 +1,164 @@
+# Week 3 independent-agent dogfood
+
+**Date:** 2026-09-01  
+**Scope:** Toka `v1.0.0-rc.10`, public `official/tokakv` `v0.1.2`, and the
+published ten-minute tour.  
+**Result:** Functional/product goals passed; the Week 3 release-quality gate
+did **not** pass because P1 onboarding/tooling defects remain.
+
+## Evidence boundary
+
+These are ten independent AI-agent trials, not ten human interviews. Each agent
+received a target-user persona, a unique disposable environment, and the same
+black-box protocol. Agents were prohibited from reading the local Toka/TokaKV
+source or tests, viewing another trial, delegating, or asking the maintainer for
+help. They used only public RC10 artifacts, `tokalang.dev`, public GitHub, and
+the public registry.
+
+This is useful reproducible dogfood evidence, but it must not be presented as a
+substitute for future human usability research. Environment coverage was eight
+macOS arm64 trials, one clean Ubuntu x64 trial, and one clean Ubuntu arm64
+trial.
+
+## Protocol
+
+Each trial independently had to:
+
+1. install and verify RC10;
+2. create a project and run `toka add tokakv`;
+3. run the public tour twice and confirm WAL recovery;
+4. modify the program with delete, snapshot, or lease behavior;
+5. deliberately create an ownership error, interpret it, and repair it;
+6. record timing, exact blockers, source-build need, willingness, and any
+   compiler crash, double-drop symptom, or hang.
+
+No trial received live guidance. Independent troubleshooting was capped at 30
+minutes.
+
+## Trial results
+
+Times are wall-clock milestones reported by the independent agent. `≤ total`
+means the agent timed the whole session reliably but did not split that
+particular milestone precisely; no finer value is invented here.
+
+| ID | Persona | Environment | Install/doctor ready | First successful app | Tour complete | Independent modification | Ownership diagnostic | Continue? | Outcome |
+| :--- | :--- | :--- | ---: | ---: | ---: | :--- | :--- | :---: | :--- |
+| 01 | Rust systems developer | macOS arm64 | 4m14s | 8m49s | 8m59s | delete / tombstone / write-back | `E0455`, independently fixed | 7/10 | Pass with workarounds |
+| 02 | Zig systems developer | macOS arm64 | 4m06s | 6m20s | 6m22s | additional snapshot (`v1`/`v2`) | `E0438`, independently fixed | 7/10 | Pass |
+| 03 | C++ infrastructure engineer | Ubuntu x64 | about 8m27s incl. prerequisites | about 9m11s | about 9m15s | owner-pinned lease after close | `E0455`, independently fixed | 7/10 | Pass with Linux prerequisites |
+| 04 | Storage-engine engineer | macOS arm64 | 1m24s | 3m12s | 3m20s | delete + snapshot + tombstone recovery | `E0455`, independently fixed | 7/10 | Pass |
+| 05 | Database/SQL engineer | macOS arm64 | 35s | 1m56s | about 1m58s | delete + snapshot isolation | `E04640`, independently fixed | 7/10 | Pass |
+| 06 | Linux infrastructure engineer | Ubuntu arm64 | 5m22s incl. prerequisites | 8m03s | 8m09s | idempotent put/delete recovery | `E0455`, independently fixed | 7/10 | Pass with Linux prerequisites |
+| 07 | PL/type-systems researcher | macOS arm64 | about 1m10s | ≤6m34s | ≤6m34s | snapshot drop + lease latest value | `E0455`, independently fixed | 8/10 | Pass |
+| 08 | AI coding/tooling developer | macOS arm64 | about 42s | ≤6m59s | ≤6m59s | snapshot of WAL-recovered state | `E0455` text/JSON/evidence, independently fixed | 8/10 | Pass |
+| 09 | Cross-platform systems maintainer | macOS arm64 | not separately timed | ≤5m42s | ≤5m42s | delete marker and restart recovery | `E0438`, independently fixed | 7/10 | Pass with workaround |
+| 10 | Skeptical Rust/storage engineer | macOS arm64 | 2m24s | 3m55s | 4m44s | delete + snapshot + recovery audit | `E0455`, independently fixed | 6/10 | Pass with friction |
+
+## Acceptance scorecard
+
+| Week 3 criterion | Evidence | Result |
+| :--- | :--- | :---: |
+| At least 8/10 install successfully | 10/10 eventually installed and verified RC10 | Pass |
+| At least 6/10 finish within 15 minutes | 10/10 completed the tour within 15 minutes | Pass |
+| At least 3 substantive feedback items | 30 ranked feedback items; four consolidated public issues | Pass |
+| At least 2 independently modify the example | 10/10 modified and ran new behavior | Pass |
+| 0 P0/P1 | 0 P0, but repeated P1 onboarding/tooling blockers | **Fail** |
+| 0 issues requiring oral maintainer guidance | 10/10 independently found a workaround and repaired ownership errors | Pass |
+
+Additional outcomes:
+
+- 10/10 independently repaired the intentional ownership diagnostic.
+- 10/10 were willing to continue a bounded small project; mean willingness was
+  7.1/10.
+- 0 compiler crashes, 0 native runtime crashes, 0 observed double-drops, and 0
+  hangs/deadlocks.
+- 0/10 required a Toka or TokaKV source build.
+- The skeptical storage trial confirmed that the second process recovered from
+  a WAL while no SSTable existed; it did not accept output text alone as proof.
+
+## Repeated findings
+
+### P1: doctor can report a false-ready SDK
+
+Six macOS/isolated-path trials selected Python 3.9 or no suitable Python and
+then failed inside the SDK's Python helper even though doctor had reported
+ready. Clean Linux trials also required Clang/LLD and `libssl-dev`; doctor found
+the missing linker but did not find missing Python or OpenSSL link inputs.
+
+Typical post-doctor failure:
+
+```text
+def package_helper_path() -> Path | None:
+TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+```
+
+or:
+
+```text
+/usr/bin/ld: cannot find -lssl
+/usr/bin/ld: cannot find -lcrypto
+```
+
+Tracking: [tokalang/toka#40](https://github.com/tokalang/toka/issues/40)
+
+### P1: semantic commands are not project-aware
+
+Five trials attempted direct semantic checks. After a successful public package
+install, `toka check/evidence src/main.tk` could not resolve
+`official/tokakv`; users had to guess package expansion paths or route the file
+through a full project build. The AI-tooling trial also received 479 evidence
+records for a six-line error once imports were repaired.
+
+Tracking: [tokalang/toka#38](https://github.com/tokalang/toka/issues/38)
+
+### P2: SDK warning output hides user diagnostics
+
+All 10 trials reported roughly 30 repeated `W0408` diagnostics originating in
+RC10's `lib/build.tk`, including clean incremental runs. The warning flood
+pushed linker and ownership errors away from the first screen.
+
+Tracking: [tokalang/toka#41](https://github.com/tokalang/toka/issues/41)
+
+### P2: package CLI discovery and error propagation
+
+Trials independently observed that `add <url>` does not describe the registry
+name path, `toka add --help` is treated as a package name, resolver root causes
+can collapse into a generic failure, relocatable archive helper discovery may
+depend on explicit `TOKA_LIB`, and successful add does not print the resolved
+version/digest.
+
+Tracking: [tokalang/toka#39](https://github.com/tokalang/toka/issues/39)
+
+## Diagnostic quality
+
+The most common deliberate failure was `E0455`: returning a `str` view borrowed
+from a local `ValueLease`. Agents consistently understood the owner/view
+relationship from the primary span and the `escaping local declared here`
+related location. Other independently repaired errors were `E0438` (use after
+move) and `E04640` (explicit `cede` supplied to a borrowed parameter).
+
+Human-readable diagnostics were sufficient for 10/10 repairs. JSON diagnostics
+provided stable codes, ranges, and related locations. The main remaining
+diagnostic ergonomics requests were scoped evidence and optional repair
+strategies such as returning an owned copy or returning the owner.
+
+## Fix order
+
+The evidence supports the planned order and does not justify a language semantic
+change:
+
+1. installation/environment: doctor Python/OpenSSL checks and documented Linux
+   runtime prerequisites;
+2. error reporting: propagate package-helper failures and remove SDK warning
+   noise;
+3. documentation: relocatable archive setup and a delete/tombstone extension;
+4. API/tooling ergonomics: project-aware check/evidence and scoped evidence;
+5. language semantics: no change indicated by these trials.
+
+## Decision
+
+The product path is independently reproducible and comfortably meets the
+installation, timing, modification, diagnosis, and stability thresholds.
+Week 3 nevertheless remains **not accepted** until the P1 false-ready and
+project-aware semantic-command defects are fixed and the same black-box
+profiles are replayed.

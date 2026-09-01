@@ -5,9 +5,13 @@ import subprocess
 import tempfile
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-TOKA_DIR = os.path.join(ROOT_DIR, "toka")
-TOKAKV_DIR = os.path.join(ROOT_DIR, "tokakv")
-TOKAC = os.path.join(TOKA_DIR, "build", "bin", "tokac")
+TOKA_DIR = os.path.abspath(os.environ.get("TOKA_SDK", os.path.join(ROOT_DIR, "toka")))
+TOKAKV_DIR = os.path.abspath(os.environ.get("TOKAKV_DIR", os.path.join(ROOT_DIR, "tokakv")))
+TOKAC = os.environ.get("TOKAC")
+if not TOKAC:
+    installed_tokac = os.path.join(TOKA_DIR, "bin", "tokac")
+    source_tokac = os.path.join(TOKA_DIR, "build", "bin", "tokac")
+    TOKAC = installed_tokac if os.path.exists(installed_tokac) else source_tokac
 
 def run_cmd(cmd, env=None):
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -23,11 +27,24 @@ def write_sanitizer_ir(source_path, output_path, sanitizer_attribute):
                     brace_index = line.rfind("{")
                     if brace_index < 0:
                         raise ValueError(f"multi-line LLVM function definition is unsupported: {line.rstrip()}")
+                    insert_index = brace_index
+                    # LLVM requires direct sanitizer attributes before trailing
+                    # function metadata such as `comdat`. Apple Clang accepted
+                    # the historical `comdat sanitize_*` order, while upstream
+                    # Linux Clang correctly rejects it.
+                    for marker in (
+                        " comdat", " section ", " partition ", " align ",
+                        " gc ", " prefix ", " prologue ", " personality ",
+                    ):
+                        marker_index = line.find(marker)
+                        if 0 <= marker_index < insert_index:
+                            insert_index = marker_index
                     line = (
-                        line[:brace_index]
+                        line[:insert_index].rstrip()
+                        + " "
                         + sanitizer_attribute
                         + " "
-                        + line[brace_index:]
+                        + line[insert_index:].lstrip()
                     )
                     definition_count += 1
                 output.write(line)
@@ -40,6 +57,18 @@ def main():
     if not os.path.exists(TOKAC):
         print(f"Error: tokac compiler binary not found at {TOKAC}")
         sys.exit(1)
+
+    version_res = run_cmd([TOKAC, "--version"])
+    if version_res.returncode != 0:
+        print(f"Error: failed to query tokac version:\n{version_res.stderr}")
+        sys.exit(1)
+    version_text = (version_res.stdout + version_res.stderr).strip()
+    expected_version = os.environ.get("TOKA_EXPECT_VERSION", "")
+    if expected_version and expected_version not in version_text:
+        print(f"Error: expected tokac {expected_version}, got: {version_text}")
+        sys.exit(1)
+    print(f"Compiler: {version_text}")
+    print(f"SDK root: {TOKA_DIR}")
 
     tests = [
         ("memtable_v1", os.path.join(TOKAKV_DIR, "tests", "memtable_v1.tk")),
@@ -112,13 +141,19 @@ def main():
         clang_bin = "/opt/homebrew/opt/llvm/bin/clang"
 
     openssl_inc = []
-    openssl_lib = []
+    openssl_lib = ["-lssl", "-lcrypto"]
     if os.path.exists("/opt/homebrew/include"):
         openssl_inc = ["-I/opt/homebrew/include"]
         openssl_lib = ["-L/opt/homebrew/lib", "-lssl", "-lcrypto"]
 
     asan_env = os.environ.copy()
     asan_env["ASAN_OPTIONS"] = "detect_leaks=1:halt_on_error=1:abort_on_error=1"
+    if sys.platform == "darwin":
+        asan_env["LSAN_OPTIONS"] = (
+            "suppressions="
+            + os.path.join(TOKAKV_DIR, "tests", "lsan_macos.supp")
+            + ":print_suppressions=1"
+        )
     llvm_symbolizer = "/opt/homebrew/opt/llvm/bin/llvm-symbolizer"
     if os.path.exists(llvm_symbolizer):
         asan_env["ASAN_SYMBOLIZER_PATH"] = llvm_symbolizer

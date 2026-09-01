@@ -1,0 +1,52 @@
+import std/io::{println}
+import official/tokakv::{TokaKvEngine}
+
+const DB_PATH = "tokakv-tour-data"
+const ACCOUNT_KEY = "account:42"
+
+fn main() -> i32 {
+    auto db# = TokaKvEngine::open(string::from(DB_PATH)).unwrap()
+    auto existing = db#.get(string::from(ACCOUNT_KEY)).unwrap()
+
+    if existing.is_none() {
+        println("[TokaKV] FIRST RUN")
+        db#.put(string::from(ACCOUNT_KEY), string::from("100")).unwrap()
+        println("write: {} = 100", ACCOUNT_KEY)
+
+        {
+            auto snapshot = db#.acquire_snapshot().unwrap()
+            db#.put(string::from(ACCOUNT_KEY), string::from("125")).unwrap()
+
+            auto old_value = db#
+                .get_at_snapshot(string::from(ACCOUNT_KEY), snapshot)
+                .unwrap()
+                .unwrap()
+            auto latest_value = db#.get(string::from(ACCOUNT_KEY)).unwrap().unwrap()
+            println("snapshot: {} = {}", ACCOUNT_KEY, old_value)
+            println("latest:   {} = {}", ACCOUNT_KEY, latest_value)
+            assert(old_value.as_str().equals("100"), "snapshot must retain the old value")
+            assert(latest_value.as_str().equals("125"), "latest read must see the update")
+        }
+
+        auto leased = db#
+            .get_lease(string::from(ACCOUNT_KEY))
+            .unwrap()
+            .into_value()
+            .unwrap()
+        assert(leased.as_str().equals("125"), "leased read must see the latest value")
+        db#.close().unwrap()
+        println("lease after close: {}", leased.as_str())
+        println("NEXT: run `toka run` again to verify WAL recovery")
+        return 0
+    }
+
+    auto recovered = existing.unwrap()
+    println("[TokaKV] SECOND RUN")
+    println("recovered: {} = {}", ACCOUNT_KEY, recovered)
+    println("sequence: {}", db#.current_seq())
+    assert(recovered.as_str().equals("125"), "reopened database must recover the latest value")
+    assert(db#.current_seq() == 2:u64, "WAL replay must recover both committed writes")
+    db#.close().unwrap()
+    println("RECOVERY VERIFIED")
+    return 0
+}

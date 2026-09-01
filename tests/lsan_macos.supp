@@ -1,0 +1,4 @@
+# Apple Objective-C runtime process-lifetime class-initialization bookkeeping.
+# This exact external frame accounts for the same 120 bytes in every otherwise
+# clean ASan process on the GitHub macOS 15 arm64 runner.
+leak:_fetchInitializingClassList

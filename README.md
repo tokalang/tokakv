@@ -1,8 +1,177 @@
-# TokaKV: High-Performance Key-Value Storage Engine for Toka
+# TokaKV
 
-`official/tokakv` is an embedded key-value storage engine implemented in pure Toka, built on top of `std/data_file`'s positional, unbuffered I/O primitives.
+[![TokaKV package qualification](https://github.com/tokalang/tokakv/actions/workflows/ci.yml/badge.svg)](https://github.com/tokalang/tokakv/actions/workflows/ci.yml)
 
-## Phase 1 Capabilities & Durability Invariants
+**A durable embedded key-value engine written in pure Toka. Write data, restart
+the process, recover it, and see how ownership keeps snapshots and leased value
+views safe.**
+
+TokaKV combines a write-ahead log, MVCC snapshots, immutable SSTables,
+snapshot-aware compaction, and an owner-pinned block cache without native
+dependencies or garbage collection. It is an official Public Preview package
+for the Toka RC10 SDK.
+
+![TokaKV RC10 quickstart: create a project, add TokaKV, write data, and verify recovery](https://raw.githubusercontent.com/tokalang/tokakv/main/demo/tokakv-quickstart.gif)
+
+## Ten-minute tour
+
+### 1. Install Toka RC10
+
+Linux and macOS SDK archives are published for x86_64 and aarch64:
+
+```sh
+curl -fsSL https://tokalang.dev/install.sh | bash -s -- v1.0.0-rc.10
+toka doctor
+```
+
+### 2. Create a project and add TokaKV
+
+```sh
+toka new tokakv-tour
+cd tokakv-tour
+toka add tokakv
+```
+
+### 3. Replace `src/main.tk`
+
+```toka
+import std/io::{println}
+import official/tokakv::{TokaKvEngine}
+
+const DB_PATH = "tokakv-tour-data"
+const ACCOUNT_KEY = "account:42"
+
+fn main() -> i32 {
+    auto db# = TokaKvEngine::open(string::from(DB_PATH)).unwrap()
+    auto existing = db#.get(string::from(ACCOUNT_KEY)).unwrap()
+
+    if existing.is_none() {
+        println("[TokaKV] FIRST RUN")
+        db#.put(string::from(ACCOUNT_KEY), string::from("100")).unwrap()
+        println("write: {} = 100", ACCOUNT_KEY)
+
+        {
+            auto snapshot = db#.acquire_snapshot().unwrap()
+            db#.put(string::from(ACCOUNT_KEY), string::from("125")).unwrap()
+
+            auto old_value = db#
+                .get_at_snapshot(string::from(ACCOUNT_KEY), snapshot)
+                .unwrap()
+                .unwrap()
+            auto latest_value = db#.get(string::from(ACCOUNT_KEY)).unwrap().unwrap()
+            println("snapshot: {} = {}", ACCOUNT_KEY, old_value)
+            println("latest:   {} = {}", ACCOUNT_KEY, latest_value)
+            assert(old_value.as_str().equals("100"), "snapshot must retain the old value")
+            assert(latest_value.as_str().equals("125"), "latest read must see the update")
+        }
+
+        auto leased = db#
+            .get_lease(string::from(ACCOUNT_KEY))
+            .unwrap()
+            .into_value()
+            .unwrap()
+        assert(leased.as_str().equals("125"), "leased read must see the latest value")
+        db#.close().unwrap()
+        println("lease after close: {}", leased.as_str())
+        println("NEXT: run `toka run` again to verify WAL recovery")
+        return 0
+    }
+
+    auto recovered = existing.unwrap()
+    println("[TokaKV] SECOND RUN")
+    println("recovered: {} = {}", ACCOUNT_KEY, recovered)
+    println("sequence: {}", db#.current_seq())
+    assert(recovered.as_str().equals("125"), "reopened database must recover the latest value")
+    assert(db#.current_seq() == 2:u64, "WAL replay must recover both committed writes")
+    db#.close().unwrap()
+    println("RECOVERY VERIFIED")
+    return 0
+}
+```
+
+The checked-in [tour source](https://github.com/tokalang/tokakv/blob/main/examples/ten-minute-tour/src/main.tk) adds explicit
+assertions to every claim made by this compact README version.
+
+### 4. Run it twice
+
+```sh
+toka run
+toka run
+```
+
+The first process writes two versions, reads both the snapshot and latest
+value, and proves that an outstanding value lease remains valid after the
+engine closes:
+
+```text
+[TokaKV] FIRST RUN
+snapshot: account:42 = 100
+latest:   account:42 = 125
+lease after close: 125
+NEXT: run `toka run` again to verify WAL recovery
+```
+
+The second process reopens the same directory. Because `close()` does not flush
+the active MemTable, this path specifically verifies replay from the durable
+write-ahead log:
+
+```text
+[TokaKV] SECOND RUN
+recovered: account:42 = 125
+sequence: 2
+RECOVERY VERIFIED
+```
+
+RC10 can print known `W0408` warnings from its SDK build modules to stderr.
+They do not invalidate a successful build or the markers above. The repository
+keeps the full diagnostics visible instead of hiding them in the public guide.
+
+## Why ownership, leases, and snapshots matter
+
+| TokaKV concept | What it protects | What the tour proves |
+| :--- | :--- | :--- |
+| Ownership | Engine, cache, and storage resources have deterministic owners and cleanup | Closing the engine cannot leave an outstanding leased view dangling |
+| `ValueLease` | A decoded value view remains attached to the owner that keeps its backing storage alive | `lease.as_str()` remains valid after cache or engine visibility changes |
+| `SnapshotLease` | A point-in-time sequence stays authoritative while the RAII lease is alive | The snapshot reads `100` after the latest value becomes `125` |
+
+Read [Ownership, leases, and snapshots](https://github.com/tokalang/tokakv/blob/main/docs/ownership-lease-snapshot.md) for
+the compiler-enforced boundaries, including examples that Toka rejects.
+
+## Public Preview status
+
+- Package identity: `official/tokakv`
+- Supported hosts: Linux and macOS on x86_64 and aarch64
+- Toka SDK: `v1.0.0-rc.10`
+- Native dependencies: none
+- Current compaction scope: L0-to-L1
+- Non-goals: distributed replication, consensus, Redis protocol serving, and
+  asynchronous disk offload
+
+TokaKV is not yet a stable 1.0 database compatibility promise. It is a
+qualified embedded engine and a concrete systems-programming demonstration of
+Toka's ownership and resource semantics.
+
+## Verify the public quickstart
+
+From a checkout of this repository, point the verifier at a published RC10 SDK:
+
+```sh
+TOKA=/path/to/rc10/bin/toka tools/verify_quickstart.sh
+```
+
+Maintainers can test an unpublished checkout instead of the registry package:
+
+```sh
+TOKA=/path/to/rc10/bin/toka TOKAKV_SOURCE="$PWD" tools/verify_quickstart.sh
+```
+
+The verifier creates a clean temporary project, runs `toka add`, executes two
+separate processes, and fails unless snapshot, lease, value, and recovery
+markers all match.
+
+## Architecture and qualification details
+
+### Phase 1: WAL and durability invariants
 
 1. **Append-Only Write-Ahead Log (WAL)**:
    - 8-byte LE header (`[CRC32: 4B LE][PayloadLen: 4B LE]`) + typed payload (`[Op: 1B][Seq: 8B LE][KeyLen: 4B LE][KeyBytes][ValLen: 4B LE][ValBytes]`).
@@ -27,7 +196,7 @@
    - Single-writer binary search table with exact `size_bytes` calculation upon insertions, overwrites, and tombstone deletes.
    - `freeze(cede self) -> FrozenMemTable` consumes the active table, sealing it into an immutable snapshot without mutable aliasing.
 
-## Phase 2A Capabilities & Single SSTable Offline Closed Loop
+### Phase 2A: SSTable offline closed loop
 
 1. **Immutable SSTable Format (V1)**:
    - **Data Blocks (4KB target)**: Block format `[CRC32: 4B LE][DataLength: 4B LE][Count: 4B LE][Entries...]`. Each entry contains `[Tag: 1B (0=Put, 1=Delete)][Seq: 8B LE][KeyLen: 4B LE][KeyBytes][ValLen: 4B LE][ValBytes]`.
@@ -55,7 +224,7 @@
      - `Ok(Some(Some(v)))`: Hit with value payload
      - `Err(KvError)`: CRC/Corruption/IO (never downgraded to miss)
 
-## Phase 2B Capabilities & Manifest / VersionSet Integration
+### Phase 2B: Manifest and VersionSet integration
 
 1. **Manifest Protocol & Atomic VersionEdit (`TOKAMNF1`)**:
    - 8-byte magic header `"TOKAMNF1"`.
@@ -74,7 +243,7 @@
    - Key range pruning `[smallest_key, largest_key]` avoids unnecessary disk reads.
    - Any SSTable CRC mismatch or I/O corruption immediately fails closed with `Err(KvError)`, never downgraded to a miss.
 
-## Phase 3A Capabilities & Safe Owner Block Cache
+### Phase 3A: Safe owner block cache
 
 1. **Safe Owner Lease Lifecycle (`~CachedBlock` / `BlockLease`)**:
    - `BlockLease` owns `~CachedBlock`; `BlockCache` internal map owns `~CachedBlock`.
@@ -114,7 +283,7 @@
    - `clang -fsanitize=thread` compiles the LLVM IR, instrumenting all Toka generated functions, memory operations, and synchronization points.
    - Jointly linked with `toka_rt_tsan.o` and executed under ThreadSanitizer with 0 data races and 0 concurrency defects.
 
-## Phase 3B Capabilities & ReadState / WriterState Separation
+### Phase 3B: ReadState and WriterState separation
 
 1. **State Decoupling & Concurrency Architecture**:
    - `ReadState`: Immutable/read-only snapshot structures (`active_mem#: MemTable`, `frozen_mems#: Vec<FrozenMemTable>`, `current_version#: Version`, `health#: u8`) implementing `@Send + @Sync` and protected by `RwMutex<ReadState>`.

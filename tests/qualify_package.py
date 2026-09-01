@@ -5,9 +5,13 @@ import subprocess
 import tempfile
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-TOKA_DIR = os.path.join(ROOT_DIR, "toka")
-TOKAKV_DIR = os.path.join(ROOT_DIR, "tokakv")
-TOKAC = os.path.join(TOKA_DIR, "build", "bin", "tokac")
+TOKA_DIR = os.path.abspath(os.environ.get("TOKA_SDK", os.path.join(ROOT_DIR, "toka")))
+TOKAKV_DIR = os.path.abspath(os.environ.get("TOKAKV_DIR", os.path.join(ROOT_DIR, "tokakv")))
+TOKAC = os.environ.get("TOKAC")
+if not TOKAC:
+    installed_tokac = os.path.join(TOKA_DIR, "bin", "tokac")
+    source_tokac = os.path.join(TOKA_DIR, "build", "bin", "tokac")
+    TOKAC = installed_tokac if os.path.exists(installed_tokac) else source_tokac
 
 def run_cmd(cmd, env=None):
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -40,6 +44,18 @@ def main():
     if not os.path.exists(TOKAC):
         print(f"Error: tokac compiler binary not found at {TOKAC}")
         sys.exit(1)
+
+    version_res = run_cmd([TOKAC, "--version"])
+    if version_res.returncode != 0:
+        print(f"Error: failed to query tokac version:\n{version_res.stderr}")
+        sys.exit(1)
+    version_text = (version_res.stdout + version_res.stderr).strip()
+    expected_version = os.environ.get("TOKA_EXPECT_VERSION", "")
+    if expected_version and expected_version not in version_text:
+        print(f"Error: expected tokac {expected_version}, got: {version_text}")
+        sys.exit(1)
+    print(f"Compiler: {version_text}")
+    print(f"SDK root: {TOKA_DIR}")
 
     tests = [
         ("memtable_v1", os.path.join(TOKAKV_DIR, "tests", "memtable_v1.tk")),

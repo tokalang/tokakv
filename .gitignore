@@ -4,3 +4,4 @@ __pycache__/
 *.ll
 *.dSYM/
 build/
+demo/.quickstart-work/

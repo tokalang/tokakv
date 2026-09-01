@@ -2,10 +2,10 @@
 pub const PACKAGE = (
     name = "tokakv",
     identity = "official/tokakv",
-    version = "0.1.1",
+    version = "0.1.2",
     kind = "library",
     license = "Apache-2.0",
-    compiler = "1.0.0-rc.9",
+    compiler = "1.0.0-rc.10",
     entry_modules = ("lib/official/tokakv.tk"),
     targets = ("macos", "linux"),
     dependencies = (),
@@ -35,5 +35,8 @@ pub const AI_CONTRACT = (
     safety = (
         "fail-closed CRC and bounds validation; owner-carrying positional I/O buffers; RAII snapshots and cache pins; PAL-bound borrowed value views; atomic Manifest replacement; test-only failpoints excluded from release builds"
     ),
-    qualification = ("python3 tests/qualify_package.py")
+    qualification = (
+        "TOKA_SDK=/path/to/rc10 TOKA_EXPECT_VERSION=1.0.0-rc.10 python3 tests/qualify_package.py",
+        "TOKA=/path/to/rc10/bin/toka tools/verify_quickstart.sh"
+    )
 )

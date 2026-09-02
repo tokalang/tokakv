@@ -290,3 +290,88 @@ RC11**, because 2/10 independently found the relocatable-SDK P1. RC10 must not
 be marked superseded on the strength of this replay. The next candidate should
 contain only the `main` DX fix and must replay the same relocation probe before
 the gate can close.
+
+## RC12 same-protocol replay
+
+**Replay date:** 2026-09-02
+
+**Candidate:** Toka `v1.0.0-rc.12`, TokaKV `0.1.2`
+
+**Result:** Functional path passed; release-quality gate failed.
+
+RC12 was published as a single-P1 relocation repair candidate. The protocol
+retained every RC11 functional check and made a real fresh-shell relocation
+probe mandatory: move the complete SDK, remove the old tree, unset
+`TOKA_LIB`/`TOKAC`/`TOKA_PATH`, expose only the new `bin` through `PATH`, clear
+shell command caches, and invoke `toka` by name rather than by absolute path.
+
+| ID | Persona | Platform | Wall time | Functional protocol | Real PATH relocation | Outcome |
+| :--- | :--- | :--- | ---: | :---: | :---: | :--- |
+| 01 | Rust systems | macOS arm64 | about 15m | Pass | Pass in ordinary isolated environment | Pass |
+| 02 | Zig / low-level | macOS arm64 | 10m16s | Pass | Pass in ordinary isolated environment | Pass |
+| 03 | C++ infrastructure | Ubuntu x64 | 13m06s | Pass with explicit-lib workaround | **Fail** | P1 found |
+| 04 | Storage engine | macOS arm64 | 12m41s | Pass with workaround | **Fail** | P1 + CodeGen P1 |
+| 05 | Database / SQL | macOS arm64 | about 13m | Pass with workaround | **Fail** | P1 found |
+| 06 | Linux infrastructure | Ubuntu arm64 | about 18m | Pass with workaround | **Fail** | P1 found |
+| 07 | PL / type systems | macOS arm64 | 6m52s | Pass with workaround | **Fail** | P1 found |
+| 08 | AI coding/tooling | macOS arm64 | 16m18s | Pass with workaround | **Fail** | P1 + JSON P1 |
+| 09 | Cross-platform systems | macOS arm64 | about 12m | Pass with workaround | **Fail** | P1 found |
+| 10 | Skeptical Rust/storage | macOS arm64 | 25m37s | Pass with workaround | **Fail** | P1 + JSON P1 |
+
+### RC12 scorecard
+
+- 10/10 verified the published archive and completed the TokaKV/WAL path,
+  using an explicit `TOKA_LIB` only after a relocation failure when required.
+- 10/10 completed an independent modification and ownership diagnosis/repair.
+- 10/10 retained user `W0408` while observing no SDK-owned `W0408`.
+- 0 compiler/native crashes, observed double-drops, or uncontrolled hangs.
+- 0/10 required a source build for the functional path; several performed an
+  additional public-tag source build for provenance evidence.
+- **2/10 passed and 8/10 failed the real fresh-shell relocation hard gate.**
+- 0 P0; multiple independently reproducible P1 classes remain.
+
+### RC12 P1: the first relocation fix retained a dangling PATH buffer
+
+In the failing profiles, `command -v toka` resolved the relocated binary, but
+`doctor` fell back to `/usr/local/lib/toka` and project `run` reported that the
+package helper was missing. Absolute-path invocation or an explicit relocated
+`TOKA_LIB` succeeded.
+
+The first fix constructed `SplitIterator` from the temporary result of
+`path_value.unwrap()`. The iterator retained a raw pointer after that temporary
+string was released, so real PATH scanning was undefined and environment
+dependent. The prior CI test also selected an explicit executable to preserve a
+basename `argv[0]`; it did not exercise ordinary POSIX PATH lookup.
+
+Issue [#43](https://github.com/tokalang/toka/issues/43) was reopened. The
+corrected `main` fix at `01c8d953` keeps the PATH string alive and makes
+non-Windows tests launch the command through actual PATH lookup.
+
+### Additional RC12 findings
+
+- Successful `capabilities --json` and `cede-obligations --json` emitted full
+  LLVM IR before their JSON document. Tracking: [#48](https://github.com/tokalang/toka/issues/48).
+- Ordinary source builds from the exact RC12 tag reported `1.0.0-rc.8` because
+  the source default was stale. Tracking: [#49](https://github.com/tokalang/toka/issues/49).
+- A documented implicit call into a `cede` formal passed `--check-only` but
+  failed normal CodeGen with internal `E0761`; explicit caller `cede` worked.
+  Tracking: [#50](https://github.com/tokalang/toka/issues/50).
+- Evidence scope, tutorial `W0401`, project-aware `run <file>`, installer
+  checksum verification, and Python traceback noise remain non-blocking follow-up.
+
+The relocation lifetime, JSON-only, and source-version fixes landed together at
+`01c8d953`. The expanded 30-check developer-experience suite passed Linux x64,
+Linux arm64, macOS arm64, and Windows/MSYS2
+([main gate](https://github.com/tokalang/toka/actions/runs/33600164581),
+[Windows dogfood](https://github.com/tokalang/toka/actions/runs/33600164546)).
+Issues #43, #48, and #49 are fixed on `main`, not in immutable RC12. Issue #50
+remains open.
+
+### RC12 decision
+
+RC12 must not be accepted or used to supersede RC10/RC11. The functional
+agentic systems-programming path remains reproducible, but the candidate failed
+its only advertised P1 repair in 8/10 independent contexts and exposed two
+additional machine-interface/compiler-consistency blockers. The next candidate
+must include the corrected real-PATH fix, JSON-only semantic commands, source
+version correction, and a resolution for #50 before another tag is created.

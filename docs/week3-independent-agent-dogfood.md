@@ -496,3 +496,45 @@ untagged and unpublished until 3–5 independent humans complete the supplementa
 usability protocol. Human trials should focus on expectations, terminology,
 documentation order, self-repair confidence, and willingness to continue—not
 repeat another artificial ten-person quota.
+
+### First human trial and replacement candidate
+
+The first independent human response completed the relocation, Registry,
+TokaKV/WAL, compaction, modification, and ownership-repair path, but found a
+new check/CodeGen consistency P1. A redundant second `.unwrap()` on the
+non-nullable `LeasedLookupResult` intermediate passed `check` with no
+diagnostic, then failed during CodeGen with `E0755` and an internal missing
+symbol error. Splitting the expression, or using the valid single-unwrap chain,
+worked. The report is public in
+[Discussion #51](https://github.com/tokalang/toka/discussions/51#discussioncomment-18249448)
+and the defect was tracked as
+[tokalang/toka#52](https://github.com/tokalang/toka/issues/52).
+
+This human finding invalidated candidate
+`abea41db0566882486ac58b8ac9764102e456462`; it will never be tagged or
+published. The semantic fallback had treated every missing `.unwrap()` method
+as a nullable intrinsic, even when its receiver was not nullable. The fix
+restricts the intrinsic to genuinely nullable receivers. Invalid redundant
+chains now fail in semantic checking with `E0417`; valid Result/Option chains
+and split-statement forms still check, compile, and run. The frozen
+`0.9.9-16` interface key did not change.
+
+The replacement unpublished RC13 candidate is
+`3d32808a9f34e1fdf9c4c36dac9facc5284a0ac2`. It passed the full Linux x64,
+Linux arm64, macOS x64, and macOS arm64 qualification plus the cross-target
+summary, and retained four new temporary archives without creating a tag or
+release: [replacement qualification run](https://github.com/tokalang/toka/actions/runs/33633120473).
+
+| Replacement target | SHA-256 |
+| :--- | :--- |
+| Linux x64 | `041c55670481a05b03f53bd9636f82a512edcdfad3d7202255d4acb3325bb74a` |
+| Linux arm64 | `68539be51e83a463096935bee74e5c03a7ee0ca95c1ae1414bad6cbfa984eee9` |
+| macOS x64 | `fc5d4e1c375c4cbd1e85e7c2f10e0499061cf2bbbbbed3a96acb39cc9a032785` |
+| macOS arm64 | `26fbe50b0c981b0e18070f3389b7c01236982e4da86cac748e97124170106aa3` |
+
+Packaged macOS arm64 replay confirmed that the invalid TokaKV expression is
+rejected consistently by `check` and `run` with no CodeGen internal error,
+while the valid chained expression runs successfully. Human recruitment has
+therefore resumed against the replacement SHA. The prior AI replay remains
+useful product-path evidence, but publication still requires 3–5 human reports
+against the replacement candidate with 0 P0/P1.

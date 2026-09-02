@@ -186,3 +186,100 @@ installation, timing, modification, diagnosis, and stability thresholds.
 The P1 defects are fixed on `main`, but Week 3 remains **not accepted for
 RC10**. The same black-box profiles must be replayed against the next published
 SDK candidate before the release-quality gate can change to accepted.
+
+## RC11 same-protocol replay
+
+**Replay date:** 2026-09-02
+
+**Candidate:** Toka `v1.0.0-rc.11`, TokaKV `0.1.2`
+
+**Evidence boundary:** ten new independent AI-agent black-box contexts, not
+human interviews. The same public-only, no-guidance, no-source-read boundary
+was retained.
+
+RC11 added negative readiness checks to the original protocol. Every trial had
+to prove that an unavailable Python runtime made `toka doctor` fail, that the
+restored runtime made it pass, that Registry-backed `check --json` and
+`evidence --json` worked without guessed package paths, that evidence stdout
+was valid JSON, and that SDK-owned `W0408` disappeared while a deliberate
+user-source `W0408` remained visible.
+
+| ID | Persona | Environment | Total wall time | Tutorial + WAL after SDK readiness | Independent extension | Ownership repair | RC11 regression checks | Outcome |
+| :--- | :--- | :--- | ---: | :---: | :--- | :--- | :---: | :--- |
+| 01 | Rust systems developer | macOS arm64 | 10m22s | Pass under 15m | delete + snapshot + lease | `E0455` | Pass | Pass |
+| 02 | Zig / low-level developer | macOS arm64 | 11m02s | Pass under 15m | delete + snapshot + lease | `E0438` | Pass | Pass |
+| 03 | C++ infrastructure engineer | Ubuntu x64 | 22m45s incl. container prerequisites | Pass under 15m | delete + snapshot + lease | `E0455` | Pass | Pass |
+| 04 | Storage-engine engineer | macOS arm64 | 11m59s | Pass under 15m | delete + snapshot + lease + flush/reopen | `E0455` | Pass | Pass |
+| 05 | Database / SQL engineer | macOS arm64 | 7m57s | Pass under 15m | delete + snapshot + lease | `E0455` | Pass | Pass |
+| 06 | Linux infrastructure engineer | Ubuntu arm64 | 17m47s incl. prerequisites | Pass under 15m | delete + snapshot + lease | `E0455` | Pass | Pass |
+| 07 | PL / type-systems researcher | macOS arm64 | about 10m | Pass under 15m | delete + snapshot + lease | `E0455` | Pass | Pass |
+| 08 | AI coding/tooling developer | macOS arm64 | 10m05s | Pass under 15m | delete + snapshot + lease | `E0455` | Pass | Pass |
+| 09 | Cross-platform systems maintainer | macOS arm64 | about 11m | Pass under 15m | delete + snapshot + lease | `E0438` | Pass, plus relocation failure | **P1 found** |
+| 10 | Skeptical Rust/storage engineer | macOS arm64 | 11m24s | Pass under 15m | delete + snapshot + lease + WAL audit | `E0455` | Pass, plus relocation failure | **P1 confirmed** |
+
+### RC11 scorecard
+
+| Criterion | RC11 evidence | Result |
+| :--- | :--- | :---: |
+| 10/10 install the published SDK | All archives verified and installed; Linux trials covered x64 and arm64 | Pass |
+| 10/10 complete tutorial and WAL recovery within 15 minutes after readiness | 10/10; Linux total wall time also included clean prerequisite installation | Pass |
+| 10/10 independently modify the example | 10/10 completed delete, snapshot, or lease behavior | Pass |
+| 10/10 understand and repair an ownership error | 10/10 repaired `E0455` or `E0438` without guidance | Pass |
+| Doctor fails closed for missing runtime inputs | 10/10 negative Python checks; Linux also staged OpenSSL/linker absence | Pass |
+| Registry project `check/evidence` works directly | 10/10 valid project-aware JSON | Pass |
+| SDK warning cleanup preserves user diagnostics | 10/10 saw zero SDK `W0408` and retained user `W0408` | Pass |
+| 0 crash, observed double-drop, or hang | 0/10 observed any of these symptoms | Pass |
+| 0 source builds | 0/10 required one | Pass |
+| 0 P0/P1 | 0 P0; the same relocatable-SDK P1 occurred independently in 2/10 | **Fail** |
+
+All ten agents were willing to continue a bounded preview project. Reported
+scores, when numeric, ranged from 7/10 to 9/10.
+
+### RC11 P1: PATH invocation breaks relocated SDK discovery
+
+Two independent trials moved the complete published SDK tree, unset
+`TOKA_LIB`, placed only its `bin` directory on `PATH`, and invoked `toka` by
+name. `doctor` and project execution did not share one reliable SDK root;
+`build/run` could exit 1 without output. Explicitly setting `TOKA_LIB` to the
+same sibling `lib` directory made the project run.
+
+The root cause was `argv[0]`-relative discovery: normal PATH execution keeps
+`argv[0]` as `toka`, so sibling tools and libraries were searched relative to
+the project directory. Absolute-path tests had hidden the defect.
+
+Tracking: [tokalang/toka#43](https://github.com/tokalang/toka/issues/43)
+
+The fix is on `main` at `5e67f14e`: resolve the manager executable through
+`PATH` before deriving sibling paths, emit actionable package-helper failures,
+and exercise a moved release-layout SDK by PATH name with `TOKA_LIB` unset in
+the ordinary developer-experience suite. This does not change language
+semantics or the `0.9.9-16` compiler-interface key. RC11 itself remains
+immutable and still contains the defect.
+
+### Repeated non-blocking RC11 findings
+
+- Semantic evidence remains valid but overly broad: roughly 550–606 KB and
+  1,589 records for the tutorial, with only six user-source records in the
+  AI-tooling trial. Tracking: [#38](https://github.com/tokalang/toka/issues/38).
+- `toka run <file>` does not consume the current project lock graph even though
+  `check/evidence <file>` do. Tracking: [#46](https://github.com/tokalang/toka/issues/46).
+- The canonical tutorial's `auto db#` produces a contradictory `W0401` during
+  direct semantic checks. Tracking: [#45](https://github.com/tokalang/toka/issues/45).
+- The installer does not yet verify the downloaded archive against the
+  published `SHA256SUMS`. Tracking: [#44](https://github.com/tokalang/toka/issues/44).
+- Python 3.9 is rejected correctly, but its parser traceback can precede the
+  friendly doctor summary; successful `toka add` still leaves resolved version
+  and checksum details in `package.lock` rather than the success message.
+
+### RC11 decision
+
+RC11 proves that the original false-ready, project-aware semantic-command, and
+SDK-warning failures are fixed. The agentic systems-programming product path
+again passed every functional, timing, modification, diagnosis, and stability
+criterion.
+
+The Week 3 release-quality gate nevertheless remains **not accepted for
+RC11**, because 2/10 independently found the relocatable-SDK P1. RC10 must not
+be marked superseded on the strength of this replay. The next candidate should
+contain only the `main` DX fix and must replay the same relocation probe before
+the gate can close.

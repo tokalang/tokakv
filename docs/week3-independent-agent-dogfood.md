@@ -375,3 +375,124 @@ its only advertised P1 repair in 8/10 independent contexts and exposed two
 additional machine-interface/compiler-consistency blockers. The next candidate
 must include the corrected real-PATH fix, JSON-only semantic commands, source
 version correction, and a resolution for #50 before another tag is created.
+
+## RC13 unpublished-candidate replay
+
+**Replay date:** 2026-09-02
+
+**Exact candidate:** `abea41db0566882486ac58b8ac9764102e456462`, labeled
+`v1.0.0-rc.13` only inside unpublished qualification artifacts. No RC13 tag or
+GitHub Release existed during this replay.
+
+**Result:** the AI-agent black-box gate passed. Human usability research remains
+required before promotion.
+
+The candidate first passed the unified release gate on Linux x64, Linux arm64,
+macOS x64, and macOS arm64. The cross-target summary bound all four passing
+reports to the exact candidate revision and version label. The manual workflow
+uploaded temporary candidate archives without creating a tag or release:
+[qualification run](https://github.com/tokalang/toka/actions/runs/33609017378).
+
+Candidate archive SHA-256 values used by the trials:
+
+| Target | SHA-256 |
+| :--- | :--- |
+| Linux x64 | `d6f2d4c94866921d156672180898a5eb39737f813704977f585e0a72a2d02785` |
+| Linux arm64 | `a83b0eeab59571f521426d388d3b4544ae9b798480b6e8f9a1b6dd85f2f7930a` |
+| macOS x64 | `734993f350ed93736f0a843d4862f1a1cd7a5f030db1973e45477af74b61ab51` |
+| macOS arm64 | `c188e2ae2aa9bb6bede547d3d7f866a30ad8129ec4faac0a87b0e09652cd83df` |
+
+### Evidence boundary
+
+Ten independent agent contexts produced valid RC13 samples. Each used a unique
+disposable HOME and trial directory, could not read the local Toka/TokaKV
+workspace or another trial, received no live troubleshooting, and used only an
+assigned unpublished archive plus the public website, GitHub, and Registry.
+
+One additional macOS x64 attempt ran on an arm64 host through Rosetta with a
+mixed-architecture Homebrew environment. It was recorded as environment-blocked
+and excluded rather than misrepresented as a native x64 sample. One attempted
+agent context was stopped by the execution platform before testing and was also
+excluded. Neither appears in the denominator below.
+
+Linux x64 agent samples ran in x86_64/amd64 containers on an arm64 Docker host,
+so their functional execution is evidence but their timings are not native x64
+performance measurements. Native x64 artifact qualification is supplied by the
+GitHub macOS x64 and Linux x64 runners above.
+
+### Trial results
+
+Every valid trial verified the exact archive digest, moved the complete SDK and
+removed the old path, started with `env -i`, left `TOKA_LIB`, `TOKAC`, and
+`TOKA_PATH` unset, placed only the relocated `bin` plus necessary host tools on
+PATH, and subsequently invoked the manager by the command name `toka`.
+
+| ID | Persona | Environment | Total wall time | Relocation + Registry | Tutorial/WAL | Independent extension | Ownership repair | Outcome |
+| :--- | :--- | :--- | ---: | :---: | :---: | :--- | :--- | :--- |
+| 01 | Rust systems developer | macOS arm64 | 7m00s | Pass | first success 2m36s; repeated recovery | delete + tombstone recovery | independently repaired | Pass |
+| 04 | Database engineer | Linux arm64 | 13m23s | Pass | first write + four recoveries | delete + snapshot + lease | `E0455`, independently repaired | Pass |
+| 05 | AI coding/tooling developer | macOS arm64 | about 11m | Pass | first write + repeated recovery | delete + snapshot + lease | `E0438`, independently repaired | Pass |
+| 06 | Linux infrastructure engineer | Linux x64 container | about 21m incl. prerequisites | Pass | WAL + abort recovery | delete + snapshot + lease | independently repaired | Pass |
+| 07 | PL/type-systems researcher | macOS arm64 | about 12m | Pass | WAL + three abrupt-exit recoveries | delete + snapshot + lease | `E0438`, independently repaired | Pass |
+| 08 | Storage reliability engineer | macOS arm64 | 8m49s | Pass | WAL + abort recovery | delete + snapshot + lease | `E0455`, independently repaired | Pass |
+| 09 | C++/Linux systems developer | Linux x64 container | about 18m incl. prerequisites | Pass | first write + four recoveries | delete + snapshot + lease | `E0455`, independently repaired | Pass |
+| 10 | Agentic coding engineer | macOS arm64 | about 9m | Pass | first write + three recoveries | delete + snapshot + lease | `E0455`, independently repaired | Pass |
+| 11 | Rust/Linux backend engineer | Linux arm64 | about 10m | Pass, including offline locked run | first write + repeated recovery | delete + snapshot + lease | independently repaired | Pass |
+| 12 | Database infrastructure engineer | Linux x64 container | about 16m incl. prerequisites | Pass | first write + three recoveries | delete + snapshot + lease | `E0474`, independently repaired | Pass |
+
+### RC13 scorecard
+
+| Criterion | RC13 evidence | Result |
+| :--- | :--- | :---: |
+| Exact candidate archive verified | 10/10 matched the assigned SHA-256 | Pass |
+| Complete SDK relocation through real PATH name | 10/10; no explicit Toka path variables | Pass |
+| Install/readiness path | 10/10 reached a ready SDK after installing documented host prerequisites | Pass |
+| Tutorial and WAL recovery within 15 minutes after readiness | 10/10 | Pass |
+| Locked project `toka run src/main.tk` | 10/10 resolved Registry TokaKV 0.1.2 | Pass |
+| Project-aware JSON | 10/10 produced directly parseable check/evidence JSON; AI-focused trials also parsed capabilities and cede-obligations JSON | Pass |
+| Independent example modification | 10/10 completed delete, snapshot, or lease behavior | Pass |
+| Ownership diagnosis and repair | 10/10 repaired without maintainer guidance | Pass |
+| User W0408 remains visible, SDK W0408 remains absent | 10/10 | Pass |
+| Python readiness failure quality | real Python 3.9 trials failed non-silently without traceback; Python 3.10+ passed | Pass |
+| Stability | 0 unexpected crashes, observed double-drops, or hangs; repeated and abrupt-exit WAL recovery passed | Pass |
+| Toka SDK source build required | 0/10 | Pass |
+| P0/P1 | 0 P0, 0 P1 across valid samples | **Pass** |
+
+All ten valid agents were willing to continue a bounded Public Preview project;
+reported numeric willingness ranged from 7/10 to 9/10. The result supports the
+agentic systems-programming path, not production-database readiness.
+
+### Repeated non-blocking findings
+
+- Semantic evidence remains broad: small TokaKV entry points produced roughly
+  147–596 KB and 1,589–1,591 records, mostly from the SDK and dependency. This
+  remains the scoped-evidence follow-up in
+  [tokalang/toka#38](https://github.com/tokalang/toka/issues/38).
+- Several agents found minor CLI ergonomics: generic subcommand help,
+  `toka new --help` being interpreted as a project name, no `toka version`
+  alias, and an optimized build message whose artifact remains under
+  `target/debug`. These are P2/P3 backlog, not reasons to reopen language
+  semantics or issue another one-fix RC.
+- Python 3.9 is outside the supported Python 3.10+ helper boundary. Real 3.9
+  interpreters now fail with one actionable message and no parser traceback;
+  simple programs may happen not to exercise the helper, which does not widen
+  the supported runtime contract.
+- The Registry 0.1.2 package still contains RC10-era README text. The canonical
+  GitHub and deployed English/Chinese tutorials were updated during the replay
+  to the warning-clean `auto db =` spelling. RC12 installation wording remains
+  correct until RC13 is actually promoted.
+
+### RC13 decision
+
+The exact unpublished RC13 candidate closes the three P1 classes exposed by
+RC12: real basename/PATH relocation, JSON-only machine commands, and implicit
+`cede` check/CodeGen consistency. It also verifies installer checksums,
+project-aware `run <file>`, warning-clean starters/tutorials, and clean Python
+failure behavior through ordinary release gates.
+
+The Week 3 **AI-agent black-box gate is accepted for the exact candidate
+revision**. This does not authorize publication by itself. RC13 remains
+untagged and unpublished until 3–5 independent humans complete the supplemental
+usability protocol. Human trials should focus on expectations, terminology,
+documentation order, self-repair confidence, and willingness to continue—not
+repeat another artificial ten-person quota.

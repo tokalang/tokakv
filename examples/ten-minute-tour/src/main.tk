@@ -5,7 +5,7 @@ const DB_PATH = "tokakv-tour-data"
 const ACCOUNT_KEY = "account:42"
 
 fn main() -> i32 {
-    auto db# = TokaKvEngine::open(string::from(DB_PATH)).unwrap()
+    auto db = TokaKvEngine::open(string::from(DB_PATH)).unwrap()
     auto existing = db#.get(string::from(ACCOUNT_KEY)).unwrap()
 
     if existing.is_none() {

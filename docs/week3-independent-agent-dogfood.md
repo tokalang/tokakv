@@ -256,6 +256,13 @@ the ordinary developer-experience suite. This does not change language
 semantics or the `0.9.9-16` compiler-interface key. RC11 itself remains
 immutable and still contains the defect.
 
+Cross-platform test-launch follow-ups `e253c410` and `d36eeadd` preserve a
+basename `argv[0]` while explicitly selecting the relocated executable. The
+final ordinary CI passed Linux x64, Linux arm64, macOS arm64, and Windows/MSYS2
+([main gate](https://github.com/tokalang/toka/actions/runs/33583805926),
+[Windows dogfood](https://github.com/tokalang/toka/actions/runs/33583805940)).
+Issue #43 is therefore fixed on `main`, but not retroactively in RC11.
+
 ### Repeated non-blocking RC11 findings
 
 - Semantic evidence remains valid but overly broad: roughly 550–606 KB and
